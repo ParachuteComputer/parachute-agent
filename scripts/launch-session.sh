@@ -24,6 +24,13 @@ if [ -z "$NAME" ] || [ -z "$CHANNEL" ]; then
   echo "usage: launch-session.sh <session-name> <channel-name>" >&2
   exit 2
 fi
+# Both are used as slugs — in file paths, a tmux session name, and inside the
+# generated .mcp.json. Reject anything that could break those (quotes, spaces,
+# slashes, shell metachars). Channel names elsewhere are slug-like ("aaron","ops").
+if printf '%s' "$NAME$CHANNEL" | grep -q '[^a-zA-Z0-9_-]'; then
+  echo "error: <name> and <channel> must be alphanumeric, dash, or underscore only" >&2
+  exit 2
+fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BRIDGE="$REPO/src/bridge.ts"
@@ -38,9 +45,10 @@ done
 
 # Idempotent: already running → just tell the operator how to reach it.
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-  echo "session '$SESSION' is already running."
-  echo "  attach:  tmux attach -t $SESSION"
-  echo "  stop:    ./scripts/stop-session.sh $NAME"
+  echo "session '$SESSION' is already running (channel unchanged)."
+  echo "  attach:           tmux attach -t $SESSION"
+  echo "  change channel:   ./scripts/stop-session.sh $NAME && ./scripts/launch-session.sh $NAME <channel>"
+  echo "  stop:             ./scripts/stop-session.sh $NAME"
   exit 0
 fi
 

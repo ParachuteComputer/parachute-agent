@@ -79,7 +79,13 @@ Spin a session up wired to a channel with one command:
 `launch-session.sh` is idempotent, writes the session's `.mcp.json` + a reinforcing
 `CLAUDE.md` (so it always replies via the `reply` tool), auto-accepts the first-launch
 prompts (folder-trust + dev-channels), and waits for the bridge to attach. Override the
-daemon with `PARACHUTE_CHANNEL_URL` (default `http://127.0.0.1:1941`).
+daemon with `PARACHUTE_CHANNEL_URL` (default `http://127.0.0.1:1941`). `<name>`/`<channel>`
+must be slugs (alphanumeric/dash/underscore).
+
+**Note:** launched sessions run `claude --dangerously-skip-permissions` — the session has
+full machine access. Acceptable for an owner-operated, trusted-network box today;
+hub-scoped JWT auth (for the UI) and VM/Docker session isolation (for the session itself)
+are the planned hardening steps.
 
 ## Hub integration
 
