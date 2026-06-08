@@ -203,7 +203,7 @@ const CHAT_UI_HTML = `<!doctype html>
   var statusEl = document.getElementById("status");
   var form = document.getElementById("composer");
   var es = null;
-  var BRIDGE_PATH = ${JSON.stringify(BRIDGE_PATH)};
+  var BRIDGE_PATH = ${JSON.stringify(BRIDGE_PATH).replace(/</g, "\\u003c")};
 
   function updateSetup(ch) {
     if (!ch) return;
