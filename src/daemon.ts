@@ -34,6 +34,11 @@ import { ClientRegistry } from "./routing.ts";
 import { requireScope, extractToken, SCOPE_READ, SCOPE_WRITE } from "./auth.ts";
 import { validateHubJwt } from "./hub-jwt.ts";
 import {
+  handleProtectedResource,
+  handleAuthorizationServer,
+  mcpWwwAuthenticate,
+} from "./oauth-discovery.ts";
+import {
   handleMcp,
   pushToChannel as mcpPushToChannel,
   pushPermissionVerdict as mcpPushPermissionVerdict,
@@ -54,13 +59,6 @@ const PORT = parseInt(process.env.PARACHUTE_CHANNEL_PORT ?? "1941", 10);
 
 /** Channel a bridge subscribes to when `?channel=` is omitted (back-compat). */
 const DEFAULT_CHANNEL = "telegram";
-
-/** Absolute path to the bridge a Claude Code session spawns — shown in /ui setup. */
-const BRIDGE_PATH = join(import.meta.dir, "bridge.ts");
-
-/** Loopback origin a co-located bridge connects to (shown in /ui setup — the
- *  bridge talks to this daemon directly, NOT through hub/the expose). */
-const DAEMON_ORIGIN = `http://127.0.0.1:${PORT}`;
 
 /** Package version + install dir, for services.json self-registration. */
 const PKG_VERSION = ((): string => {
@@ -193,10 +191,8 @@ const CHAT_UI_HTML = `<!doctype html>
   <details class="setup">
     <summary>Connect a Claude Code session ▾</summary>
     <div class="body">
-      <p>1. In the working directory you'll run Claude Code from, create <code>.mcp.json</code>:</p>
-      <pre><button class="copy" data-copy="mcp">copy</button><code id="snippet-mcp"></code></pre>
-      <p>2. Launch Claude Code from that directory:</p>
-      <pre><button class="copy" data-copy="launch">copy</button><code id="snippet-launch"></code></pre>
+      <p>Add this channel as an HTTP MCP server — by URL, exactly like adding the vault. Run:</p>
+      <pre><button class="copy" data-copy="add">copy</button><code id="snippet-add"></code></pre>
       <p id="setup-note"></p>
     </div>
   </details>
@@ -214,9 +210,6 @@ const CHAT_UI_HTML = `<!doctype html>
   var statusEl = document.getElementById("status");
   var form = document.getElementById("composer");
   var es = null;
-  var BRIDGE_PATH = ${JSON.stringify(BRIDGE_PATH).replace(/</g, "\\u003c")};
-  // The bridge talks to the daemon directly on loopback (not through hub).
-  var DAEMON_ORIGIN = ${JSON.stringify(DAEMON_ORIGIN)};
   // Served through hub the page is /channel/ui; locally it's /ui. Derive the
   // mount prefix so every API/SSE call resolves under the same prefix.
   var MOUNT = location.pathname.replace(/\\/ui\\/?$/, "");
@@ -250,28 +243,24 @@ const CHAT_UI_HTML = `<!doctype html>
 
   function updateSetup(ch) {
     if (!ch) return;
-    var mcp = {
-      mcpServers: {
-        "parachute-channel": {
-          command: "bun",
-          args: [BRIDGE_PATH],
-          env: { PARACHUTE_CHANNEL_URL: DAEMON_ORIGIN, PARACHUTE_CHANNEL_NAME: ch },
-        },
-      },
-    };
-    document.getElementById("snippet-mcp").textContent = JSON.stringify(mcp, null, 2);
-    document.getElementById("snippet-launch").textContent =
-      "claude --dangerously-load-development-channels=server:parachute-channel";
+    // The public origin this channel is reachable at. Served through the hub
+    // expose, location.origin IS the hub origin and the channel mounts under
+    // /channel; served directly off the daemon, it's the loopback origin with
+    // no mount prefix. MOUNT (derived from the page path) captures that prefix.
+    var addCmd =
+      "claude mcp add --transport http channel " +
+      window.location.origin + MOUNT + "/mcp/" + ch;
+    document.getElementById("snippet-add").textContent = addCmd;
     document.getElementById("setup-note").textContent =
-      "On first launch, confirm the dev-channels prompt (\\"I am using this for local development\\"). " +
-      "After that, messages you send here inject directly into that idle session, and its replies appear here.";
+      "It will prompt for OAuth the first time (just like adding the vault) — no local file, " +
+      "works on any machine that can reach this URL. After it connects, messages you send here " +
+      "inject directly into that idle session, and its replies appear here.";
   }
 
   document.querySelectorAll(".copy").forEach(function (btn) {
     btn.addEventListener("click", function (e) {
       e.preventDefault();
-      var id = btn.getAttribute("data-copy") === "mcp" ? "snippet-mcp" : "snippet-launch";
-      var txt = document.getElementById(id).textContent;
+      var txt = document.getElementById("snippet-add").textContent;
       if (navigator.clipboard) navigator.clipboard.writeText(txt);
       var prev = btn.textContent; btn.textContent = "copied"; setTimeout(function () { btn.textContent = prev; }, 1200);
     });
@@ -546,6 +535,27 @@ export function createFetchHandler(
       });
     }
 
+    // ---------------------------------------------------------------------
+    // OAuth discovery for the HTTP MCP surface — RFC 9728 + RFC 8414, in the
+    // PATH-INSERTION form (`.well-known` ABOVE the resource path). This is the
+    // shape a Claude Code HTTP-MCP client probes when adding the channel by URL
+    // (the same shape vault serves). For the resource at `/mcp/<channel>`:
+    //
+    //   /.well-known/oauth-protected-resource/mcp/<channel>
+    //   /.well-known/oauth-authorization-server/mcp/<channel>
+    //
+    // Both are PUBLIC (no auth) — they have to be reachable before the client
+    // holds a token. Externally they're `<hub>/channel/.well-known/...`; hub's
+    // stripPrefix removes `/channel`, so the daemon matches the bare path and
+    // re-adds the prefix in the advertised URLs via x-forwarded-host.
+    // ---------------------------------------------------------------------
+    if (req.method === "GET") {
+      const prm = url.pathname.match(/^\/\.well-known\/oauth-protected-resource\/mcp\/([^/]+)$/);
+      if (prm) return handleProtectedResource(req, decodeURIComponent(prm[1]!));
+      const asm = url.pathname.match(/^\/\.well-known\/oauth-authorization-server\/mcp\/([^/]+)$/);
+      if (asm) return handleAuthorizationServer(req, decodeURIComponent(asm[1]!));
+    }
+
     // SSE event stream — bridges subscribe by channel. Bridge-facing: requires
     // a hub JWT with `channel:read`.
     if (req.method === "GET" && url.pathname === "/events") {
@@ -738,8 +748,20 @@ export function createFetchHandler(
       }
       // Gate on channel:read — short-circuits to 401 pre-JWKS when no token is
       // presented (testable without a live hub, same as the other endpoints).
+      // On a 401 (no/invalid bearer), decorate with the RFC 9728
+      // `WWW-Authenticate` challenge so a Claude Code HTTP-MCP client knows
+      // where to discover OAuth (mirrors vault's withMcpChallenge). The other
+      // endpoints (/events, /api/*) stay plain 401 — only the /mcp path drives
+      // a spec OAuth client, so only it carries the challenge.
       const denied = await requireScope(req, url, SCOPE_READ);
-      if (denied) return denied;
+      if (denied) {
+        if (denied.status === 401) {
+          const headers = new Headers(denied.headers);
+          headers.set("WWW-Authenticate", mcpWwwAuthenticate(req, channel));
+          return new Response(await denied.text(), { status: 401, headers });
+        }
+        return denied;
+      }
       // Re-validate to surface the caller's scopes for the write-tool checks.
       // (requireScope already proved the token valid + carrying channel:read;
       // this second pass hits the warm JWKS cache.) A token present but missing

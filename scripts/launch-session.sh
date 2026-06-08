@@ -32,8 +32,6 @@ if printf '%s' "$NAME$CHANNEL" | grep -q '[^a-zA-Z0-9_-]'; then
   exit 2
 fi
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BRIDGE="$REPO/src/bridge.ts"
 DAEMON_URL="${PARACHUTE_CHANNEL_URL:-http://127.0.0.1:1941}"
 STATE_DIR="${PARACHUTE_CHANNEL_STATE_DIR:-$HOME/.parachute/channel}"
 WORKDIR="$STATE_DIR/sessions/$NAME"
@@ -74,20 +72,23 @@ if [ -z "$TOKEN" ]; then
   echo "         running and you're logged in (parachute login) to authenticate the session." >&2
 fi
 
-# Bridge MCP config — the session's only wiring to the channel. The token, when
-# present, is injected into the env block so the bridge presents it on every
-# daemon request.
+# MCP config — the session's only wiring to the channel. This is now an HTTP
+# MCP server (URL + Bearer), NOT a stdio bridge spawned from a local file: the
+# session connects to the daemon's `/mcp/<channel>` endpoint exactly like adding
+# the vault MCP. No `bun src/bridge.ts` path — works on any machine that can
+# reach the daemon URL. The minted token rides as the Authorization header (the
+# headless/local launch path); a human adding the channel by hand uses
+# `claude mcp add --transport http` and gets prompted for OAuth instead.
+MCP_URL="$DAEMON_URL/mcp/$CHANNEL"
 if [ -n "$TOKEN" ]; then
   cat > "$WORKDIR/.mcp.json" <<EOF
 {
   "mcpServers": {
     "parachute-channel": {
-      "command": "bun",
-      "args": ["$BRIDGE"],
-      "env": {
-        "PARACHUTE_CHANNEL_URL": "$DAEMON_URL",
-        "PARACHUTE_CHANNEL_NAME": "$CHANNEL",
-        "PARACHUTE_CHANNEL_TOKEN": "$TOKEN"
+      "type": "http",
+      "url": "$MCP_URL",
+      "headers": {
+        "Authorization": "Bearer $TOKEN"
       }
     }
   }
@@ -98,12 +99,8 @@ else
 {
   "mcpServers": {
     "parachute-channel": {
-      "command": "bun",
-      "args": ["$BRIDGE"],
-      "env": {
-        "PARACHUTE_CHANNEL_URL": "$DAEMON_URL",
-        "PARACHUTE_CHANNEL_NAME": "$CHANNEL"
-      }
+      "type": "http",
+      "url": "$MCP_URL"
     }
   }
 }
@@ -159,6 +156,7 @@ for _ in $(seq 1 20); do
 done
 
 echo "✓ session '$SESSION' ready on channel '$CHANNEL'."
+echo "  connected over HTTP MCP at $MCP_URL (no local bridge file)."
 [ -n "$TOKEN" ] && echo "  authenticated with a hub-issued channel token (channel:read + channel:write)." \
                 || echo "  NOT authenticated (no token minted) — only an unguarded dev daemon will accept it."
 [ "$connected" = 1 ] && echo "  bridge connected to the daemon." || echo "  (bridge connection not yet confirmed via /health — usually a moment behind.)"
