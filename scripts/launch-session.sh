@@ -109,6 +109,8 @@ else
 }
 EOF
 fi
+# .mcp.json holds the channel token — keep it owner-only.
+chmod 600 "$WORKDIR/.mcp.json"
 
 # Reinforce the channel contract so the session always answers via the reply tool.
 cat > "$WORKDIR/CLAUDE.md" <<'EOF'
