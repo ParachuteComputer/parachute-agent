@@ -266,7 +266,9 @@ const CHAT_UI_HTML = `<!doctype html>
   document.querySelectorAll(".copy").forEach(function (btn) {
     btn.addEventListener("click", function (e) {
       e.preventDefault();
-      var txt = document.getElementById(btn.getAttribute("data-copy")).textContent;
+      var el = document.getElementById(btn.getAttribute("data-copy") || "");
+      if (!el) return;
+      var txt = el.textContent;
       if (navigator.clipboard) navigator.clipboard.writeText(txt);
       var prev = btn.textContent; btn.textContent = "copied"; setTimeout(function () { btn.textContent = prev; }, 1200);
     });
