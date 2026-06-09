@@ -751,8 +751,8 @@ export function createFetchHandler(
       }
     }
 
-    // Vault inbound webhook — a vault trigger POSTs here when a new inbound
-    // `#channel-message` note appears. Resolves the target channel from
+    // Vault inbound webhook — a vault trigger POSTs here when a new
+    // `#channel-message/inbound` note appears. Resolves the target channel from
     // `note.metadata.channel`, asserts it's a vault-transport channel, and hands
     // the note to that transport's `ingestInbound`, which `ctx.emit`s it →
     // wakes the subscribed bridge / MCP session.
@@ -797,7 +797,7 @@ export function createFetchHandler(
       // Idempotency: a duplicate trigger delivery for the same note must not
       // double-wake. First-seen → process; already-seen → ack without emitting.
       if (markSeen(note.id)) {
-        vt.ingestInbound({ id: note.id, content: note.content, metadata: note.metadata });
+        vt.ingestInbound({ id: note.id, content: note.content, tags: note.tags, metadata: note.metadata });
       }
       // Never write back to the note — the v1 trigger handles its own
       // created/rendered_at markers vault-side.

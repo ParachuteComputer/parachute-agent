@@ -4,11 +4,12 @@
  * These exercise the transport WITHOUT a live vault — `fetch` is stubbed to
  * capture the outbound note write, and `ctx.emit` is recorded to assert inbound
  * delivery. They cover:
- *   - reply(): writes the right POST .../api/notes with the outbound marker,
- *     direction, channel, Bearer token; returns the created note id;
+ *   - reply(): writes the right POST .../api/notes tagged
+ *     `#channel-message/outbound` (no `outbound` metadata key), with direction,
+ *     channel, Bearer token; returns the created note id;
  *   - reply(): threads in_reply_to when the bridge passes it;
  *   - ingestInbound(): emits the inbound content + meta onto its channel;
- *   - ingestInbound(): IGNORES an outbound-marked note (loop avoidance);
+ *   - ingestInbound(): IGNORES a `#channel-message/outbound`-tagged note (loop avoidance);
  *   - registry: a vault channel instantiates from config.
  */
 
@@ -45,7 +46,7 @@ function baseConfig() {
 }
 
 describe("VaultTransport — reply (outbound note write)", () => {
-  test("reply() POSTs .../api/notes with outbound marker + direction + channel + Bearer", async () => {
+  test("reply() POSTs .../api/notes tagged #channel-message/outbound + direction + channel + Bearer", async () => {
     const calls: { url: string; init: RequestInit }[] = [];
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       calls.push({ url: String(url), init: init ?? {} });
@@ -74,13 +75,14 @@ describe("VaultTransport — reply (outbound note write)", () => {
       metadata: Record<string, string>;
     };
     expect(sent.content).toBe("the reply text");
-    expect(sent.tags).toEqual(["#channel-message"]);
+    // Loop avoidance is now the hierarchical TAG, not a metadata marker.
+    expect(sent.tags).toEqual(["#channel-message/outbound"]);
     expect(sent.path.startsWith("channel/eng/")).toBe(true);
     expect(sent.metadata.channel).toBe("eng");
     expect(sent.metadata.direction).toBe("outbound");
     expect(sent.metadata.sender).toBe("session");
-    // The load-bearing loop-avoidance presence marker.
-    expect(sent.metadata.outbound).toBe("1");
+    // The old `outbound:"1"` presence marker is gone — no such metadata key.
+    expect("outbound" in sent.metadata).toBe(false);
     expect(typeof sent.metadata.ts).toBe("string");
   });
 
@@ -126,6 +128,7 @@ describe("VaultTransport — ingestInbound", () => {
     t.ingestInbound({
       id: "note-in-1",
       content: "hello session",
+      tags: ["#channel-message/inbound"],
       metadata: { channel: "eng", direction: "inbound", sender: "aaron", ts: "2026-06-08T00:00:00Z" },
     });
     expect(ctx.emitted).toHaveLength(1);
@@ -139,19 +142,20 @@ describe("VaultTransport — ingestInbound", () => {
     expect(m.meta.direction).toBe("inbound");
   });
 
-  test("IGNORES an outbound-marked note (loop avoidance)", () => {
+  test("IGNORES a #channel-message/outbound-tagged note (loop avoidance)", () => {
     const t = new VaultTransport(baseConfig());
     const ctx = fakeCtx("eng");
     void t.start(ctx);
     t.ingestInbound({
       id: "our-own-reply",
       content: "I am awake",
-      metadata: { channel: "eng", direction: "outbound", sender: "session", outbound: "1" },
+      tags: ["#channel-message/outbound"],
+      metadata: { channel: "eng", direction: "outbound", sender: "session" },
     });
     expect(ctx.emitted).toHaveLength(0);
   });
 
-  test("IGNORES a note with direction:outbound even if outbound marker is absent", () => {
+  test("IGNORES a note with direction:outbound even if the outbound tag is absent", () => {
     const t = new VaultTransport(baseConfig());
     const ctx = fakeCtx("eng");
     void t.start(ctx);

@@ -8,24 +8,29 @@
  *
  * How it differs from telegram / http-ui — the "external party" is the vault:
  *  - Inbound (human → session): a vault trigger POSTs the daemon's
- *    `/api/vault/inbound` webhook when a new inbound `#channel-message` note
+ *    `/api/vault/inbound` webhook when a new `#channel-message/inbound` note
  *    appears; the daemon resolves the channel from `note.metadata.channel` and
  *    calls this transport's `ingestInbound(note)`, which `ctx.emit(...)`s →
  *    routes to the bridge / MCP session subscribed to that channel and wakes it.
  *  - Outbound (session → human): when the session calls the `reply` tool, the
  *    bridge POSTs `/api/reply {channel,...}`; the daemon dispatches to this
- *    transport's `reply()`, which writes an OUTBOUND `#channel-message` note via
+ *    transport's `reply()`, which writes a `#channel-message/outbound` note via
  *    the vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`).
  *
- * Loop avoidance (load-bearing). An outbound reply is itself a new
- * `#channel-message` note — if the trigger fired on it, the session would wake
- * on its own reply forever. The vault trigger predicate can only match on
- * key-PRESENCE (`has_metadata`/`missing_metadata`), NOT on a value
- * (`direction == "inbound"`). So every outbound note carries a presence marker
- * `outbound: "1"`, and the trigger is configured to EXCLUDE notes that have it.
- * As belt-and-suspenders over the trigger predicate, `ingestInbound` also drops
- * any note that is outbound-marked (or `direction: "outbound"`) — so even a
- * mis-wired trigger can never wake us on our own reply.
+ * Loop avoidance (load-bearing) — via hierarchical tags. An outbound reply is
+ * itself a `#channel-message` note; if the trigger fired on it, the session would
+ * wake on its own reply forever. The vault trigger predicate does EXACT tag
+ * membership (no descendant expansion), so we split the parent tag into two
+ * children and key the trigger off the inbound child only:
+ *  - inbound notes carry `#channel-message/inbound`;
+ *  - outbound (reply) notes carry `#channel-message/outbound`;
+ *  - the trigger fires on `tags: ["#channel-message/inbound"]` — an exact match
+ *    that never matches an outbound note, so a reply can't wake its own session.
+ * A UI querying the parent `#channel-message` still sees BOTH directions, because
+ * the query engine DOES inherit descendants. As belt-and-suspenders over the
+ * trigger predicate, `ingestInbound` also drops any note tagged
+ * `#channel-message/outbound` (or `direction: "outbound"`) — so even a mis-wired
+ * trigger can never wake us on our own reply.
  */
 
 import type {
@@ -52,12 +57,19 @@ export interface VaultTransportConfig {
 export interface InboundNote {
   id: string;
   content?: string;
+  /** The note's tags — carries `#channel-message/{inbound,outbound}` for loop avoidance. */
+  tags?: string[];
   metadata?: Record<string, unknown>;
 }
 
 const DEFAULT_VAULT_URL = "http://127.0.0.1:1940";
 const DEFAULT_PATH_PREFIX = "channel";
+/** Parent tag — query this (descendants inherit) to see BOTH directions of a channel. */
 const CHANNEL_MESSAGE_TAG = "#channel-message";
+/** Inbound child — the vault trigger fires on this exact tag (never matches outbound → no loop). */
+const CHANNEL_MESSAGE_INBOUND_TAG = "#channel-message/inbound";
+/** Outbound child — replies carry this; the trigger's exact-match predicate excludes it. */
+const CHANNEL_MESSAGE_OUTBOUND_TAG = "#channel-message/outbound";
 
 export class VaultTransport implements Transport {
   readonly kind = "vault";
@@ -117,11 +129,11 @@ export class VaultTransport implements Transport {
 
     const metadata: Record<string, string> = {
       channel,
+      // `direction` stays as a human/UI convenience field. The loop-avoidance
+      // source of truth is now the `#channel-message/outbound` TAG below — the
+      // trigger fires on the inbound child tag only, so this note never wakes us.
       direction: "outbound",
       sender: "session",
-      // PRESENCE MARKER — the trigger excludes notes that have this key, so an
-      // outbound reply never wakes the session (loop avoidance). Load-bearing.
-      outbound: "1",
       ts,
     };
     // Thread the reply to the inbound note id when the bridge passes it through.
@@ -137,7 +149,7 @@ export class VaultTransport implements Transport {
       body: JSON.stringify({
         content: args.text ?? "",
         path,
-        tags: [CHANNEL_MESSAGE_TAG],
+        tags: [CHANNEL_MESSAGE_OUTBOUND_TAG],
         metadata,
       }),
     });
@@ -168,19 +180,19 @@ export class VaultTransport implements Transport {
   // -------------------------------------------------------------------------
 
   /**
-   * Deliver an inbound `#channel-message` note onto this channel: emit it so the
-   * subscribed bridge / MCP session wakes. Called by the daemon's
+   * Deliver an inbound `#channel-message/inbound` note onto this channel: emit it
+   * so the subscribed bridge / MCP session wakes. Called by the daemon's
    * `/api/vault/inbound` webhook after it has resolved the channel.
    *
-   * Belt-and-suspenders over the trigger predicate: a note that is
-   * outbound-marked (`metadata.outbound` present) OR explicitly
-   * `direction: "outbound"` is IGNORED — we never wake on our own reply, even if
-   * a mis-wired trigger delivers one.
+   * Belt-and-suspenders over the trigger predicate: a note tagged
+   * `#channel-message/outbound` OR explicitly `direction: "outbound"` is IGNORED
+   * — we never wake on our own reply, even if a mis-wired trigger delivers one.
    */
   ingestInbound(note: InboundNote): void {
     if (!this.ctx) throw new Error("vault transport: not started");
     const meta = note.metadata ?? {};
-    if (meta.outbound !== undefined || meta.direction === "outbound") {
+    const tags = note.tags ?? [];
+    if (tags.includes(CHANNEL_MESSAGE_OUTBOUND_TAG) || meta.direction === "outbound") {
       return; // our own reply — never wake on it.
     }
     // Flatten the note's metadata into the inbound meta (string-valued), then
