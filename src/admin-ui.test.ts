@@ -114,6 +114,20 @@ describe("module.json — modular-UI (P4) declaration", () => {
     expect(deliver?.provision?.type).toBe("vault-trigger");
   });
 
+  test("message.deliver declares the hub-connection wiring (endpoint + scope)", async () => {
+    // The hub's general Connections engine (P5) wires a `vault-trigger` action
+    // GENERICALLY: the webhook the vault calls back on is derived from the sink
+    // action's `endpoint` (hub-proxied under the module's mount), and the bearer
+    // the vault re-presents is minted at the action's declared `scope` — NOT a
+    // channel-hardcoded path in hub code. So the deliver action must carry both.
+    const m = JSON.parse(await Bun.file(manifestPath).text()) as {
+      actions?: Array<{ key: string; endpoint?: string; scope?: string }>;
+    };
+    const deliver = (m.actions ?? []).find((a) => a.key === "message.deliver");
+    expect(deliver?.endpoint).toBe("/api/vault/inbound");
+    expect(deliver?.scope).toBe("channel:send");
+  });
+
   test("preserves the existing manifest contract (name, port, scopes)", async () => {
     const m = JSON.parse(await Bun.file(manifestPath).text()) as Record<string, unknown>;
     expect(m.name).toBe("channel");
