@@ -23,6 +23,8 @@
     {
       "key": "message.deliver",
       "title": "Deliver an inbound message (wakes the session)",
+      "endpoint": "/api/vault/inbound",
+      "scope": "channel:send",
       "provision": {
         "type": "vault-trigger",
         "note": "hub registers a vault runtime trigger that webhooks the channel inbound endpoint with a channel:send bearer"
