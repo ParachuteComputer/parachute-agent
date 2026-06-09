@@ -328,7 +328,11 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
     return { srv, base: `http://127.0.0.1:${srv.port}`, emitted };
   }
 
-  function body(noteId: string, extraMeta: Record<string, unknown> = {}) {
+  function body(
+    noteId: string,
+    extraMeta: Record<string, unknown> = {},
+    tags: string[] = ["#channel-message/inbound"],
+  ) {
     return JSON.stringify({
       trigger: "channel-inbound",
       event: "created",
@@ -336,7 +340,7 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
         id: noteId,
         path: `channel/eng/${noteId}`,
         content: "wake up session",
-        tags: ["#channel-message"],
+        tags,
         metadata: { channel: "eng", direction: "inbound", sender: "aaron", ...extraMeta },
       },
     });
@@ -482,13 +486,13 @@ describe("Vault inbound webhook — POST /api/vault/inbound", () => {
     }
   });
 
-  test("outbound-marked note is ack'd 200 but NOT emitted (belt-and-suspenders)", async () => {
+  test("#channel-message/outbound-tagged note is ack'd 200 but NOT emitted (belt-and-suspenders)", async () => {
     const { srv, base, emitted } = buildVaultServer();
     try {
       const res = await fetch(`${base}/api/vault/inbound?secret=${SECRET}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: body("ob-1", { direction: "outbound", outbound: "1" }),
+        body: body("ob-1", { direction: "outbound" }, ["#channel-message/outbound"]),
       });
       expect(res.status).toBe(200);
       expect(emitted).toHaveLength(0);

@@ -161,14 +161,20 @@ A `vault` transport backs a channel with notes in a Parachute vault, so messages
 are durable, queryable, and a vault surface can render them. Multiple channels per
 vault: the note's `channel` metadata routes it.
 
-**Note shape** — tag `#channel-message`, content = the message text, metadata:
-`{ channel, direction: "inbound"|"outbound", sender, outbound: "1" (outbound only — the loop-avoidance marker), in_reply_to (outbound), ts }`.
+**Note shape** — hierarchical tags off the `#channel-message` parent:
+`#channel-message/inbound` (human→session) and `#channel-message/outbound` (session reply).
+Content = the message text; metadata: `{ channel, direction: "inbound"|"outbound", sender,
+in_reply_to (outbound), ts }`. Loop avoidance lives in the TAG, not metadata: the trigger
+fires on the inbound child tag only (exact match — no descendant expansion), so a reply never
+wakes its own session. A UI querying the parent `#channel-message` still sees BOTH directions,
+because the query engine DOES inherit descendants. Inbound notes MUST be written with the
+`#channel-message/inbound` tag and the channel name in `metadata.channel`.
 
-**Flow.** INBOUND (human→session): a new inbound note → a vault **trigger** POSTs a
-webhook → the channel daemon's `POST /api/vault/inbound` → routes by `note.metadata.channel`
+**Flow.** INBOUND (human→session): a new `#channel-message/inbound` note → a vault **trigger**
+POSTs a webhook → the channel daemon's `POST /api/vault/inbound` → routes by `note.metadata.channel`
 → `ctx.emit` wakes the session (fans to SSE bridges + HTTP-MCP sessions alike).
-OUTBOUND (session→human): the session's `reply` writes an outbound note via the vault
-REST API (`POST <vaultUrl>/vault/<vault>/api/notes`, Bearer `vault:<name>:write`).
+OUTBOUND (session→human): the session's `reply` writes a `#channel-message/outbound` note via the
+vault REST API (`POST <vaultUrl>/vault/<vault>/api/notes`, Bearer `vault:<name>:write`).
 
 **channels.json** (the channel side):
 ```json
@@ -181,25 +187,26 @@ REST API (`POST <vaultUrl>/vault/<vault>/api/notes`, Bearer `vault:<name>:write`
 1. (Optional, for indexed queries) declare the `#channel-message` tag schema with
    indexed `channel`/`direction`/`sender` fields (`update-tag`).
 2. Add a trigger to the vault's `config.yaml` that fires on new inbound notes and
-   webhooks the channel daemon. Loop avoidance: the vault predicate can only match
-   key *presence* (not `direction == "inbound"`), so it excludes the `outbound`
-   marker via `missing_metadata`:
+   webhooks the channel daemon. Loop avoidance is by hierarchical tag: the vault
+   predicate does EXACT tag membership (no descendant expansion), so firing on the
+   inbound child tag never matches an outbound (reply) note — no `missing_metadata`
+   clause needed:
    ```yaml
    triggers:
      - name: channel_inbound
        events: ["created"]
        when:
-         tags: ["#channel-message"]
+         tags: ["#channel-message/inbound"]
          has_metadata: ["channel"]
-         missing_metadata: ["outbound", "channel_inbound_rendered_at"]
+         missing_metadata: ["channel_inbound_rendered_at"]
        action:
          webhook: "http://127.0.0.1:1941/api/vault/inbound?secret=<shared secret>"
          send: "json"
    ```
    The shared secret rides in the URL — vault doesn't sign webhooks yet; a hub-JWT
    auth block on the trigger is a follow-up. The daemon defends in depth too:
-   `ingestInbound` drops any note marked `outbound`, so a reply can never wake its
-   own session.
+   `ingestInbound` drops any note tagged `#channel-message/outbound`, so a reply can
+   never wake its own session.
 
 ## Environment variables
 
