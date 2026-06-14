@@ -66,7 +66,6 @@ import {
 import {
   createTerminalWsHandlers,
   type TerminalWsData,
-  type SpawnTerminalFn,
 } from "./terminal.ts";
 import { TERMINAL_UI_HTML } from "./terminal-ui.ts";
 import { validateHubJwt } from "./hub-jwt.ts";
