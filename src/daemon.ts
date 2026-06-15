@@ -100,6 +100,7 @@ import {
   mcpSessionCount,
 } from "./mcp-http.ts";
 import { renderAdminPage } from "./admin-ui.ts";
+import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
 
 // Re-export the shared auth surface so existing importers of the daemon module
 // keep working; the canonical home is now `auth.ts` (shared with http-ui.ts).
@@ -293,82 +294,62 @@ async function removeChannelLive(
  * POSTs sends to /api/channels/<sel>/send. This is the surface for verifying
  * messaging works end to end with no Telegram and no vault.
  */
-const CHAT_UI_HTML = `<!doctype html>
+export const CHAT_UI_HTML = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>parachute-channel · chat</title>
 <style>
-  :root {
-    --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef;
-    --muted: #8b93a3; --you: #2b5cff; --them: #232936; --accent: #4cc2a0;
-  }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; }
-  body {
-    background: var(--bg); color: var(--fg);
-    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    display: flex; flex-direction: column; height: 100vh;
-  }
-  header {
-    display: flex; align-items: center; gap: 12px;
-    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
-  }
-  header .brand { font-weight: 600; }
-  header .brand small { color: var(--muted); font-weight: 400; }
-  header select {
-    margin-left: auto; background: var(--bg); color: var(--fg);
-    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font: inherit;
-  }
-  #status { font-size: 12px; color: var(--muted); }
-  #status.live { color: var(--accent); }
+${THEME_CSS}
+  /* ---- Chat page layout + transcript (page-specific, after the shared kit) -- */
+  html, body { height: 100%; }
+  body { display: flex; flex-direction: column; height: 100vh; }
+  .app-header { flex: 0 0 auto; }
   #transcript {
     flex: 1; overflow-y: auto; padding: 16px;
     display: flex; flex-direction: column; gap: 8px;
   }
+  /* Light-theme message bubbles. "you" = accent; "them" = soft surface; "sys" =
+     muted/italic system line; "perm" = a warn style for permission prompts. */
   .msg { max-width: 78%; padding: 8px 12px; border-radius: 12px; white-space: pre-wrap; word-wrap: break-word; }
-  .msg.you { align-self: flex-end; background: var(--you); color: #fff; border-bottom-right-radius: 4px; }
-  .msg.them { align-self: flex-start; background: var(--them); border-bottom-left-radius: 4px; }
-  .msg.sys { align-self: center; background: transparent; color: var(--muted); font-size: 12px; font-style: italic; max-width: 90%; }
-  .msg.perm { align-self: flex-start; background: #3a2f1a; border: 1px solid #6b5320; color: #ffd98a; max-width: 90%; }
-  .files { margin-top: 4px; font-size: 12px; opacity: .85; }
+  .msg.you { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.them { align-self: flex-start; background: var(--bg-soft); color: var(--fg); border: 1px solid var(--border); border-bottom-left-radius: 4px; }
+  .msg.sys { align-self: center; background: transparent; color: var(--fg-muted); font-size: 0.8rem; font-style: italic; max-width: 90%; }
+  .msg.perm { align-self: flex-start; background: var(--bg-soft); border: 1px solid var(--border); color: var(--fg-muted); max-width: 90%; }
+  .files { margin-top: 4px; font-size: 0.8rem; opacity: .85; }
   form {
     display: flex; gap: 8px; padding: 12px 16px;
-    border-top: 1px solid var(--line); background: var(--panel);
+    border-top: 1px solid var(--border); background: var(--card);
   }
   #input {
-    flex: 1; resize: none; background: var(--bg); color: var(--fg);
-    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font: inherit; max-height: 120px;
+    flex: 1; resize: none;
+    border-radius: 8px; padding: 10px 12px; max-height: 120px;
   }
-  button {
-    background: var(--you); color: #fff; border: 0; border-radius: 8px;
-    padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer;
-  }
-  button:disabled { opacity: .4; cursor: default; }
-  details.setup { border-bottom: 1px solid var(--line); background: var(--panel); }
+  #send { flex: 0 0 auto; }
+  details.setup { border-bottom: 1px solid var(--border); background: var(--card); }
   details.setup > summary {
-    cursor: pointer; padding: 8px 16px; color: var(--accent); font-size: 13px; user-select: none;
+    cursor: pointer; padding: 8px 16px; color: var(--accent-hover); font-size: 0.85rem; user-select: none;
   }
-  details.setup .body { padding: 4px 16px 14px; font-size: 13px; color: var(--muted); }
+  details.setup .body { padding: 4px 16px 14px; font-size: 0.85rem; color: var(--fg-muted); }
   details.setup .body p { margin: 8px 0 4px; }
   details.setup pre {
-    margin: 4px 0; padding: 10px 12px; background: var(--bg); border: 1px solid var(--line);
-    border-radius: 8px; overflow-x: auto; color: var(--fg); font-size: 12px; line-height: 1.45;
+    margin: 4px 0; padding: 10px 12px; background: var(--bg-soft); border: 1px solid var(--border);
+    border-radius: 8px; overflow-x: auto; color: var(--fg); font-size: 0.8rem; line-height: 1.45;
   }
-  details.setup code { color: var(--fg); }
+  details.setup code { font-family: var(--font-mono); color: var(--fg); }
   details.setup .copy {
-    float: right; padding: 1px 8px; font-size: 11px; font-weight: 500; background: var(--them);
-    border: 1px solid var(--line); border-radius: 6px;
+    float: right; padding: 1px 8px; font-size: 0.7rem; font-weight: 500; background: var(--bg-soft);
+    color: var(--fg-muted); border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
   }
 </style>
 </head>
 <body>
-  <header>
-    <div class="brand">parachute-channel <small>· chat</small></div>
-    <span id="status">connecting…</span>
-    <select id="channel" title="channel"></select>
-  </header>
+  ${appShell({
+    active: "chat",
+    tag: "chat",
+    controls: '<select id="channel" class="btn-sm" title="channel" style="width:auto;"></select>',
+  })}
   <details class="setup">
     <summary>Connect a Claude Code session ▾</summary>
     <div class="body">
@@ -383,46 +364,35 @@ const CHAT_UI_HTML = `<!doctype html>
   <div id="transcript"></div>
   <form id="composer">
     <textarea id="input" rows="1" placeholder="Type a message… (Enter to send, Shift+Enter for newline)" autocomplete="off"></textarea>
-    <button id="send" type="submit" disabled>Send</button>
+    <button id="send" type="submit" class="btn btn-primary" disabled>Send</button>
   </form>
 <script>
+${SHELL_JS}
 (function () {
   var transcript = document.getElementById("transcript");
   var sel = document.getElementById("channel");
   var input = document.getElementById("input");
   var sendBtn = document.getElementById("send");
-  var statusEl = document.getElementById("status");
   var form = document.getElementById("composer");
   var es = null;
-  // Served through hub the page is /channel/ui; locally it's /ui. Derive the
-  // mount prefix so every API/SSE call resolves under the same prefix.
-  var MOUNT = location.pathname.replace(/\\/ui\\/?$/, "");
+  // MOUNT, escapeHtml, fetchToken (caches on window.__token), authedFetch come
+  // from SHELL_JS. Wire the shared nav for the chat view.
+  wireShell("chat");
 
   // ----- Layer 2 auth -----------------------------------------------------
   // The daemon's send + SSE endpoints require a hub-issued channel JWT
-  // (aud:channel, scopes channel:read channel:send). The hub mints one for the
-  // logged-in portal operator at <hub-origin>/admin/channel-token (cookie-gated,
-  // ~10min TTL). We fetch it from the page origin (same origin as the hub when
-  // served through the expose) and attach it: Bearer header on POST, ?token= on
-  // the EventSource (which can't set headers). A direct-to-daemon / not-logged-in
-  // load just leaves the token unset and surfaces a notice — an unguarded dev
-  // daemon may still accept the calls, so we don't hard-crash.
-  window.__token = null;
-  function fetchToken() {
-    return fetch(window.location.origin + "/admin/channel-token", { credentials: "include" })
-      .then(function (r) {
-        if (!r.ok) throw new Error("token " + r.status);
-        return r.json();
-      })
-      .then(function (j) {
-        window.__token = j && j.token ? j.token : null;
-        return window.__token;
-      })
-      .catch(function (err) {
-        window.__token = null;
-        add("sys", "Not authenticated — open this UI through the hub portal (" + err + ")");
-        return null;
-      });
+  // (aud:channel, scopes channel:read channel:send). The shared fetchToken
+  // (SHELL_JS) mints one for the logged-in portal operator at
+  // <hub-origin>/admin/channel-token (cookie-gated, ~10min TTL) and caches it on
+  // window.__token; it REJECTS on failure. ensureToken wraps it with the chat's
+  // own notice (a "sys" transcript line) so a not-authenticated load explains
+  // itself, then resolves to null — an unguarded dev daemon may still accept the
+  // calls, so we don't hard-crash.
+  function ensureToken() {
+    return fetchToken().catch(function (err) {
+      add("sys", "Not authenticated — open this UI through the hub portal (" + err + ")");
+      return null;
+    });
   }
 
   function updateSetup(ch) {
@@ -469,11 +439,8 @@ const CHAT_UI_HTML = `<!doctype html>
     transcript.scrollTop = transcript.scrollHeight;
   }
 
-  function setStatus(text, live) {
-    statusEl.textContent = text;
-    statusEl.className = live ? "live" : "";
-  }
-
+  // setStatus(text, kind) comes from SHELL_JS — it updates the shared #status
+  // element the appShell header renders. Kinds: "live" | "err" | "" (default).
   function currentChannel() { return sel.value; }
 
   // Guard so an SSE error triggers at most one token-refresh+reconnect per
@@ -483,13 +450,13 @@ const CHAT_UI_HTML = `<!doctype html>
   function connect() {
     if (es) { es.close(); es = null; }
     var ch = currentChannel();
-    if (!ch) { setStatus("no channel", false); sendBtn.disabled = true; return; }
+    if (!ch) { setStatus("no channel", ""); sendBtn.disabled = true; return; }
     updateSetup(ch);
-    setStatus("connecting…", false);
+    setStatus("connecting…", "");
     var url = MOUNT + "/ui/events?channel=" + encodeURIComponent(ch);
     if (window.__token) url += "&token=" + encodeURIComponent(window.__token);
     es = new EventSource(url);
-    es.onopen = function () { sseRetried = false; setStatus("● live · " + ch, true); sendBtn.disabled = false; };
+    es.onopen = function () { sseRetried = false; setStatus("● live · " + ch, "live"); sendBtn.disabled = false; };
     es.addEventListener("reply", function (e) {
       try { var d = JSON.parse(e.data); add("them", d.text || "", d.files); }
       catch (_) { add("them", e.data); }
@@ -503,18 +470,18 @@ const CHAT_UI_HTML = `<!doctype html>
         add("perm", "🔐 permission: " + d.tool_name + "\\n" + (d.description || "") + "\\n" + (d.input_preview || ""));
       } catch (_) {}
     });
-    es.addEventListener("close", function () { setStatus("closed", false); });
+    es.addEventListener("close", function () { setStatus("closed", ""); });
     es.onerror = function () {
       // A stale/short-lived token 401s the stream. Refresh the token once and
       // reconnect; otherwise let EventSource auto-reconnect (transient network).
       if (!sseRetried && window.__token) {
         sseRetried = true;
-        setStatus("re-authenticating…", false);
+        setStatus("re-authenticating…", "");
         if (es) { es.close(); es = null; }
-        fetchToken().then(function () { connect(); });
+        ensureToken().then(function () { connect(); });
         return;
       }
-      setStatus("reconnecting…", false);
+      setStatus("reconnecting…", "");
     };
   }
 
@@ -539,7 +506,7 @@ const CHAT_UI_HTML = `<!doctype html>
       if (r.ok) return;
       // The token is short-lived; on a 401 refresh it once and retry the send.
       if (r.status === 401) {
-        return fetchToken().then(function (tok) {
+        return ensureToken().then(function (tok) {
           if (!tok) { add("sys", "send failed: not authenticated"); return; }
           return postSend(ch, text).then(function (r2) {
             if (!r2.ok) return r2.json().catch(function(){return {};}).then(function (j) {
@@ -575,7 +542,7 @@ const CHAT_UI_HTML = `<!doctype html>
   function loadChannelsAndConnect() {
     return fetch(MOUNT + "/.parachute/config").then(function (r) { return r.json(); }).then(function (cfg) {
       var chans = (cfg.channels || []).filter(function (c) { return c.transport === "http-ui"; });
-      if (!chans.length) { setStatus("no http-ui channels configured", false); return; }
+      if (!chans.length) { setStatus("no http-ui channels configured", ""); return; }
       var preselect = new URL(window.location.href).searchParams.get("channel");
       chans.forEach(function (c) {
         var opt = document.createElement("option");
@@ -584,13 +551,13 @@ const CHAT_UI_HTML = `<!doctype html>
         sel.appendChild(opt);
       });
       connect();
-    }).catch(function (err) { setStatus("config load failed: " + err, false); });
+    }).catch(function (err) { setStatus("config load failed: " + err, "err"); });
   }
 
   // Fetch a hub token first (so SSE + send go out authenticated), then list the
   // channels and connect. A token failure still proceeds — an unguarded dev
   // daemon may accept the calls, and the failure already surfaced a notice.
-  fetchToken().then(loadChannelsAndConnect);
+  ensureToken().then(loadChannelsAndConnect);
 })();
 </script>
 </body>
