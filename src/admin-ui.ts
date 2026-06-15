@@ -65,6 +65,8 @@
  * one add-form, switched by the transport select.
  */
 
+import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
+
 const PALETTE = {
   bg: "#faf8f4",
   bgSoft: "#f3f0ea",
@@ -83,8 +85,8 @@ const PALETTE = {
   successSoft: "rgba(61, 104, 73, 0.08)",
 } as const;
 
-const FONT_SERIF = `Georgia, "Times New Roman", serif`;
-const FONT_SANS = `-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif`;
+// Mono is the only font const still referenced by the page-specific STYLES;
+// the shared THEME_CSS owns the sans/serif tokens now.
 const FONT_MONO = `ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Mono", monospace`;
 
 /**
@@ -133,24 +135,15 @@ export function renderAdminPage(mount = ""): string {
   <title>Channel — Configuration</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="no-referrer" />
-  <style>${STYLES}</style>
+  <style>${THEME_CSS}${STYLES}</style>
 </head>
 <body>
+  ${appShell({ active: "config", tag: "configuration", status: "" })}
   <main>
     <div class="card">
       <header class="card-header">
-        <div class="brand">
-          <span class="brand-mark">C</span>
-          <span class="brand-name">Channel</span>
-          <span class="brand-tag">configuration</span>
-        </div>
         <h1>Manage channels</h1>
         <p class="subtitle">Add and remove the channels your Claude Code sessions talk over. Each channel is bound to one transport.</p>
-        <p class="subtitle" style="margin-top:6px;">
-          <a id="nav-agents" href="#">Agents →</a> spawn &amp; watch sandboxed sessions ·
-          <a id="nav-chat" href="#">Chat</a> ·
-          <a id="nav-terminal" href="#">Terminal</a>
-        </p>
       </header>
 
       <div id="status-banner" class="banner" hidden></div>
@@ -265,23 +258,21 @@ export function renderAdminPage(mount = ""): string {
       }
     })();
   </script>
-  <script>${PAGE_SCRIPT}</script>
+  <script>${SHELL_JS}${PAGE_SCRIPT}</script>
 </body>
 </html>`;
 }
 
+/**
+ * Page-specific styles, layered AFTER ${THEME_CSS} (the shared kit). The kit
+ * owns the tokens, base elements, header/nav shell, banners, buttons, inputs,
+ * fields, dot, h1/subtitle/section-title. These rules are the bits unique to the
+ * config page: the centered card layout, the section dividers, the channel-row
+ * list, the link-result panel, and the footer. The page is LIGHT-only now (the
+ * old prefers-color-scheme dark block was dropped — every channel page is the
+ * one brand-light look; only the terminal CONTENT pane stays black).
+ */
 const STYLES = `
-  *, *::before, *::after { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
-  body {
-    font-family: ${FONT_SANS};
-    background: ${PALETTE.bg};
-    color: ${PALETTE.fg};
-    line-height: 1.55;
-    min-height: 100vh;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-  }
   main { display: flex; justify-content: center; padding: 2.5rem 1.5rem; }
   .card {
     width: 100%;
@@ -293,65 +284,8 @@ const STYLES = `
     box-shadow: 0 1px 2px rgba(44, 42, 38, 0.04), 0 8px 24px rgba(44, 42, 38, 0.06);
   }
   .card-header { margin-bottom: 1.5rem; }
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    color: ${PALETTE.accent};
-    font-weight: 500;
-    font-size: 0.95rem;
-    margin-bottom: 1.25rem;
-  }
-  .brand-mark {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 1.5rem;
-    height: 1.5rem;
-    border-radius: 50%;
-    background: ${PALETTE.accent};
-    color: ${PALETTE.cardBg};
-    font-weight: 600;
-    font-size: 0.85rem;
-    line-height: 1;
-  }
-  .brand-name { letter-spacing: 0.01em; font-weight: 600; }
-  .brand-tag {
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    font-size: 0.7rem;
-    color: ${PALETTE.fgDim};
-    border-left: 1px solid ${PALETTE.border};
-    padding-left: 0.55rem;
-    margin-left: 0.15rem;
-  }
-  h1 {
-    font-family: ${FONT_SERIF};
-    font-weight: 400;
-    font-size: 1.75rem;
-    line-height: 1.2;
-    margin: 0 0 0.4rem;
-    color: ${PALETTE.fg};
-  }
-  .subtitle { margin: 0; color: ${PALETTE.fgMuted}; font-size: 0.95rem; }
-
-  .banner {
-    margin: 0 0 1.25rem;
-    padding: 0.75rem 0.9rem;
-    border-radius: 6px;
-    font-size: 0.9rem;
-    border: 1px solid transparent;
-  }
-  .banner-error { background: ${PALETTE.dangerSoft}; border-color: ${PALETTE.danger}; color: ${PALETTE.danger}; }
-  .banner-success { background: ${PALETTE.successSoft}; border-color: ${PALETTE.success}; color: ${PALETTE.success}; }
-  .banner-warn { background: ${PALETTE.bgSoft}; border-color: ${PALETTE.border}; color: ${PALETTE.fgMuted}; }
-  .banner code {
-    font-family: ${FONT_MONO};
-    font-size: 0.85em;
-    background: rgba(255,255,255,0.5);
-    padding: 0.05rem 0.3rem;
-    border-radius: 3px;
-  }
+  /* The card's h1 is a touch larger than the kit's default page h1. */
+  .card-header h1 { font-size: 1.75rem; }
 
   .section {
     display: flex;
@@ -363,13 +297,6 @@ const STYLES = `
   }
   #list-section { border-top: none; padding-top: 0; margin-top: 0; }
   .section-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
-  .section-title {
-    font-family: ${FONT_SERIF};
-    font-weight: 400;
-    font-size: 1.2rem;
-    margin: 0;
-    color: ${PALETTE.fg};
-  }
   .section-desc { margin: 0; font-size: 0.85rem; color: ${PALETTE.fgMuted}; }
   .section-desc code, .field-hint code {
     font-family: ${FONT_MONO};
@@ -411,8 +338,6 @@ const STYLES = `
   }
   .channel-vault { font-size: 0.78rem; color: ${PALETTE.fgDim}; }
   .channel-status { margin-left: auto; display: inline-flex; align-items: center; gap: 0.35rem; font-size: 0.8rem; }
-  .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; display: inline-block; background: ${PALETTE.fgDim}; }
-  .dot.live { background: ${PALETTE.accent}; }
   .channel-status .clients { color: ${PALETTE.fgDim}; }
   .btn-remove {
     font: inherit;
@@ -430,49 +355,13 @@ const STYLES = `
   .btn-remove:disabled { opacity: 0.5; cursor: progress; }
 
   .add-form { display: flex; flex-direction: column; gap: 1rem; }
-  .field { display: flex; flex-direction: column; gap: 0.3rem; }
-  /* The author \`display:flex\` above outranks the UA \`[hidden]{display:none}\`
-     rule, so a per-transport field with the \`hidden\` attribute would still
-     render. Re-assert the hide at matching specificity so applyTransportUI's
-     \`field.hidden = …\` toggling actually shows/hides the field. */
-  .field[hidden] { display: none; }
-  .field-label { font-size: 0.85rem; font-weight: 500; color: ${PALETTE.fgMuted}; letter-spacing: 0.01em; }
-  .field-hint { font-size: 0.8rem; color: ${PALETTE.fgDim}; }
-  .field-error { font-size: 0.8rem; color: ${PALETTE.danger}; font-weight: 500; }
-
-  select, input[type=text], input[type=password] {
-    font: inherit;
-    width: 100%;
-    padding: 0.55rem 0.7rem;
-    border: 1px solid ${PALETTE.border};
-    border-radius: 6px;
-    background: ${PALETTE.bg};
-    color: ${PALETTE.fg};
-    transition: border-color 0.15s ease, background 0.15s ease;
-  }
+  /* A focus ring on inputs/selects — a touch richer than the kit's plain focus. */
   select:focus, input:focus {
-    outline: none;
-    border-color: ${PALETTE.accent};
     background: ${PALETTE.cardBg};
     box-shadow: 0 0 0 3px ${PALETTE.accentSoft};
   }
   .field-invalid select, .field-invalid input { border-color: ${PALETTE.danger}; }
-
-  .btn {
-    font: inherit;
-    font-weight: 500;
-    padding: 0.6rem 1.1rem;
-    border-radius: 6px;
-    border: 1px solid transparent;
-    cursor: pointer;
-    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-  }
-  .btn-sm { padding: 0.3rem 0.7rem; font-size: 0.82rem; }
-  .btn-primary { background: ${PALETTE.accent}; color: ${PALETTE.cardBg}; }
-  .btn-primary:hover { background: ${PALETTE.accentHover}; }
-  .btn-primary:disabled { background: ${PALETTE.fgDim}; cursor: progress; }
-  .btn-secondary { background: ${PALETTE.cardBg}; color: ${PALETTE.fgMuted}; border-color: ${PALETTE.border}; }
-  .btn-secondary:hover { color: ${PALETTE.fg}; border-color: ${PALETTE.fgDim}; }
+  .btn-primary:disabled { background: ${PALETTE.fgDim}; border-color: ${PALETTE.fgDim}; cursor: progress; }
   .button-row { display: flex; gap: 0.6rem; margin-top: 0.25rem; }
 
   #link-result {
@@ -528,26 +417,10 @@ const STYLES = `
   .footer-hint a { color: ${PALETTE.accent}; }
   .footer-hint a:hover { color: ${PALETTE.accentHover}; }
 
-  @media (prefers-color-scheme: dark) {
-    body { background: #1a1815; color: #e8e4dc; }
-    .card { background: #25221d; border-color: #3a362f; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3); }
-    h1, .section-title { color: #f0ece4; }
-    .subtitle, .section-desc, .field-label, .field-hint { color: #a8a29a; }
-    .channel-row { background: #1f1c18; border-color: #3a362f; }
-    .channel-transport { background: #2a2620; }
-    select, input[type=text], input[type=password] { background: #1f1c18; border-color: #3a362f; color: #e8e4dc; }
-    select:focus, input:focus { background: #25221d; }
-    .btn-secondary { background: #25221d; border-color: #3a362f; color: #a8a29a; }
-    .btn-secondary:hover { color: #e8e4dc; border-color: #6b6860; }
-    .card-footer, .section { border-color: #3a362f; }
-    .loading { background: #1f1c18; }
-    .section-desc code, .field-hint code, .footer-hint code { background: #2a2620; }
-  }
-
   @media (max-width: 600px) {
     main { padding: 1rem; }
     .card { padding: 1.5rem 1.25rem; border-radius: 10px; }
-    h1 { font-size: 1.45rem; }
+    .card-header h1 { font-size: 1.45rem; }
     .button-row .btn { width: 100%; }
     .channel-row { flex-wrap: wrap; }
     .channel-status { margin-left: 0; }
@@ -569,38 +442,21 @@ const PAGE_SCRIPT = String.raw`
   var MOUNT = window.__CHANNEL_MOUNT__ || "";
   var API_URL = window.__CHANNEL_API_URL__ || "/api/channels";
 
-  // Wire the header nav links to the sibling surfaces under the same mount.
-  (function wireNav() {
-    var map = { "nav-agents": "/agents", "nav-chat": "/ui", "nav-terminal": "/terminal" };
-    Object.keys(map).forEach(function (id) {
-      var a = document.getElementById(id);
-      if (a) a.href = MOUNT + map[id];
-    });
-  })();
+  // Wire the shared app-shell nav (hrefs from MOUNT + the active tab) for the
+  // config view. wireShell + MOUNT come from SHELL_JS; the admin page sets its
+  // own MOUNT from window.__CHANNEL_MOUNT__ (the runtime-detected prefix) just
+  // above, which wireShell then reads.
+  wireShell("config");
 
   // --- Auth: a channel:admin Bearer minted by the hub --------------------
   // The channel config API (/api/channels) requires a hub JWT with
-  // channel:admin. The hub mints one for the logged-in portal operator at
-  // <origin>/admin/channel-token (cookie-gated) -- the same endpoint the chat
-  // UI uses. We fetch it from the page origin (which IS the hub origin when
-  // served through the expose) and attach it as a Bearer on every API call.
-  // A direct-to-daemon / not-logged-in load leaves the token null and surfaces
-  // a notice -- the daemon's requireScope then 401s the API calls.
-  window.__token = null;
-  function fetchToken() {
-    return fetch(window.location.origin + "/admin/channel-token", { credentials: "include" })
-      .then(function (r) {
-        if (!r.ok) throw new Error("token " + r.status);
-        return r.json();
-      })
-      .then(function (j) {
-        window.__token = j && j.token ? j.token : null;
-        return window.__token;
-      })
-      .catch(function (_err) {
-        window.__token = null;
-        return null;
-      });
+  // channel:admin. fetchToken (SHELL_JS) mints one for the logged-in portal
+  // operator at <origin>/admin/channel-token (cookie-gated) and caches it on
+  // window.__token; it REJECTS on failure. ensureToken wraps it to resolve to
+  // null instead, so boot still proceeds to loadChannels -- which surfaces the
+  // no-auth banner on the resulting 401 (one clear notice, not two).
+  function ensureToken() {
+    return fetchToken().catch(function (_err) { return null; });
   }
 
   function authHeaders(extra) {
@@ -708,14 +564,8 @@ const PAGE_SCRIPT = String.raw`
     }
   }
 
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
-  }
+  // escapeHtml comes from SHELL_JS (identical 5-char escape) — the page's many
+  // setBanner(...) interpolations reuse it, one escaping discipline page-wide.
 
   // --- List + render ------------------------------------------------------
   // Two reads: /api/channels (channel:admin, the authoritative config list:
@@ -1346,7 +1196,7 @@ const PAGE_SCRIPT = String.raw`
     // list. A token failure still proceeds to loadChannels -- which surfaces the
     // no-auth banner on the resulting 401, so the operator sees one clear notice.
     // The vault dropdown loads in parallel (public discovery doc, no token).
-    fetchToken().then(loadChannels);
+    ensureToken().then(loadChannels);
     loadVaults();
   });
 `;

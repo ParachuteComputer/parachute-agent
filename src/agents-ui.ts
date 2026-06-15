@@ -27,6 +27,8 @@
  * read back; the spawn result shows scopes but never minted token values.
  */
 
+import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
+
 export const AGENTS_UI_HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -35,70 +37,45 @@ export const AGENTS_UI_HTML = `<!doctype html>
 <meta name="referrer" content="no-referrer" />
 <title>parachute-channel · agents</title>
 <style>
-  :root {
-    --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef;
-    --muted: #8b93a3; --accent: #4cc2a0; --danger: #e0796b; --warn: #d9b25f;
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; }
-  body {
-    background: var(--bg); color: var(--fg);
-    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    padding-bottom: 48px;
-  }
-  header {
-    display: flex; align-items: center; gap: 14px;
-    padding: 12px 20px; border-bottom: 1px solid var(--line); background: var(--panel);
-    position: sticky; top: 0; z-index: 5;
-  }
-  header .brand { font-weight: 600; }
-  header .brand small { color: var(--muted); font-weight: 400; }
-  header nav { display: flex; gap: 12px; }
-  header nav a { color: var(--muted); text-decoration: none; font-size: 13px; }
-  header nav a:hover { color: var(--fg); text-decoration: underline; }
-  header .spacer { margin-left: auto; }
-  #status { font-size: 12px; color: var(--muted); }
-  #status.live { color: var(--accent); }
-  #status.err { color: var(--danger); }
+${THEME_CSS}
+  /* ---- Agents page layout (page-specific, layered after the shared kit) ---- */
+  .app-header { position: sticky; top: 0; z-index: 5; }
+  body { padding-bottom: 48px; }
   main { max-width: 940px; margin: 0 auto; padding: 20px; display: grid; gap: 20px; }
   section {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px;
+    box-shadow: 0 1px 2px rgba(44,42,38,0.04), 0 8px 24px rgba(44,42,38,0.06);
   }
-  section h2 { margin: 0 0 4px; font-size: 15px; }
-  section p.hint { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 4px; }
-  input[type=text], input[type=password], select, textarea {
-    width: 100%; background: var(--bg); color: var(--fg);
-    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit;
-  }
+  section h2 { margin: 0 0 4px; font-size: 1.2rem; }
+  section p.hint { margin: 0 0 14px; color: var(--fg-muted); font-size: 0.85rem; }
+  label { display: block; font-size: 0.78rem; color: var(--fg-muted); margin: 0 0 4px; }
   .row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
   .row > .grow { flex: 1 1 160px; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .grid3 { display: grid; grid-template-columns: 1.4fr 1fr 1.2fr; gap: 12px; }
+  /* The agents page predates the kit's .btn classes; keep its bare <button>
+     selectors working by mapping them onto the brand tokens. .primary/.danger/
+     .ghost are page-local button modifiers (distinct from the kit's .btn-*). */
   button {
-    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    background: var(--card); color: var(--fg); border: 1px solid var(--border);
     border-radius: 6px; padding: 8px 14px; font: inherit; cursor: pointer;
   }
-  button:hover { border-color: var(--muted); }
+  button:hover { border-color: var(--fg-dim); }
   button:disabled { opacity: .4; cursor: default; }
   button.primary { background: var(--accent); color: #06140f; border-color: var(--accent); font-weight: 600; }
-  button.danger { color: var(--danger); border-color: #3a2a2a; }
-  button.danger:hover { border-color: var(--danger); }
-  button.ghost { padding: 4px 9px; font-size: 12px; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); }
-  .pill.on { color: var(--accent); border-color: #244; }
-  .pill.off { color: var(--warn); border-color: #443; }
-  .pill.attached { color: var(--accent); border-color: #244; }
-  .pill.detached { color: var(--muted); }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
-  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  button.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+  button.danger { color: var(--danger); border-color: var(--border); background: transparent; }
+  button.danger:hover { border-color: var(--danger); background: var(--danger-soft); }
+  button.ghost { padding: 4px 9px; font-size: 12px; background: transparent; border-color: transparent; color: var(--fg-muted); }
+  button.ghost:hover { background: var(--bg-soft); color: var(--fg); }
+  .pill.detached { color: var(--fg-dim); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { color: var(--fg-muted); font-weight: 500; font-size: 0.78rem; }
   td.actions { text-align: right; white-space: nowrap; }
   td.actions a, td.actions button { margin-left: 6px; }
-  a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  details { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
-  details summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+  details { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+  details summary { cursor: pointer; color: var(--fg-muted); font-size: 0.85rem; user-select: none; }
   details[open] summary { color: var(--fg); margin-bottom: 12px; }
   .sub { display: grid; gap: 12px; }
   .extra-channels { display: grid; gap: 8px; }
@@ -108,26 +85,16 @@ export const AGENTS_UI_HTML = `<!doctype html>
   .mounts-rows { display: grid; gap: 8px; }
   .mounts-rows .mrow input { flex: 1 1 auto; }
   .mounts-rows .mrow select { flex: 0 0 90px; }
-  .msg { margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 13px; display: none; white-space: pre-wrap; }
-  .msg.ok { display: block; background: #11241d; color: var(--accent); border: 1px solid #244; }
-  .msg.err { display: block; background: #241313; color: var(--danger); border: 1px solid #3a2a2a; }
-  code { color: var(--fg); background: #0b0d11; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
-  .scopes { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
-  .muted { color: var(--muted); }
-  .empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+  .msg { margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 0.85rem; display: none; white-space: pre-wrap; border: 1px solid transparent; }
+  .msg.ok { display: block; background: var(--success-soft); color: var(--success); border-color: var(--success); }
+  .msg.err { display: block; background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
+  code { font-family: var(--font-mono); color: var(--fg); background: var(--bg-soft); padding: 1px 5px; border-radius: 4px; font-size: 0.8rem; }
+  .scopes { margin: 8px 0 0; font-size: 0.78rem; color: var(--fg-muted); }
+  .empty { color: var(--fg-muted); font-size: 0.85rem; padding: 8px 2px; }
 </style>
 </head>
 <body>
-  <header>
-    <div class="brand">parachute-channel <small>· agents</small></div>
-    <nav>
-      <a id="nav-chat" href="#">Chat</a>
-      <a id="nav-terminal" href="#">Terminal</a>
-      <a id="nav-config" href="#">Config</a>
-    </nav>
-    <span class="spacer"></span>
-    <span id="status">connecting…</span>
-  </header>
+  ${appShell({ active: "agents", tag: "agents" })}
 
   <main>
     <!-- Claude credential -->
@@ -273,25 +240,16 @@ export const AGENTS_UI_HTML = `<!doctype html>
   </main>
 
 <script>
+${SHELL_JS}
 (function () {
-  // Served through the hub the page is /channel/agents; locally /agents. Derive
-  // the mount prefix so API + token + nav URLs resolve under the same prefix.
-  var MOUNT = location.pathname.replace(/\\/agents\\/?$/, "");
-  var statusEl = document.getElementById("status");
-  var TOKEN = null;
+  // MOUNT, setStatus, escapeHtml, fetchToken (caches on window.__token),
+  // authedFetch all come from SHELL_JS. Wire the shared nav for the agents view.
+  wireShell("agents");
   var knownChannels = [];
 
-  // Wire nav links under the same mount.
-  document.getElementById("nav-chat").href = MOUNT + "/ui";
-  document.getElementById("nav-terminal").href = MOUNT + "/terminal";
-  document.getElementById("nav-config").href = MOUNT + "/admin";
+  // esc is the page-local name for the shared escapeHtml (used widely below).
+  var esc = escapeHtml;
 
-  function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = cls || ""; }
-  function esc(s) {
-    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
-      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
-    });
-  }
   function showMsg(el, text, isErr) {
     // textContent (NOT innerHTML) — server/result strings flow through here, so
     // this deliberately avoids needing esc(): the browser never parses them as HTML.
@@ -300,18 +258,14 @@ export const AGENTS_UI_HTML = `<!doctype html>
   }
   function clearMsg(el) { el.textContent = ""; el.className = "msg"; }
 
-  // --- token (operator channel:admin, minted by the hub) ------------------
-  function fetchToken() {
-    return fetch(location.origin + "/admin/channel-token", { credentials: "include" })
-      .then(function (r) { if (!r.ok) throw new Error("token " + r.status); return r.json(); })
-      .then(function (j) { TOKEN = (j && j.token) ? j.token : null; return TOKEN; })
-      .catch(function (err) { TOKEN = null; setStatus("not authenticated", "err"); throw err; });
-  }
-
+  // --- token + API --------------------------------------------------------
+  // fetchToken (SHELL_JS) mints + caches the channel:admin Bearer on
+  // window.__token. api() is the agents-page JSON wrapper: it prefixes MOUNT,
+  // attaches the Bearer + a JSON content-type, and retries once on 401.
   function api(path, opts, _retried) {
     opts = opts || {};
     var headers = Object.assign({}, opts.headers || {});
-    if (TOKEN) headers["authorization"] = "Bearer " + TOKEN;
+    if (window.__token) headers["authorization"] = "Bearer " + window.__token;
     if (opts.body && !headers["content-type"]) headers["content-type"] = "application/json";
     return fetch(MOUNT + path, Object.assign({}, opts, { headers: headers })).then(function (r) {
       if (r.status === 401 && !_retried) {

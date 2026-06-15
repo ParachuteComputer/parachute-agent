@@ -23,6 +23,8 @@
  *      the live session with scrollback intact.
  */
 
+import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
+
 export const TERMINAL_UI_HTML = `<!doctype html>
 <html lang="en">
 <head>
@@ -31,81 +33,49 @@ export const TERMINAL_UI_HTML = `<!doctype html>
 <meta name="referrer" content="no-referrer" />
 <title>parachute-channel · terminal</title>
 <style>
-  :root {
-    --bg: #0f1115; --panel: #171a21; --line: #262b36; --fg: #e6e9ef;
-    --muted: #8b93a3; --accent: #4cc2a0; --danger: #e0796b;
-  }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; }
-  body {
-    background: var(--bg); color: var(--fg);
-    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    display: flex; flex-direction: column; height: 100vh;
-  }
-  header {
-    display: flex; align-items: center; gap: 12px;
-    padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
-    flex: 0 0 auto;
-  }
-  header .brand { font-weight: 600; }
-  header .brand small { color: var(--muted); font-weight: 400; }
-  header nav a { color: var(--muted); text-decoration: none; font-size: 13px; margin-right: 4px; }
-  header nav a:hover { color: var(--fg); text-decoration: underline; }
-  header select {
-    background: var(--bg); color: var(--fg);
-    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font: inherit;
-  }
-  header .spacer { margin-left: auto; }
-  #status { font-size: 12px; color: var(--muted); }
-  #status.live { color: var(--accent); }
-  #status.err { color: var(--danger); }
-  button {
-    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
-    border-radius: 6px; padding: 6px 12px; font: inherit; cursor: pointer;
-  }
-  button:hover { border-color: var(--muted); }
-  button:disabled { opacity: .4; cursor: default; }
+${THEME_CSS}
+  /* ---- Terminal-pane layout (page-specific, layered after the shared kit) -- */
+  html, body { height: 100%; }
+  body { display: flex; flex-direction: column; height: 100vh; }
+  .app-header { flex: 0 0 auto; }
+  /* The terminal CONTENT pane stays dark — a terminal is black everywhere. Only
+     the chrome (header/nav) above is the brand-light kit. */
   #term-wrap {
-    flex: 1 1 auto; min-height: 0; padding: 8px; background: #000;
+    flex: 1 1 auto; min-height: 0; padding: 8px; background: var(--term-bg);
   }
   #term { width: 100%; height: 100%; }
   .notice {
-    padding: 8px 16px; font-size: 13px; color: var(--muted);
-    border-bottom: 1px solid var(--line); background: var(--panel);
+    padding: 0.6rem 1.1rem; font-size: 0.9rem; color: var(--fg-muted);
+    border-bottom: 1px solid var(--border); background: var(--card);
   }
   .notice.err { color: var(--danger); }
-  .notice code { color: var(--fg); }
+  .notice code { font-family: var(--font-mono); color: var(--fg); }
 </style>
 </head>
 <body>
-  <header>
-    <div class="brand">parachute-channel <small>· terminal</small></div>
-    <nav><a id="nav-agents" href="#">← Agents</a></nav>
-    <select id="channel" title="agent session"></select>
-    <button id="reconnect" type="button" title="Re-attach to the tmux session">Reconnect</button>
-    <span class="spacer"></span>
-    <span id="status">loading…</span>
-  </header>
+  ${appShell({
+    active: "terminal",
+    tag: "terminal",
+    status: "loading…",
+    controls:
+      '<select id="channel" class="btn-sm" title="agent session" style="width:auto;"></select>' +
+      '<button id="reconnect" type="button" class="btn btn-sm" title="Re-attach to the tmux session">Reconnect</button>',
+  })}
   <div id="notice" class="notice" hidden></div>
   <div id="term-wrap"><div id="term"></div></div>
 
 <script>
+${SHELL_JS}
 (function () {
   var sel = document.getElementById("channel");
-  var statusEl = document.getElementById("status");
   var noticeEl = document.getElementById("notice");
   var reconnectBtn = document.getElementById("reconnect");
   var termHost = document.getElementById("term");
 
-  // Served through the hub the page is /channel/terminal; locally it's
-  // /terminal. Derive the mount prefix so the WS + token + asset URLs resolve
-  // under the same prefix (same shape as the chat UI's MOUNT).
-  var MOUNT = location.pathname.replace(/\\/terminal(\\/[^/]*)?\\/?$/, "");
+  // MOUNT, setStatus, escapeHtml, fetchToken, authedFetch come from SHELL_JS.
+  // Wire the shared nav (hrefs + active tab) for the terminal view.
+  wireShell("terminal");
 
-  // Wire the nav link to the agents page under the same mount.
-  document.getElementById("nav-agents").href = MOUNT + "/agents";
-
-  function setStatus(text, cls) { statusEl.textContent = text; statusEl.className = cls || ""; }
   function showNotice(html, isErr) {
     noticeEl.innerHTML = html;
     noticeEl.className = "notice" + (isErr ? " err" : "");
@@ -180,17 +150,16 @@ export const TERMINAL_UI_HTML = `<!doctype html>
   }
 
   // --- token (operator channel:admin, minted by the hub) ------------------
-  window.__token = null;
-  function fetchToken() {
-    return fetch(window.location.origin + "/admin/channel-token", { credentials: "include" })
-      .then(function (r) { if (!r.ok) throw new Error("token " + r.status); return r.json(); })
-      .then(function (j) { window.__token = (j && j.token) ? j.token : null; return window.__token; })
-      .catch(function (err) {
-        window.__token = null;
-        showNotice("Not authenticated — open this page through the hub portal, signed in " +
-          "as the operator. The terminal needs a <code>channel:admin</code> token (" + err + ").", true);
-        return null;
-      });
+  // The shared fetchToken (SHELL_JS) does the mint + caches it on window.__token,
+  // and REJECTS on failure. ensureToken wraps it with the terminal's own notice
+  // affordance so a not-authenticated load explains itself, then resolves to null
+  // (never rejects) — the WS attach validates the token anyway.
+  function ensureToken() {
+    return fetchToken().catch(function (err) {
+      showNotice("Not authenticated — open this page through the hub portal, signed in " +
+        "as the operator. The terminal needs a <code>channel:admin</code> token (" + err + ").", true);
+      return null;
+    });
   }
 
   // --- WebSocket relay ----------------------------------------------------
@@ -248,7 +217,7 @@ export const TERMINAL_UI_HTML = `<!doctype html>
     if (reconnectTimer) return;
     reconnectTimer = setTimeout(function () {
       reconnectTimer = null;
-      fetchToken().then(function () { connect(); });
+      ensureToken().then(function () { connect(); });
     }, 1500);
   }
 
@@ -270,7 +239,7 @@ export const TERMINAL_UI_HTML = `<!doctype html>
 
   reconnectBtn.addEventListener("click", function () {
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    fetchToken().then(function () { connect(); });
+    ensureToken().then(function () { connect(); });
   });
 
   sel.addEventListener("change", function () {
@@ -285,12 +254,8 @@ export const TERMINAL_UI_HTML = `<!doctype html>
   // --- boot: list running AGENTS, then connect ----------------------------
   // The terminal attaches to an AGENT's tmux session (name-agent), so the picker
   // lists running agents (operator-gated /api/agents), NOT channels — an agent has
-  // its own name, which isn't necessarily a configured channel.
-  function authedFetch(path) {
-    var headers = {};
-    if (window.__token) headers["authorization"] = "Bearer " + window.__token;
-    return fetch(MOUNT + path, { headers: headers });
-  }
+  // its own name, which isn't necessarily a configured channel. authedFetch (from
+  // SHELL_JS) attaches the Bearer + retries once on 401.
   function requestedAgent() {
     var u = new URL(window.location.href);
     var p = u.searchParams.get("agent") || u.searchParams.get("channel") || "";
@@ -299,7 +264,7 @@ export const TERMINAL_UI_HTML = `<!doctype html>
     return p;
   }
   function loadAgentsAndConnect() {
-    return authedFetch("/api/agents")
+    return authedFetch(MOUNT + "/api/agents")
       .then(function (r) { if (!r.ok) throw new Error("agents " + r.status); return r.json(); })
       .then(function (j) {
         var names = (j.agents || []).map(function (a) { return a.name; });
@@ -328,7 +293,7 @@ export const TERMINAL_UI_HTML = `<!doctype html>
       });
   }
 
-  fetchToken().then(loadAgentsAndConnect);
+  ensureToken().then(loadAgentsAndConnect);
   } // end boot()
 })();
 </script>
