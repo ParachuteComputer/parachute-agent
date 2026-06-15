@@ -141,13 +141,21 @@ ${SHELL_JS}
   function chatUrl(channel) { return MOUNT + "/ui?channel=" + encodeURIComponent(channel); }
   function terminalUrl(agent) { return MOUNT + "/terminal?agent=" + encodeURIComponent(agent); }
 
-  // --- channels (OPEN config, no token needed) ----------------------------
-  // The config listing is non-sensitive and served PUBLIC, so the channels card
-  // renders even on an unauthenticated load.
+  // --- channels (OPEN config + health, no token needed) -------------------
+  // The config listing + /health are non-sensitive and served PUBLIC, so the
+  // channels card renders even on an unauthenticated load. Config gives the
+  // channel list + transport; /health gives real liveness (which channels the
+  // daemon has actually loaded) + client counts — so the dot reflects truth
+  // rather than always showing green.
   function loadChannels() {
-    return fetch(MOUNT + "/.parachute/config")
-      .then(function (r) { if (!r.ok) throw new Error("config " + r.status); return r.json(); })
-      .then(function (cfg) {
+    return Promise.all([
+      fetch(MOUNT + "/.parachute/config").then(function (r) { if (!r.ok) throw new Error("config " + r.status); return r.json(); }),
+      fetch(MOUNT + "/health").then(function (r) { return r.ok ? r.json() : { channels: [] }; }).catch(function () { return { channels: [] }; }),
+    ])
+      .then(function (res) {
+        var cfg = res[0], health = res[1] || {};
+        var live = {};
+        (health.channels || []).forEach(function (c) { live[c.name] = c; });
         var chans = cfg.channels || [];
         channelsCount.textContent = chans.length ? String(chans.length) : "";
         if (!chans.length) {
@@ -156,11 +164,15 @@ ${SHELL_JS}
           return;
         }
         channelsList.innerHTML = chans.map(function (c) {
+          var h = live[c.name];
+          var dot = h ? "<span class='dot live' title='loaded'></span>" : "<span class='dot' title='configured, not loaded'></span>";
+          var clients = h && h.clients ? "<span class='count'>" + h.clients + (h.clients === 1 ? " client" : " clients") + "</span>" : "";
           return "<div class='ov-row'>" +
-            "<span class='dot live'></span>" +
+            dot +
             "<span class='name'>" + esc(c.name) + "</span>" +
             "<span class='pill'>" + esc(c.transport || "channel") + "</span>" +
             "<span class='spacer'></span>" +
+            clients +
             "<span class='links'>" +
               "<a href='" + esc(chatUrl(c.name)) + "'>chat →</a>" +
             "</span>" +

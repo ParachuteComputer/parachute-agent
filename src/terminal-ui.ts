@@ -105,7 +105,7 @@ ${SHELL_JS}
     s.onerror = function () {
       setStatus("xterm unavailable", "err");
       showNotice("Failed to load the terminal renderer from <code>" + src + "</code>. " +
-        "You can always attach on the host: <code>tmux attach -t &lt;channel&gt;-agent</code>.", true);
+        "You can always attach on the host: <code>tmux attach -t &lt;agent-name&gt;-agent</code>.", true);
     };
     document.head.appendChild(s);
   }
@@ -117,7 +117,7 @@ ${SHELL_JS}
     if (typeof window.Terminal !== "function") {
       setStatus("xterm unavailable", "err");
       showNotice("The terminal renderer didn't initialize. " +
-        "You can always attach on the host: <code>tmux attach -t &lt;channel&gt;-agent</code>.", true);
+        "You can always attach on the host: <code>tmux attach -t &lt;agent-name&gt;-agent</code>.", true);
       return;
     }
     setStatus("connecting…");
