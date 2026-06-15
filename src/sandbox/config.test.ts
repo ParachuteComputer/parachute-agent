@@ -118,9 +118,9 @@ describe("buildSandboxConfig — spec → SandboxRuntimeConfig", () => {
     expect(cfg.ripgrep).toEqual({ command: "/abs/rg" });
   });
 
-  test("the produced config matches the runtime's required shape (keys present)", () => {
+  test("a restricted-network config carries the full runtime shape (allowedDomains present)", () => {
     const cfg = buildSandboxConfig({
-      spec: specOf(),
+      spec: specOf(), // network "restricted" → allowedDomains present
       baseBinds: BASE_BINDS,
       egressBase: EGRESS_BASE,
       platform: "darwin",
@@ -131,5 +131,20 @@ describe("buildSandboxConfig — spec → SandboxRuntimeConfig", () => {
     expect(cfg.filesystem).toHaveProperty("allowRead");
     expect(cfg.filesystem).toHaveProperty("allowWrite");
     expect(cfg.filesystem).toHaveProperty("denyWrite");
+  });
+
+  test("an open-network config OMITS allowedDomains but keeps the rest of the shape", () => {
+    const cfg = buildSandboxConfig({
+      spec: { name: "arm", channels: ["ch"] }, // default → network open
+      baseBinds: BASE_BINDS,
+      egressBase: EGRESS_BASE,
+      platform: "darwin",
+    });
+    // allowedDomains is deliberately ABSENT on open (the runtime's allow-all shape);
+    // this is NOT a protocol guarantee that allowedDomains is always present.
+    expect(cfg.network).not.toHaveProperty("allowedDomains");
+    expect(cfg.network).toHaveProperty("deniedDomains");
+    expect(cfg.filesystem).toHaveProperty("denyRead");
+    expect(cfg.filesystem).toHaveProperty("allowWrite");
   });
 });

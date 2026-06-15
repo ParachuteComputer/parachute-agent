@@ -323,6 +323,13 @@ function parseMountEntry(raw: unknown, i: number): AgentMount {
   // but a relative `hostPath` would resolve against the session's cwd in
   // surprising ways — make the trust boundary explicit with a clean 400 here
   // rather than a confusing sandbox behavior downstream.
+  //
+  // NOTE: a mount's hostPath is added to `allowRead`, which OVERRIDES the
+  // `filesystem: "workspace"` home-tree deny. So an operator who mounts a
+  // home-tree path (e.g. ~/.parachute) deliberately re-opens that path to the
+  // agent even under the scoped default. That's intentional (this endpoint is
+  // channel:admin-gated; the operator is choosing it), not an injection bypass —
+  // but weigh it before mounting sensitive home-tree paths.
   if (!m.hostPath.startsWith("/")) {
     throw new SpawnRequestError(`body.mounts[${i}].hostPath must be an absolute path (start with "/")`);
   }
