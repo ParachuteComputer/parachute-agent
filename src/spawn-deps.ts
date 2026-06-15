@@ -71,27 +71,6 @@ function resolveChannelUrl(): string {
 }
 
 /**
- * Claude runtime/config paths bound read-only so the sandboxed `claude` runs:
- *   - the config DIR (`~/.claude` or $CLAUDE_CONFIG_DIR) — skills, plugins, settings;
- *   - the config FILE `~/.claude.json` (at the home ROOT, a sibling of the dir).
- *
- * Binding `~/.claude.json` is load-bearing: without it claude can't see that it's
- * already onboarded, so it runs FIRST-RUN SETUP, whose connectivity check is FATAL
- * under the restricted egress proxy → the tmux session dies instantly with
- * "An unknown error occurred (Unexpected)". With it bound, claude skips onboarding
- * and starts cleanly under both restricted and open network. Bound READ-ONLY: a
- * session can read the operator's claude config (it runs on the operator's claude
- * credential anyway) but never mutate it for future sessions.
- */
-function claudeConfigReads(): string[] {
-  const dir = process.env.CLAUDE_CONFIG_DIR ?? resolve(homedir(), ".claude");
-  const reads = [dir, resolve(homedir(), ".claude.json")];
-  // If CLAUDE_CONFIG_DIR is set, newer claude keeps its config json under it too.
-  if (process.env.CLAUDE_CONFIG_DIR) reads.push(join(process.env.CLAUDE_CONFIG_DIR, ".claude.json"));
-  return reads;
-}
-
-/**
  * Resolve the `claude` binary to an ABSOLUTE path and the read binds the sandbox
  * needs to actually exec it.
  *
@@ -158,11 +137,14 @@ export function resolveSpawnDeps(): SpawnAgentDeps {
   // bare "claude" on PATH (correct when claude is outside the home tree).
   const claude = resolveClaudeBin();
 
-  // The runtime/config paths the sandboxed `claude` must read: its config dir +
-  // config file (skip-onboarding, see claudeConfigReads) + (when resolved) the
-  // binary itself and its install dir. System paths (/usr,/lib,/opt) stay
-  // readable; the per-session workspace (rw) is added by spawnAgent under sessionsDir.
-  const runtimeReadOnly = [...claudeConfigReads(), ...(claude?.reads ?? [])];
+  // Read binds the sandboxed `claude` needs in CONFINED (scoped-read) mode: the
+  // claude BINARY + its install dir (commonly under the home tree, which confined
+  // mode denies). The agent's config/onboarding now lives in its own per-session
+  // HOME (seedAgentHome) under the workspace — re-allowed there — so we no longer
+  // bind (or expose) the operator's real ~/.claude. In TRUSTED mode reads are
+  // broad and these binds are harmless no-ops. System paths (/usr,/lib,/opt) stay
+  // readable; the per-session workspace (rw) is added by spawnAgent.
+  const runtimeReadOnly = [...(claude?.reads ?? [])];
 
   return {
     hubOrigin: getHubOrigin(),

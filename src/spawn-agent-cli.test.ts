@@ -80,10 +80,11 @@ describe("parseArgs — name + channels + vault + egress + mounts → the right 
     expect(spec!.channels[1]).toEqual({ name: "second" });
   });
 
-  test("--egress-all sets egressUnrestricted and overrides --egress", () => {
-    const { spec } = parseArgs(["a", "--channel", "c", "--egress", "x.com", "--egress-all"]);
-    expect(spec!.egressUnrestricted).toBe(true);
-    expect(spec!.egress).toBeUndefined(); // allow-all is strictly broader
+  test("default is trusted (no isolation field); --confined sets it + keeps --egress", () => {
+    expect(parseArgs(["a", "--channel", "c"]).spec!.isolation).toBeUndefined(); // default trusted
+    const { spec } = parseArgs(["a", "--channel", "c", "--egress", "x.com", "--confined"]);
+    expect(spec!.isolation).toBe("confined");
+    expect(spec!.egress).toEqual(["x.com"]); // additive hosts kept (used under confined)
   });
 });
 

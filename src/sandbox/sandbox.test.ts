@@ -41,9 +41,12 @@ function fakeEngine(): SandboxEngine & {
   return rec;
 }
 
+// CONFINED so the config-shape assertions (allowedDomains floor, /Users deny)
+// apply; trusted is the default elsewhere and covered in config.test.ts.
 const SPEC: AgentSpec = {
   name: "arm",
   channels: ["ch"],
+  isolation: "confined",
   egress: ["registry.npmjs.org"],
   mounts: [{ hostPath: "/proj", mountPath: "/work", mode: "rw" }],
 };
@@ -92,12 +95,12 @@ describe("Sandbox adapter", () => {
     expect(engine.calls).toEqual(["reset", "initialize", "wrap"]);
   });
 
-  test("a RESTRICTED spawn's proxy env does NOT leak into a later OPEN spawn (the real-bug scenario)", async () => {
+  test("a CONFINED spawn's proxy env does NOT leak into a later TRUSTED spawn (the real-bug scenario)", async () => {
     // A leak-MODELING engine, mirroring the real singleton: `initialize` turns the
-    // proxy on iff the config has an allowlist (restricted); `wrap` emits HTTP_PROXY
+    // proxy on iff the config has an allowlist (confined); `wrap` emits HTTP_PROXY
     // iff the proxy is on; `reset` turns it off. Without the reset-before-init in
-    // Sandbox.wrap, the proxy would still be on from the restricted spawn and leak
-    // into the open spawn's env — exactly the live failure.
+    // Sandbox.wrap, the proxy would still be on from the confined spawn and leak
+    // into the trusted spawn's env — exactly the live failure.
     let proxyOn = false;
     const engine: SandboxEngine = {
       isSupportedPlatform: () => true,
@@ -113,13 +116,14 @@ describe("Sandbox adapter", () => {
       },
     };
     const sandbox = new Sandbox(engine);
-    // 1) restricted spawn → proxy on, HTTP_PROXY present.
-    const restricted = await sandbox.wrap({ spec: { name: "r", channels: ["c"] }, baseBinds: BASE_BINDS, egressBase: EGRESS_BASE, command: "claude" });
-    expect(restricted.env.HTTP_PROXY).toBeDefined();
-    // 2) open spawn right after → the per-wrap reset clears the proxy, so NO stale
-    //    HTTP_PROXY leaks in (the bug: claude would route to the dead proxy + die).
-    const open = await sandbox.wrap({ spec: { name: "o", channels: ["c"], egressUnrestricted: true }, baseBinds: BASE_BINDS, egressBase: EGRESS_BASE, command: "claude" });
-    expect(open.env.HTTP_PROXY).toBeUndefined();
+    // 1) confined spawn → allowlist present → proxy on, HTTP_PROXY present.
+    const confined = await sandbox.wrap({ spec: { name: "r", channels: ["c"], isolation: "confined" }, baseBinds: BASE_BINDS, egressBase: EGRESS_BASE, command: "claude" });
+    expect(confined.env.HTTP_PROXY).toBeDefined();
+    // 2) trusted spawn right after (the default) → the per-wrap reset clears the
+    //    proxy, so NO stale HTTP_PROXY leaks in (the bug: claude would route to the
+    //    dead proxy + die).
+    const trusted = await sandbox.wrap({ spec: { name: "o", channels: ["c"] }, baseBinds: BASE_BINDS, egressBase: EGRESS_BASE, command: "claude" });
+    expect(trusted.env.HTTP_PROXY).toBeUndefined();
   });
 
   test("reset() tears the engine down", async () => {
@@ -134,11 +138,11 @@ describe("Sandbox adapter", () => {
     expect(new Sandbox(engine).isSupportedPlatform()).toBe(true);
   });
 
-  test("SECURITY: a spec omitting egress still gets the base floor in the engine config", async () => {
+  test("SECURITY: a confined spec omitting egress still gets the base floor in the engine config", async () => {
     const engine = fakeEngine();
     const sandbox = new Sandbox(engine);
     await sandbox.wrap({
-      spec: { name: "x", channels: ["c"] }, // no egress declared
+      spec: { name: "x", channels: ["c"], isolation: "confined" }, // confined, no egress declared
       baseBinds: BASE_BINDS,
       egressBase: EGRESS_BASE,
       command: "claude",

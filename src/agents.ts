@@ -82,10 +82,10 @@ export interface RedactedSpawnResult {
   tokens: RedactedToken[];
   /** The MCP server entry keys wired into the session (names only). */
   mcpServers: string[];
-  /** Egress allowlist baked into the sandbox (empty when unrestricted). */
+  /** Isolation posture the session launched under. */
+  isolation: "trusted" | "confined";
+  /** Egress allowlist baked into the sandbox (empty when trusted/open). */
   egress: string[];
-  /** True when the session runs with NO network restriction (allow-all). */
-  egressUnrestricted: boolean;
 }
 
 /** The spawn/list/kill operations the daemon routes call. Injectable for tests. */
@@ -221,11 +221,11 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
     spec.vault = parseVaultEntry(b.vault);
   }
 
-  if (b.egressUnrestricted !== undefined && b.egressUnrestricted !== null) {
-    if (typeof b.egressUnrestricted !== "boolean") {
-      throw new SpawnRequestError("body.egressUnrestricted must be a boolean");
+  if (b.isolation !== undefined && b.isolation !== null) {
+    if (b.isolation !== "trusted" && b.isolation !== "confined") {
+      throw new SpawnRequestError('body.isolation must be "trusted" or "confined"');
     }
-    if (b.egressUnrestricted) spec.egressUnrestricted = true;
+    spec.isolation = b.isolation;
   }
 
   if (b.egress !== undefined && b.egress !== null) {
@@ -238,8 +238,9 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
         return h.trim();
       })
       .filter((h) => h.length > 0);
-    // egressUnrestricted is strictly broader; ignore per-host egress when set.
-    if (egress.length > 0 && !spec.egressUnrestricted) spec.egress = egress;
+    // Additional allowed hosts — only take effect under `isolation: "confined"`
+    // (trusted = fully open network); harmless to carry otherwise.
+    if (egress.length > 0) spec.egress = egress;
   }
 
   if (b.mounts !== undefined && b.mounts !== null) {
@@ -354,7 +355,7 @@ export function redactSpawnResult(result: SpawnAgentResult): RedactedSpawnResult
   } catch {
     mcpServers = [];
   }
-  // allowedDomains is absent when the session runs unrestricted (allow-all).
+  // allowedDomains is present only in CONFINED mode (trusted omits it = open net).
   const allowed = result.wrapped.config.network.allowedDomains as string[] | undefined;
   return {
     session: result.session,
@@ -362,8 +363,8 @@ export function redactSpawnResult(result: SpawnAgentResult): RedactedSpawnResult
     alreadyRunning: result.alreadyRunning,
     tokens,
     mcpServers,
+    isolation: allowed === undefined ? "trusted" : "confined",
     egress: allowed ?? [],
-    egressUnrestricted: allowed === undefined,
   };
 }
 

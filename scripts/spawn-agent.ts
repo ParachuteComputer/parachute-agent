@@ -62,8 +62,10 @@ Flags:
                                   The FIRST channel is the wake channel.
   --vault <name>:<read|write>[:tag1,tag2]
                                   optional vault MCP scope (+ optional tag-scope).
-  --egress <host,host,...>        optional additive egress allowlist (beyond the base).
-  --egress-all                    open the network entirely (allow ALL egress; trusted sessions only).
+  --confined                      isolate for UNTRUSTED input: scoped reads (home denied) +
+                                  egress restricted to the base + --egress hosts.
+                                  Default is "trusted": broad reads + open network.
+  --egress <host,host,...>        additive egress allowlist (only used with --confined).
   --mount <hostPath:mountPath:ro|rw[:shared]>
                                   filesystem mount (repeatable; optional).
   --help                          show this help.
@@ -177,7 +179,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
   const channels: AgentChannelSpec[] = [];
   let vault: AgentVaultSpec | undefined;
   const egress: string[] = [];
-  let egressUnrestricted = false;
+  let confined = false;
   const mounts: AgentMount[] = [];
 
   for (let i = 0; i < argv.length; i++) {
@@ -205,8 +207,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
         i++;
         break;
       }
-      case "--egress-all": {
-        egressUnrestricted = true;
+      case "--confined": {
+        confined = true;
         break;
       }
       case "--mount": {
@@ -231,8 +233,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
 
   const spec: AgentSpec = { name, channels };
   if (vault) spec.vault = vault;
-  if (egressUnrestricted) spec.egressUnrestricted = true;
-  else if (egress.length > 0) spec.egress = egress;
+  if (confined) spec.isolation = "confined";
+  if (egress.length > 0) spec.egress = egress;
   if (mounts.length > 0) spec.mounts = mounts;
   return { help: false, spec };
 }

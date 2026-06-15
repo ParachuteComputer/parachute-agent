@@ -25,7 +25,8 @@
  * subscription path).
  */
 
-import { writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { writeFileSync, mkdirSync, chmodSync, existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AgentSpec, BaseBinds } from "./sandbox/types.ts";
 import { normalizeChannel } from "./sandbox/types.ts";
@@ -212,10 +213,125 @@ export function buildAgentChildEnv(
 }
 
 /**
+ * Create the agent's PRIVATE, WRITABLE HOME inside its workspace and seed it so
+ * claude starts straight into a usable session — no onboarding flow, no per-folder
+ * trust prompt — and so ALL of claude's config/cache/log/lock/temp writes land
+ * here instead of EPERM-ing against the operator's (read-only, shared) real home.
+ *
+ * This is the keystone of a STABLE sandbox: claude always has a home it can fully
+ * read AND write, decoupled from the operator's ~/.claude (so concurrent agents
+ * never race/corrupt it).
+ *
+ * The seed is based on the operator's REAL `~/.claude.json` so the agent inherits
+ * a fully-COMPLETED first run — onboarding, theme, and every version-migration
+ * flag — which is robust to claude's evolving first-run sub-steps (chasing them
+ * one-by-one is exactly the fragility this avoids). We then strip the heavy /
+ * private bits: `projects` is REPLACED with just this workspace (pre-trusted), and
+ * `oauthAccount` is dropped (the agent authenticates via CLAUDE_CODE_OAUTH_TOKEN).
+ * If the operator has no config, fall back to the two flags that gate the prompts.
+ *
+ * Returns the env overrides (HOME + CLAUDE_CONFIG_DIR + XDG_* + the temp vars) to
+ * layer LAST over the launch env so they win over the inherited + engine env.
+ * Idempotent: an existing seed is left as-is (claude owns it after first boot).
+ * `operatorConfigPath` is injectable for tests.
+ */
+export function seedAgentHome(
+  workspace: string,
+  opts: { mcpServers?: string[]; operatorConfigPath?: string } = {},
+): Record<string, string> {
+  const mcpServerNames = opts.mcpServers ?? [];
+  const operatorConfigPath = opts.operatorConfigPath ?? join(homedir(), ".claude.json");
+  const home = join(workspace, "home");
+  const claudeDir = join(home, ".claude");
+  const tmp = join(workspace, "tmp");
+  mkdirSync(claudeDir, { recursive: true });
+  mkdirSync(tmp, { recursive: true });
+  // claude reads its primary config from `$CLAUDE_CONFIG_DIR/.claude.json` when
+  // CLAUDE_CONFIG_DIR is set (which we set below, to claudeDir) — NOT
+  // `$HOME/.claude.json`. Seed THERE. Only seed if absent — after first boot
+  // claude owns this file.
+  const seedPath = join(claudeDir, ".claude.json");
+  if (!existsSync(seedPath)) {
+    let base: Record<string, unknown> = {};
+    try {
+      if (existsSync(operatorConfigPath)) {
+        base = JSON.parse(readFileSync(operatorConfigPath, "utf-8")) as Record<string, unknown>;
+      }
+    } catch {
+      base = {}; // unreadable/garbage operator config → minimal seed
+    }
+    delete base.oauthAccount; // don't copy the operator's account into the agent home
+    const seed = {
+      ...base,
+      hasCompletedOnboarding: true,
+      // Replace the operator's project history with ONLY this workspace, pre-trusted
+      // AND with our own configured MCP servers pre-approved (claude otherwise
+      // prompts "New MCP server found in this project" for the workspace .mcp.json
+      // we wrote — these are operator-configured, not foreign, so pre-approve them).
+      projects: {
+        [workspace]: {
+          hasTrustDialogAccepted: true,
+          hasCompletedProjectOnboarding: true,
+          enabledMcpjsonServers: mcpServerNames,
+          enableAllProjectMcpServers: true,
+        },
+      },
+    };
+    writeFileSync(seedPath, JSON.stringify(seed, null, 2) + "\n", { mode: 0o600 });
+  }
+  // settings.json: pre-suppress the "are you sure?" meta-prompt that
+  // `--dangerously-skip-permissions` shows on first use (the operator's own config
+  // sets this too). Without it, skip-permissions just trades one prompt for another.
+  const settingsPath = join(claudeDir, "settings.json");
+  if (!existsSync(settingsPath)) {
+    writeFileSync(
+      settingsPath,
+      JSON.stringify({ skipDangerousModePermissionPrompt: true }, null, 2) + "\n",
+      { mode: 0o600 },
+    );
+  }
+  // NOTE: we deliberately do NOT override HOME. claude resolves its own install
+  // relative to $HOME (`$HOME/.local/...`); leaving HOME as the operator's means
+  // claude finds its real install (no "setup issue", no per-spawn self-reinstall).
+  // All of claude's WRITES are redirected to the per-session dirs below
+  // (CLAUDE_CONFIG_DIR + XDG + temp), so it never EPERMs on the operator's
+  // read-only home and concurrent agents don't share mutable config.
+  return {
+    CLAUDE_CONFIG_DIR: claudeDir,
+    XDG_CONFIG_HOME: join(home, ".config"),
+    XDG_DATA_HOME: join(home, ".local", "share"),
+    XDG_CACHE_HOME: join(home, ".cache"),
+    XDG_STATE_HOME: join(home, ".local", "state"),
+    XDG_RUNTIME_DIR: join(home, ".run"),
+    // claude's `/tmp/claude-<uid>` scratch dir follows CLAUDE_CODE_TMPDIR; TMPDIR/
+    // TMP/TEMP cover everything else. All inside the writable workspace, so claude
+    // never EPERMs on temp (the "could not start" death) regardless of read scope.
+    TMPDIR: tmp,
+    CLAUDE_CODE_TMPDIR: tmp,
+    TMP: tmp,
+    TEMP: tmp,
+    // An ephemeral sandboxed agent shouldn't auto-update itself — it would download
+    // a fresh claude into the per-session data dir on every spawn (bandwidth + disk
+    // for nothing; the agent is gone when the session ends). This narrow flag
+    // disables ONLY the updater — unlike CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC,
+    // which also disables the channels feature we depend on.
+    DISABLE_AUTOUPDATER: "1",
+  };
+}
+
+/**
  * Build the `claude` invocation argv (pre-sandbox-wrap). Interactive `claude`
  * (NOT `claude -p` — the session runs on the subscription, §1/§6) with the
  * strict, multi-entry MCP config and the dev-channels flag for the first channel
  * (the wake transport). `--strict-mcp-config` closes the MCP surface to the spec.
+ *
+ * `--dangerously-skip-permissions`: a spawned agent runs AUTONOMOUSLY — there is no
+ * human at the terminal to answer claude's in-app permission / dev-channels
+ * confirmation prompts, and the OS sandbox (+ scoped reads / egress when confined)
+ * is the real containment, so claude's own prompts are redundant friction. Skipping
+ * them is what lets the agent reach a usable state hands-off. (The meta "are you
+ * sure" for this flag is pre-suppressed via the seeded settings.json — see
+ * seedAgentHome.)
  */
 export function buildAgentClaudeArgs(opts: {
   mcpConfigPath: string;
@@ -225,6 +341,7 @@ export function buildAgentClaudeArgs(opts: {
   const bin = opts.claudeBin ?? "claude";
   return [
     bin,
+    "--dangerously-skip-permissions",
     "--strict-mcp-config",
     "--mcp-config",
     opts.mcpConfigPath,
@@ -385,30 +502,28 @@ export async function spawnAgent(
     }),
   );
 
-  // A writable per-session temp dir INSIDE the workspace (the workspace is the
-  // sandbox's one writable region). claude needs a writable TMPDIR to start — its
-  // default (`/tmp/claude-<uid>/…`) is OUTSIDE the workspace, which the sandbox
-  // DENIES, so without this claude dies immediately with
-  // "Claude Code could not start: EPERM … mkdir '/tmp/claude-<uid>/…'". Pointing
-  // TMPDIR (+ the claude-specific + the generic TMP/TEMP) at this dir keeps all of
-  // claude's scratch writes within the allowed workspace.
-  const sessionTmp = join(workspace, "tmp");
-  mkdirSync(sessionTmp, { recursive: true });
+  // The agent's private, writable, pre-seeded HOME + temp dirs (the stability
+  // keystone — see seedAgentHome). Everything claude reads/writes about itself
+  // lives here, inside the workspace (the sandbox's writable region). The MCP
+  // server names (from the config we just wrote) are pre-approved in the seed so
+  // claude doesn't prompt to trust the project's .mcp.json.
+  const mcpServerNames = Object.keys(
+    (JSON.parse(mcpConfigJson) as { mcpServers?: Record<string, unknown> }).mcpServers ?? {},
+  );
+  const homeEnv = seedAgentHome(workspace, { mcpServers: mcpServerNames });
 
   // Layer the scrubbed agent env UNDER the sandbox wrapper's env: the engine's
   // proxy vars / sandbox markers win over our childEnv on conflict;
   // CLAUDE_CODE_OAUTH_TOKEN + the passthrough fundamentals come from us;
-  // ANTHROPIC_API_KEY is absent. EXCEPTION: the temp vars are layered LAST so they
-  // override even the engine's own TMPDIR (which points at a non-writable path
-  // under our scoped-read policy — the cause of the "could not start" death).
+  // ANTHROPIC_API_KEY is absent. EXCEPTION: the HOME/config/temp vars are layered
+  // LAST so they override even the engine's own (e.g. its non-writable TMPDIR) —
+  // pointing claude at its private writable home is what stops the EPERM /
+  // "could not start" deaths.
   const childEnv = buildAgentChildEnv(deps.parentEnv ?? process.env, claudeOauthToken);
   const launchEnv: Record<string, string | undefined> = {
     ...childEnv,
     ...wrapped.env,
-    TMPDIR: sessionTmp,
-    CLAUDE_CODE_TMPDIR: sessionTmp,
-    TMP: sessionTmp,
-    TEMP: sessionTmp,
+    ...homeEnv,
   };
 
   await deps.tmux.newSession({

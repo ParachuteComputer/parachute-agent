@@ -64,7 +64,7 @@ afterEach(() => {
 d("LIVE Seatbelt — network egress", () => {
   test("positive control: the harness can run a trivial sandboxed command", async () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-pos-"));
-    const spec: AgentSpec = { name: "pos", channels: ["c"], egress: [] };
+    const spec: AgentSpec = { name: "pos", channels: ["c"], isolation: "confined", egress: [] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },
@@ -79,7 +79,7 @@ d("LIVE Seatbelt — network egress", () => {
   test("DENIED: curl to a host NOT in the allowlist is blocked", async () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-deny-"));
     // Allowlist the base only (anthropic + the loopback hub). example.com is NOT on it.
-    const spec: AgentSpec = { name: "deny", channels: ["c"], egress: [] };
+    const spec: AgentSpec = { name: "deny", channels: ["c"], isolation: "confined", egress: [] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },
@@ -99,7 +99,7 @@ d("LIVE Seatbelt — network egress", () => {
 
   test("a spec that adds an egress host gets that host on the allowlist (additive)", async () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-add-"));
-    const spec: AgentSpec = { name: "add", channels: ["c"], egress: ["example.com"] };
+    const spec: AgentSpec = { name: "add", channels: ["c"], isolation: "confined", egress: ["example.com"] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },
@@ -122,7 +122,7 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
     const secretFile = join(secretDir, "secret.txt");
     writeFileSync(secretFile, "TOPSECRET-do-not-read");
     try {
-      const spec: AgentSpec = { name: "read", channels: ["c"], egress: [] };
+      const spec: AgentSpec = { name: "read", channels: ["c"], isolation: "confined", egress: [] };
       const cfg = buildSandboxConfig({
         spec,
         baseBinds: { workspace, runtimeReadOnly: [] },
@@ -154,7 +154,7 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
     const secretFile = join(secretDir, "home-secret.txt");
     writeFileSync(secretFile, "HOME-TOPSECRET-do-not-read");
     try {
-      const spec: AgentSpec = { name: "homeread", channels: ["c"], egress: [] };
+      const spec: AgentSpec = { name: "homeread", channels: ["c"], isolation: "confined", egress: [] };
       // buildSandboxConfig with platform "darwin" → denyRead:["/Users"],
       // allowRead:[workspace]. We pass the config THROUGH unmodified.
       const cfg = buildSandboxConfig({
@@ -187,7 +187,7 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-read-ok-"));
     const f = join(workspace, "inside.txt");
     writeFileSync(f, "READABLE-inside-workspace");
-    const spec: AgentSpec = { name: "readok", channels: ["c"], egress: [] };
+    const spec: AgentSpec = { name: "readok", channels: ["c"], isolation: "confined", egress: [] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },
@@ -204,7 +204,7 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
     const outsideDir = mkdtempSync(join(tmpdir(), "sbx-live-outside-"));
     const target = join(outsideDir, "should-not-exist.txt");
     try {
-      const spec: AgentSpec = { name: "write", channels: ["c"], egress: [] };
+      const spec: AgentSpec = { name: "write", channels: ["c"], isolation: "confined", egress: [] };
       const cfg = buildSandboxConfig({
         spec,
         baseBinds: { workspace, runtimeReadOnly: [] },
@@ -223,7 +223,7 @@ d("LIVE Seatbelt — filesystem read confinement", () => {
   test("ALLOWED: writing INSIDE the workspace succeeds", async () => {
     workspace = mkdtempSync(join(tmpdir(), "sbx-live-write-ok-"));
     const target = join(workspace, "out.txt");
-    const spec: AgentSpec = { name: "writeok", channels: ["c"], egress: [] };
+    const spec: AgentSpec = { name: "writeok", channels: ["c"], isolation: "confined", egress: [] };
     const cfg = buildSandboxConfig({
       spec,
       baseBinds: { workspace, runtimeReadOnly: [] },

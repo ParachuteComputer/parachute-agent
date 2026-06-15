@@ -111,23 +111,36 @@ export interface AgentSpec {
   /** Additional MCP servers, by URL. */
   otherMcps?: OtherMcpSpec[];
   /**
-   * Network egress — ADDITIVE to a minimal non-removable base of
-   * `{ the Anthropic API host(s), the hub/vault origin }` (design §4.4). A
-   * weaver-style arm declares `[]` (base only); a code-building arm opens
-   * exactly the package/source hosts it needs.
+   * Isolation posture — the single knob that sets BOTH the read scope and the
+   * network egress, matched to the trust gradient:
+   *
+   *   - `"trusted"` (DEFAULT): the operator's own self-spawned agent on a flat
+   *     trust gradient. Reads are BROAD (the runtime default — claude reads its
+   *     binary, the system, the operator's files without per-path binds) and the
+   *     network is OPEN. Writes are still confined to the per-session workspace
+   *     (which holds the agent's private HOME), so it can't corrupt the operator's
+   *     real config or escape its workspace. This is what makes the sandbox STABLE
+   *     for running claude — claude's own runtime never collides with a deny.
+   *
+   *   - `"confined"`: for an agent fed FOREIGN/untrusted input. Reads are SCOPED
+   *     (home tree denied, re-allowed to workspace + the claude runtime + declared
+   *     mounts) and egress is RESTRICTED to the non-removable base
+   *     (`{ Anthropic API, hub/vault }`) UNIONed with `egress[]`. The real
+   *     isolation surface — only turn it on when the agent processes input you
+   *     don't trust.
+   *
+   * Defaults to `"trusted"` (owner-operated). The per-session writable HOME +
+   * temp + onboarding seed are provided in BOTH postures (claude must always be
+   * able to run); `isolation` only governs reach BEYOND claude's own runtime.
+   */
+  isolation?: "trusted" | "confined";
+  /**
+   * Network egress hosts ADDITIVE to the non-removable base — only meaningful
+   * under `isolation: "confined"` (in `"trusted"` the network is fully open, so
+   * this is ignored). A confined code-building agent opens exactly the
+   * package/source hosts it needs here.
    */
   egress?: string[];
-  /**
-   * Open the network entirely — allow ALL egress, ignoring `egress[]` and the
-   * base allowlist (the sandbox runs with no network restriction; filesystem
-   * isolation is unchanged). This is the operator's explicit, deliberate choice
-   * for a TRUSTED session where the convenience of unrestricted network outweighs
-   * the exfiltration surface ("I know how this is contained"). Egress is the
-   * load-bearing control for a session fed FOREIGN-authored input (design §3.3),
-   * so this must never be the default and must be an explicit per-spawn opt-in.
-   * Mutually overrides `egress` (allow-all is strictly broader).
-   */
-  egressUnrestricted?: boolean;
   /**
    * Filesystem mounts — ADDITIVE to the default private per-session workspace
    * (rw) + the implicit runtime/claude-config (ro). Reads are scoped to declared
