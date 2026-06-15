@@ -9,9 +9,28 @@ const BASE_BINDS: BaseBinds = {
 };
 const EGRESS_BASE: EgressBaseInput = { hubOrigin: "https://hub.example.com" };
 
+// These cases exercise the CONFINED posture (scoped reads + egress floor), so the
+// helper defaults to it; a spread `p` can override (e.g. to test trusted).
 function specOf(p: Partial<AgentSpec> = {}): AgentSpec {
-  return { name: "arm", channels: ["ch"], ...p };
+  return { name: "arm", channels: ["ch"], isolation: "confined", ...p };
 }
+
+describe("buildSandboxConfig — trusted (default) posture", () => {
+  test("trusted: NO read deny (broad) + NO allowedDomains (open network), writes still confined", () => {
+    const cfg = buildSandboxConfig({
+      spec: { name: "arm", channels: ["ch"] }, // no isolation → trusted default
+      baseBinds: BASE_BINDS,
+      egressBase: EGRESS_BASE,
+      platform: "darwin",
+    });
+    // Broad reads: no home-tree deny.
+    expect(cfg.filesystem.denyRead).toEqual([]);
+    // Open network: allowedDomains omitted entirely (runtime = no restriction).
+    expect((cfg.network as { allowedDomains?: string[] }).allowedDomains).toBeUndefined();
+    // Writes are STILL confined to the workspace even when trusted.
+    expect(cfg.filesystem.allowWrite).toContain("/state/sessions/arm");
+  });
+});
 
 describe("buildSandboxConfig — spec → SandboxRuntimeConfig", () => {
   test("network: deny-by-default + base floor present, deniedDomains empty", () => {

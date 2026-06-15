@@ -34,16 +34,21 @@ describe("resolveSpawnDeps", () => {
     expect(() => resolveSpawnDeps()).toThrow(SpawnDepsError);
   });
 
-  test("binds ~/.claude.json read-only (skip-onboarding regression guard)", () => {
+  test("binds the claude binary (confined reads) but NOT the operator's ~/.claude", () => {
     tmp = mkdtempSync(join(tmpdir(), "spawn-deps-"));
     process.env.PARACHUTE_HOME = tmp;
     writeFileSync(join(tmp, "operator.token"), "fake-operator-bearer");
     const deps = resolveSpawnDeps();
-    // The config FILE at the home root must be bound — this is the fix for the
-    // onboarding-connectivity death under restricted egress.
-    expect(deps.runtimeReadOnly).toContain(resolve(homedir(), ".claude.json"));
-    // And the config DIR.
-    const dir = process.env.CLAUDE_CONFIG_DIR ?? resolve(homedir(), ".claude");
-    expect(deps.runtimeReadOnly).toContain(dir);
+    // The agent's config/onboarding now lives in its own per-session HOME
+    // (seedAgentHome), so we no longer expose the operator's real config.
+    expect(deps.runtimeReadOnly).not.toContain(resolve(homedir(), ".claude.json"));
+    expect(deps.runtimeReadOnly).not.toContain(resolve(homedir(), ".claude"));
+    // The claude BINARY is still bound (needed under confined/scoped reads) when
+    // resolvable on PATH — and claudeBin is set to its absolute path.
+    const bin = Bun.which("claude");
+    if (bin) {
+      expect(deps.claudeBin).toBe(bin);
+      expect(deps.runtimeReadOnly).toContain(bin);
+    }
   });
 });

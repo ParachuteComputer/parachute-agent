@@ -1,5 +1,5 @@
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -8,6 +8,7 @@ import {
   buildAgentClaudeArgs,
   buildLaunchScript,
   realTmuxLauncher,
+  seedAgentHome,
   sessionName,
   shellJoin,
   type SpawnAgentDeps,
@@ -157,6 +158,8 @@ describe("buildAgentClaudeArgs", () => {
     expect(argv).toContain("--mcp-config");
     expect(argv).toContain("/ws/.mcp.json");
     expect(argv).toContain("--dangerously-load-development-channels=server:channel-aaron-dev");
+    // Autonomous: no human answers tool prompts; the sandbox is the containment.
+    expect(argv).toContain("--dangerously-skip-permissions");
     // NOT headless: no `-p`.
     expect(argv).not.toContain("-p");
   });
@@ -166,6 +169,80 @@ describe("shellJoin", () => {
   test("leaves safe args bare, quotes args with spaces", () => {
     expect(shellJoin(["claude", "--mcp-config", "/a/b.json"])).toBe("claude --mcp-config /a/b.json");
     expect(shellJoin(["echo", "a b"])).toBe("echo 'a b'");
+  });
+});
+
+describe("seedAgentHome — the per-session writable HOME (stability keystone)", () => {
+  test("seeds from the operator config (inherits first-run state), strips projects+oauthAccount, trusts the workspace", () => {
+    const ws = mkdtempSync(join(tmpdir(), "seed-home-"));
+    const opDir = mkdtempSync(join(tmpdir(), "seed-op-"));
+    const opPath = join(opDir, ".claude.json");
+    // A realistic operator config: completed first-run flags + history + account.
+    writeFileSync(opPath, JSON.stringify({
+      hasCompletedOnboarding: true,
+      theme: "dark",
+      numStartups: 536,
+      sonnet45MigrationComplete: true,
+      oauthAccount: { email: "op@example.com", secret: "DO-NOT-COPY" },
+      projects: { "/some/other/proj": { hasTrustDialogAccepted: true } },
+    }));
+    try {
+      const env = seedAgentHome(ws, { mcpServers: ["channel-uni-dev", "vault-default"], operatorConfigPath: opPath });
+      // Config + temp are redirected to per-session dirs INSIDE the workspace.
+      // (HOME is deliberately NOT overridden — claude finds its real install there.)
+      expect(env.HOME).toBeUndefined();
+      expect(env.CLAUDE_CONFIG_DIR).toBe(join(ws, "home", ".claude"));
+      expect(env.TMPDIR).toBe(join(ws, "tmp"));
+      expect(env.CLAUDE_CODE_TMPDIR).toBe(join(ws, "tmp"));
+      const seed = JSON.parse(readFileSync(join(ws, "home", ".claude", ".claude.json"), "utf8")) as Record<string, unknown>;
+      // Inherits the operator's completed first-run state (onboarding, theme, migrations).
+      expect(seed.hasCompletedOnboarding).toBe(true);
+      expect(seed.theme).toBe("dark");
+      expect(seed.sonnet45MigrationComplete).toBe(true);
+      // Strips the account; replaces project history with ONLY this workspace, trusted.
+      expect(seed.oauthAccount).toBeUndefined();
+      const projects = seed.projects as Record<string, { hasTrustDialogAccepted: boolean; hasCompletedProjectOnboarding: boolean }>;
+      expect(Object.keys(projects)).toEqual([ws]);
+      expect(projects[ws]!.hasTrustDialogAccepted).toBe(true);
+      expect(projects[ws]!.hasCompletedProjectOnboarding).toBe(true);
+      // Our configured MCP servers are pre-approved (no "trust this MCP server" prompt).
+      expect((projects[ws] as { enabledMcpjsonServers?: string[] }).enabledMcpjsonServers).toEqual([
+        "channel-uni-dev",
+        "vault-default",
+      ]);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+      rmSync(opDir, { recursive: true, force: true });
+    }
+  });
+
+  test("falls back to the minimal seed when the operator has no config", () => {
+    const ws = mkdtempSync(join(tmpdir(), "seed-home-noop-"));
+    try {
+      seedAgentHome(ws, { operatorConfigPath: join(ws, "does-not-exist.json") });
+      const seed = JSON.parse(readFileSync(join(ws, "home", ".claude", ".claude.json"), "utf8")) as {
+        hasCompletedOnboarding: boolean;
+        projects: Record<string, { hasTrustDialogAccepted: boolean }>;
+      };
+      expect(seed.hasCompletedOnboarding).toBe(true);
+      expect(seed.projects[ws]!.hasTrustDialogAccepted).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  test("idempotent — an existing seed is left as-is (claude owns it after first boot)", () => {
+    const ws = mkdtempSync(join(tmpdir(), "seed-home-idem-"));
+    const noop = join(ws, "no-operator.json");
+    try {
+      seedAgentHome(ws, { operatorConfigPath: noop });
+      const path = join(ws, "home", ".claude", ".claude.json");
+      writeFileSync(path, JSON.stringify({ hasCompletedOnboarding: true, mine: true }));
+      seedAgentHome(ws, { operatorConfigPath: noop }); // second call must not clobber
+      expect(JSON.parse(readFileSync(path, "utf8")).mine).toBe(true);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
   });
 });
 
@@ -180,6 +257,7 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
       name: "aaron-dev",
       channels: ["aaron-dev"],
       vault: { name: "default", access: "read", tags: ["#channel-message"] },
+      isolation: "confined", // exercise the egress floor + scoped reads (step 6)
     };
     const res = await spawnAgent(spec, baseDeps({ tmux, sandboxEngine: engine }));
 

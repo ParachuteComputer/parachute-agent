@@ -216,18 +216,20 @@ export const AGENTS_UI_HTML = `<!doctype html>
           </div>
 
           <div>
-            <label for="net-mode">Network</label>
+            <label for="net-mode">Isolation</label>
             <select id="net-mode">
-              <option value="open" selected>Open — full network access (default)</option>
-              <option value="restricted">Restricted — only Anthropic API + hub/vault + listed hosts</option>
+              <option value="trusted" selected>Trusted — full read + open network (default)</option>
+              <option value="confined">Confined — scoped reads + restricted network (untrusted input)</option>
             </select>
             <div id="egress-wrap" style="display:none; margin-top:8px;">
               <label for="egress">Additional allowed hosts (comma-separated)</label>
               <input type="text" id="egress" placeholder="registry.npmjs.org, github.com" autocomplete="off" />
             </div>
             <div id="open-warn" class="muted" style="display:none; font-size:12px; margin-top:8px;">
-              Open is the default — the session reaches the network like any local process (it's still
-              filesystem-sandboxed). Choose Restricted to confine egress when a session handles untrusted input.
+              Trusted is the default for your own agents — the session reads the system + your files and
+              reaches the network like any local process (it still gets a private writable home and can't
+              write outside its workspace). Choose Confined for an agent that handles untrusted input:
+              its reads are scoped to its workspace and its network is restricted.
             </div>
           </div>
 
@@ -410,15 +412,16 @@ export const AGENTS_UI_HTML = `<!doctype html>
   }
   document.getElementById("add-mount").addEventListener("click", function () { mountRow(); });
 
-  // Network mode toggle: show host list only when restricted; warn when open.
+  // Isolation toggle: show the additional-hosts field only when Confined; show the
+  // explainer note when Trusted (the default).
   var netMode = document.getElementById("net-mode");
   function syncNetMode() {
-    var open = netMode.value === "open";
-    document.getElementById("egress-wrap").style.display = open ? "none" : "";
-    document.getElementById("open-warn").style.display = open ? "" : "none";
+    var trusted = netMode.value === "trusted";
+    document.getElementById("egress-wrap").style.display = trusted ? "none" : "";
+    document.getElementById("open-warn").style.display = trusted ? "" : "none";
   }
   netMode.addEventListener("change", syncNetMode);
-  syncNetMode(); // default is open → show the note, hide the hosts field
+  syncNetMode(); // default is trusted → show the note, hide the hosts field
 
   function collectSpec() {
     var wake = chanEl.value;
@@ -440,12 +443,12 @@ export const AGENTS_UI_HTML = `<!doctype html>
       spec.vault = v;
     }
 
-    if (netMode.value === "open") {
-      spec.egressUnrestricted = true;
-    } else {
+    if (netMode.value === "confined") {
+      spec.isolation = "confined";
       var egress = document.getElementById("egress").value.split(",").map(function (h) { return h.trim(); }).filter(Boolean);
       if (egress.length) spec.egress = egress;
     }
+    // else: trusted (default) — no isolation field; broad reads + open network.
 
     var mounts = [];
     document.querySelectorAll("#mounts-rows .mrow").forEach(function (row) {
@@ -477,7 +480,8 @@ export const AGENTS_UI_HTML = `<!doctype html>
           r.tokens.forEach(function (t) { lines.push("  " + t.resource + " → " + t.scope); });
         }
         if (r.mcpServers && r.mcpServers.length) lines.push("MCP servers: " + r.mcpServers.join(", "));
-        lines.push("network: " + (r.egressUnrestricted ? "OPEN (all hosts)" : ((r.egress || []).join(", ") || "base only")));
+        lines.push("isolation: " + (r.isolation || "trusted") +
+          (r.isolation === "confined" ? " (egress: " + ((r.egress || []).join(", ") || "base only") + ")" : " (full read + open network)"));
       }
       showMsg(msg, lines.join("\\n"), false);
       loadAgents();

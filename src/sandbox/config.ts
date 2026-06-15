@@ -56,17 +56,22 @@ export function currentSandboxPlatform(): SandboxPlatform {
 export function buildSandboxConfig(input: BuildSandboxConfigInput): SandboxRuntimeConfig {
   const platform = input.platform ?? currentSandboxPlatform();
 
-  const fs = composeFilesystemView(input.baseBinds, input.spec.mounts, platform);
+  // The single isolation knob (default "trusted") sets BOTH read scope + egress.
+  const confined = input.spec.isolation === "confined";
 
-  // Network: by default the non-removable base unioned with the spec's additions.
-  // When the spec opts into `egressUnrestricted`, we OMIT `allowedDomains` entirely
-  // — the sandbox-runtime treats an absent allowedDomains as "no network
-  // restriction" (verified: present-but-empty = block all; absent = allow all).
-  // The cast is because the runtime's TS type marks allowedDomains required while
-  // its runtime honors the absent case as the documented allow-all path.
-  const network: SandboxRuntimeConfig["network"] = input.spec.egressUnrestricted
-    ? ({ deniedDomains: [] } as unknown as SandboxRuntimeConfig["network"])
-    : { allowedDomains: composeEgressAllowlist(input.egressBase, input.spec.egress), deniedDomains: [] };
+  // Reads are scoped only when confined; trusted = broad reads (claude's own
+  // runtime never collides with a deny — the stability win). Writes are confined
+  // to the workspace in both.
+  const fs = composeFilesystemView(input.baseBinds, input.spec.mounts, platform, confined);
+
+  // Network: trusted = OPEN (omit `allowedDomains` — the runtime treats an absent
+  // allowedDomains as "no restriction"; verified: present-but-empty = block all,
+  // absent = allow all). confined = the non-removable base UNIONed with the spec's
+  // additions. The cast is because the runtime's TS type marks allowedDomains
+  // required while its runtime honors the absent case as the documented allow-all.
+  const network: SandboxRuntimeConfig["network"] = confined
+    ? { allowedDomains: composeEgressAllowlist(input.egressBase, input.spec.egress), deniedDomains: [] }
+    : ({ deniedDomains: [] } as unknown as SandboxRuntimeConfig["network"]);
 
   const config: SandboxRuntimeConfig = {
     network,

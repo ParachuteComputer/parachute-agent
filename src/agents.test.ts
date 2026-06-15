@@ -139,13 +139,14 @@ describe("buildSpecFromBody", () => {
       buildSpecFromBody({ name: "a", channels: ["c"], mounts: [{ hostPath: "/h", mountPath: "/m", mode: "x" }] }),
     ).toThrow(/mode/);
   });
-  test("egressUnrestricted is accepted and overrides per-host egress", () => {
-    const spec = buildSpecFromBody({ name: "a", channels: ["c"], egressUnrestricted: true, egress: ["x.com"] });
-    expect(spec.egressUnrestricted).toBe(true);
-    expect(spec.egress).toBeUndefined(); // allow-all is strictly broader
+  test("isolation defaults to trusted (omitted) and accepts 'confined' + egress", () => {
+    expect(buildSpecFromBody({ name: "a", channels: ["c"] }).isolation).toBeUndefined(); // default = trusted
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], isolation: "confined", egress: ["x.com"] });
+    expect(spec.isolation).toBe("confined");
+    expect(spec.egress).toEqual(["x.com"]); // additive hosts kept (used under confined)
   });
-  test("rejects a non-boolean egressUnrestricted", () => {
-    expect(() => buildSpecFromBody({ name: "a", channels: ["c"], egressUnrestricted: "yes" })).toThrow(/egressUnrestricted/);
+  test("rejects an invalid isolation value", () => {
+    expect(() => buildSpecFromBody({ name: "a", channels: ["c"], isolation: "loose" })).toThrow(/isolation/);
   });
   test("rejects relative mount paths (must be absolute)", () => {
     expect(() =>
@@ -182,23 +183,23 @@ describe("redactSpawnResult", () => {
     ]);
     expect(red.mcpServers).toEqual(["channel-aaron", "vault-default"]);
     expect(red.egress).toEqual(["api.anthropic.com:443"]);
-    expect(red.egressUnrestricted).toBe(false);
+    expect(red.isolation).toBe("confined"); // allowedDomains present → confined
     // The smoking gun: no token VALUE appears anywhere in the serialized result.
     const wire = JSON.stringify(red);
     expect(wire).not.toContain("SECRET-CHANNEL-TOKEN");
     expect(wire).not.toContain("SECRET-VAULT-TOKEN");
   });
-  test("an unrestricted-network result (no allowedDomains) → egressUnrestricted true, egress []", () => {
-    const unrestricted: SpawnAgentResult = {
+  test("a trusted result (no allowedDomains) → isolation 'trusted', egress []", () => {
+    const trusted: SpawnAgentResult = {
       ...result,
       wrapped: {
         ...result.wrapped,
-        // allow-all: allowedDomains absent (the runtime's no-restriction shape).
+        // trusted: allowedDomains absent (the runtime's no-restriction shape).
         config: { network: { deniedDomains: [] }, filesystem: { denyRead: [], allowWrite: [], denyWrite: [] } } as unknown as SpawnAgentResult["wrapped"]["config"],
       },
     };
-    const red = redactSpawnResult(unrestricted);
-    expect(red.egressUnrestricted).toBe(true);
+    const red = redactSpawnResult(trusted);
+    expect(red.isolation).toBe("trusted");
     expect(red.egress).toEqual([]);
   });
 });
