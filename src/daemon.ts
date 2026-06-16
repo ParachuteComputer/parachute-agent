@@ -58,7 +58,8 @@ import {
   removeChannelClaudeCredential,
   describeClaudeCredentials,
 } from "./credentials.ts";
-import { ClientRegistry } from "./routing.ts";
+import { ClientRegistry, sseFrame } from "./routing.ts";
+import { DeliveryState } from "./delivery-state.ts";
 import {
   requireScope,
   extractToken,
@@ -99,6 +100,8 @@ import {
   pushToChannel as mcpPushToChannel,
   pushPermissionVerdict as mcpPushPermissionVerdict,
   mcpSessionCount,
+  setOnSessionConnect,
+  assertMcpSdkStreamContract,
 } from "./mcp-http.ts";
 import { renderAdminPage } from "./admin-ui.ts";
 import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
@@ -203,7 +206,11 @@ const START_CMD: string[] = resolveStartCmd(INSTALL_DIR);
 // ---------------------------------------------------------------------------
 
 /** Build the per-channel context a transport routes through. */
-function contextFor(registry: ClientRegistry, channel: string): TransportContext {
+function contextFor(
+  registry: ClientRegistry,
+  channel: string,
+  deliveryState: DeliveryState,
+): TransportContext {
   return {
     channel,
     emit(msg: InboundMessage): void {
@@ -211,7 +218,7 @@ function contextFor(registry: ClientRegistry, channel: string): TransportContext
       // channel is authoritative. This makes it impossible for a transport to
       // emit onto another channel (closing a silent cross-channel-leak footgun)
       // even if a future transport sets msg.channel incorrectly.
-      registry.routeToChannel(channel, "message", {
+      const sseDelivered = registry.routeToChannel(channel, "message", {
         content: msg.content,
         meta: msg.meta,
         source: msg.source,
@@ -220,13 +227,152 @@ function contextFor(registry: ClientRegistry, channel: string): TransportContext
       // over /mcp/<channel> (vs. the stdio bridge over /events) receives the
       // same inbound as a server-pushed notifications/claude/channel. Additive:
       // the SSE path above is untouched.
-      mcpPushToChannel(channel, msg.content, msg.meta);
+      const mcpDelivered = mcpPushToChannel(channel, msg.content, msg.meta);
+
+      // Advance the per-channel delivery high-water-mark ONLY on a real delivery
+      // (≥1 live subscriber across SSE bridges + MCP sessions). If nobody was
+      // listening (delivered === 0) we deliberately leave the mark BEHIND so this
+      // message replays the next time a session (re)connects — the spine of the
+      // no-silent-loss fix. The note's ts rides in `meta.ts` (ingestInbound
+      // flattens the note metadata, which carries the vault-written `ts`).
+      const delivered = sseDelivered + mcpDelivered;
+      const ts = msg.meta?.ts;
+      if (delivered > 0 && typeof ts === "string" && ts) {
+        deliveryState.advance(channel, ts);
+      }
     },
     emitPermissionVerdict(v): void {
       registry.routeToChannel(channel, "permission_verdict", v);
       mcpPushPermissionVerdict(channel, v);
     },
   };
+}
+
+/** The replayed-message shape handed to a per-session / per-stream `deliverOne`.
+ *  Mirrors what `contextFor.emit` fans out so a replayed wake is indistinguishable
+ *  from a live one to the receiving session. */
+export interface ReplayMessage {
+  content: string;
+  meta: Record<string, string>;
+  source: string;
+}
+
+/** Hard cap on how many backlog messages a single (re)connect replays — newest N.
+ *  A long deaf window shouldn't dump hundreds of messages onto a freshly-attached
+ *  session; the older ones stay durable in the vault and visible in the transcript. */
+export const REPLAY_CAP = 50;
+
+/**
+ * Replay the inbound backlog a channel missed onto a SINGLE newly-(re)connected
+ * subscriber — the recovery half of the no-silent-loss fix.
+ *
+ * On (re)connect (an MCP session attaching, or an SSE bridge reopening `/events`)
+ * we load the channel's durable transcript, keep the INBOUND messages with `ts`
+ * strictly newer than the delivery high-water-mark (the ones emitted while nobody
+ * was listening, or that arrived during the daemon's restart deaf window), and
+ * hand each — oldest-first — to `deliverOne`, which targets ONLY this one new
+ * subscriber (a per-session MCP push / a write to this one SSE stream). Targeting
+ * a single subscriber is deliberate: a broadcast would re-wake sessions that
+ * already saw these messages.
+ *
+ * VAULT-ONLY. Replay needs a durable transcript to read; only `VaultTransport`
+ * has one. http-ui / telegram channels are skipped (a non-vault transport, or a
+ * channel with no transport, returns 0 — nothing to replay).
+ *
+ * CAPPED. At most `REPLAY_CAP` (the NEWEST) messages are replayed; a longer
+ * backlog is truncated with a log note. The older messages remain durable in the
+ * vault and render in the transcript — they're just not pushed as fresh wakes.
+ *
+ * MARK ADVANCE. After a successful replay the mark advances to the newest replayed
+ * `ts` (monotonic), so a second connect on the same channel replays nothing. A
+ * `deliverOne` that throws aborts before advancing that message's ts, so a failed
+ * push doesn't silently mark the message delivered.
+ *
+ * Returns the number of messages delivered (0 for a non-vault / missing channel,
+ * or an empty backlog). Best-effort on the load: a transcript read failure is
+ * logged and treated as an empty backlog — a (re)connect must never fail because
+ * the vault was briefly unreachable.
+ */
+export async function replayBacklog(
+  channels: Map<string, Channel>,
+  deliveryState: DeliveryState,
+  channel: string,
+  deliverOne: (msg: ReplayMessage) => void,
+): Promise<number> {
+  const ch = channels.get(channel);
+  const transport = ch?.transport;
+  // VAULT-ONLY: a durable transcript is the prerequisite for replay.
+  if (!(transport instanceof VaultTransport)) return 0;
+
+  const mark = deliveryState.getLastDelivered(channel);
+
+  let transcript;
+  try {
+    // Reuse the index-free, tag-only transcript read (no metadata-operator query —
+    // `channel` isn't indexed). It returns BOTH directions sorted ascending by ts.
+    transcript = await transport.loadTranscript();
+  } catch (err) {
+    // The vault was unreachable / errored — don't fail the connect. Nothing to
+    // replay this time; the mark stays put so a later connect retries the backlog.
+    console.warn(
+      `parachute-channel: replayBacklog for "${channel}" — transcript load failed (${(err as Error).message}); ` +
+        `skipping replay (backlog stays durable in the vault).`,
+    );
+    return 0;
+  }
+
+  // Keep only INBOUND messages newer than the mark, with a usable ts (we advance
+  // the mark by ts, so a blank-ts message can't be tracked → skip it). Ascending
+  // by ts already (loadTranscript sorts), but filter preserves order.
+  let pending = transcript.filter(
+    (m) => m.direction === "inbound" && typeof m.ts === "string" && m.ts > mark,
+  );
+  if (pending.length === 0) return 0;
+
+  // Cap at the NEWEST REPLAY_CAP — drop the oldest overflow (they stay in the vault).
+  if (pending.length > REPLAY_CAP) {
+    const dropped = pending.length - REPLAY_CAP;
+    console.log(
+      `parachute-channel: replayBacklog for "${channel}" — backlog of ${pending.length} exceeds cap ${REPLAY_CAP}; ` +
+        `replaying the newest ${REPLAY_CAP}, ${dropped} older message(s) left in the vault transcript.`,
+    );
+    pending = pending.slice(pending.length - REPLAY_CAP);
+  }
+
+  let delivered = 0;
+  for (const m of pending) {
+    // Re-read the LIVE mark each iteration. `mark` above was snapshotted BEFORE the
+    // `await loadTranscript()`, so a concurrent emit (a live delivery) or a racing
+    // second (re)connect on the same channel may have advanced the mark past this
+    // message in the meantime. Skip anything already delivered so two near-
+    // simultaneous connects can't double-deliver the same backlog. (Reviewer nit, PR #67.)
+    if (m.ts <= deliveryState.getLastDelivered(channel)) continue;
+    // Shape the replayed wake to match a live `ingestInbound` emit: content +
+    // flattened meta (carrying the ORIGINAL ts so the receiving session sees the
+    // real arrival time) + provenance fields the session keys off.
+    const meta: Record<string, string> = {
+      ts: m.ts,
+      sender: m.sender,
+      source: "vault",
+      note_id: m.id,
+      direction: "inbound",
+      replay: "true", // marks this as a backlog replay (vs. a live wake) for any consumer that cares
+    };
+    if (m.inReplyTo) meta.in_reply_to = m.inReplyTo;
+    // deliverOne targets ONLY this one new subscriber (the SSE caller writes to
+    // its own stream; the MCP caller pushes to its own session). Both current
+    // callers swallow a dead-stream/dead-session error internally, so the loop
+    // runs to completion in practice. The `advance` BELOW (after deliverOne) is
+    // the load-bearing safety property: were deliverOne ever to throw, we abort
+    // before advancing THIS message's ts, so it's never silently marked delivered.
+    deliverOne({ content: m.text, meta, source: "vault" });
+    // Advance per-message (monotonic). Ordering matters: advancing only after a
+    // successful deliverOne means a (hypothetical) mid-loop throw leaves the mark
+    // at the last delivered ts, so the next connect resumes from there.
+    deliveryState.advance(channel, m.ts);
+    delivered++;
+  }
+  return delivered;
 }
 
 /**
@@ -245,6 +391,7 @@ async function addChannelLive(
   channels: Map<string, Channel>,
   registry: ClientRegistry,
   entry: ChannelEntry,
+  deliveryState: DeliveryState,
 ): Promise<Channel> {
   const existing = channels.get(entry.name);
   if (existing) {
@@ -260,7 +407,7 @@ async function addChannelLive(
   const transport = instantiateTransport(entry);
   const channel: Channel = { name: entry.name, transport, entry };
   channels.set(entry.name, channel);
-  await transport.start(contextFor(registry, entry.name));
+  await transport.start(contextFor(registry, entry.name, deliveryState));
   return channel;
 }
 
@@ -904,12 +1051,29 @@ function clampQueryDim(raw: string | null, fallback: number): number {
 export function createFetchHandler(
   channels: Map<string, Channel>,
   registry: ClientRegistry,
-  opts?: { agentOps?: AgentOps },
+  opts?: { agentOps?: AgentOps; deliveryState?: DeliveryState },
 ): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
   // Spawn/list/kill operations behind the web agents surface. Lazily defaulted to
   // the real ops (resolve-deps + real tmux); tests inject a stub so the routes are
   // exercised without a hub, a sandbox, or a tmux server. Built once per handler.
   const agentOps: AgentOps = opts?.agentOps ?? createRealAgentOps();
+
+  // Per-channel delivery high-water-mark store (the no-silent-loss spine). The
+  // daemon's `main` passes the boot-time instance; tests that don't care get a
+  // throwaway instance whose default mark is "now" — so a test channel never
+  // surprise-replays its whole transcript on connect. The MCP connect hook +
+  // the SSE `/events` replay below both run `replayBacklog` against it.
+  const deliveryState: DeliveryState = opts?.deliveryState ?? new DeliveryState();
+
+  // Install the MCP connect hook: when an MCP session's GET push stream goes live
+  // (mcp-http's handleMcp GET branch → fireConnectReplay — NOT at registration,
+  // which precedes the stream and would drop the pushes), replay its missed backlog
+  // to THAT session only. Last-handler-wins is fine — one live daemon; tests reset it.
+  setOnSessionConnect((channel, pushToThisSession) => {
+    void replayBacklog(channels, deliveryState, channel, (msg) =>
+      pushToThisSession(msg.content, msg.meta),
+    );
+  });
   /** Resolve the transport for a channel name, or null on miss. */
   function transportFor(channel: string | undefined): Transport | null {
     if (!channel) return null;
@@ -1174,7 +1338,7 @@ export function createFetchHandler(
         return json({ error: `failed to write channels.json: ${(err as Error).message}` }, 500);
       }
       try {
-        await addChannelLive(channels, registry, entry);
+        await addChannelLive(channels, registry, entry, deliveryState);
       } catch (err) {
         return json(
           {
@@ -1414,6 +1578,21 @@ export function createFetchHandler(
             enqueue: (payload) => controller.enqueue(payload),
           });
           controller.enqueue(": connected\n\n");
+          // Replay any backlog this (re)connecting stdio bridge missed while it
+          // was detached — written to THIS stream only (a per-stream `message`
+          // frame, the same event the live route emits), so a reconnect after a
+          // daemon restart / a deaf window picks up the messages that arrived in
+          // the gap. Fire-and-forget: a vault read failure inside replayBacklog is
+          // logged + treated as an empty backlog, never failing the connect.
+          void replayBacklog(channels, deliveryState, subscribedChannel, (msg) => {
+            try {
+              controller.enqueue(
+                sseFrame("message", { content: msg.content, meta: msg.meta, source: msg.source }),
+              );
+            } catch {
+              // Stream already closed — drop; the next connect retries the backlog.
+            }
+          });
         },
         cancel() {
           registry.remove(clientId);
@@ -1868,6 +2047,11 @@ function main(): void {
   mkdirSync(STATE_DIR, { recursive: true });
   mkdirSync(INBOX_DIR, { recursive: true });
 
+  // Verify the one MCP SDK internal our HTTP-MCP delivery accounting reads
+  // (`_streamMapping['_GET_stream']`, see assertMcpSdkStreamContract). A screaming
+  // boot error on SDK drift beats discovering it as silent message loss later.
+  assertMcpSdkStreamContract();
+
   let channels: Map<string, Channel>;
   try {
     channels = loadRegistry({ stateDir: STATE_DIR });
@@ -1887,13 +2071,24 @@ function main(): void {
 
   const registry = new ClientRegistry();
 
+  // Per-channel delivery high-water-mark store, constructed ONCE at boot with the
+  // daemon's boot time as the default mark — so a channel with no persisted mark
+  // replays only messages that arrive AFTER this start (the deaf-window case),
+  // never its whole vault history. Persisted marks (from a prior run) survive the
+  // restart and replay exactly the gap. Shared by `contextFor.emit` (advance) and
+  // both connect-hook replays (MCP session + SSE bridge).
+  const deliveryState = new DeliveryState({
+    stateDir: STATE_DIR,
+    defaultMark: new Date().toISOString(),
+  });
+
   // The terminal WS handler set (pty↔socket relay + backpressure flow control,
   // src/terminal.ts). One handler object serves every terminal connection;
   // per-connection state lives on `ws.data`. The fetch handler routes accepted
   // upgrades into these via `server.upgrade(req, { data })`.
   const terminalWs = createTerminalWsHandlers();
 
-  const fetchHandler = createFetchHandler(channels, registry);
+  const fetchHandler = createFetchHandler(channels, registry, { deliveryState });
   const server = Bun.serve<TerminalWsData, never>({
     port: PORT,
     hostname: "127.0.0.1",
@@ -1977,7 +2172,7 @@ function main(): void {
   // Per-channel failures are logged and don't abort the others; the daemon must
   // still serve the channels that did come up.
   for (const channel of [...channels.values()]) {
-    addChannelLive(channels, registry, channel.entry).catch((err) => {
+    addChannelLive(channels, registry, channel.entry, deliveryState).catch((err) => {
       console.error(`parachute-channel: transport "${channel.name}" start failed:`, err);
     });
   }

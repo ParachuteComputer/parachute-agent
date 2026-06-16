@@ -240,6 +240,17 @@ Bearer `vault:<name>:write`).
 - `.env` — optional generic env vars (e.g. `PARACHUTE_HUB_ORIGIN`). The daemon no longer consumes `TELEGRAM_BOT_TOKEN` here.
 - `access.json` — allowlist (compatible with the official plugin's format)
 - `inbox/` — downloaded attachments
+- `delivery-state.json` — per-channel last-delivered high-water-mark (`{ "<channel>": "<iso-ts>" }`), the spine of the no-silent-loss guarantee (below). Cheap, monotonic, write-through; losing it only costs a bounded re-replay.
+
+## No silent message loss (delivery high-water-mark + backlog replay)
+
+A connected vault-backed session used to go silently deaf after a daemon restart: MCP sessions drop on restart and only reconnect on the next interaction, and an inbound that lands with **zero** live subscribers reaches no one — yet the vault trigger acks success and stamps `..._rendered_at`, so it never re-fires. The message stays durable in the vault but is lost from the live wake.
+
+The fix (`src/delivery-state.ts`):
+- **Per-channel high-water-mark** — the ISO `ts` of the last inbound we actually delivered to ≥1 live subscriber. `contextFor.emit` advances it ONLY on a real delivery (SSE client count + MCP session count > 0); a 0-subscriber emit deliberately leaves the mark behind so the message replays later. Monotonic (never rewinds), persisted to `delivery-state.json`. A channel with no persisted mark defaults to the **daemon boot time** — so a first connect never replays ancient history, only the genuine deaf-window gap.
+- **Backlog replay on (re)connect** (`replayBacklog`, VAULT channels only) — when an MCP session registers or an SSE bridge reopens `/events`, the daemon loads the channel transcript (reusing the index-free `loadTranscript`), replays the inbound messages newer than the mark — oldest-first, capped at the newest 50 — to **that one new subscriber only** (a per-session MCP push / a write to that one SSE stream, so existing subscribers aren't re-woken), then advances the mark.
+
+`markSeen` (the webhook idempotency dedup that prevents the N-trigger fan-out from double-waking) is unchanged and orthogonal — the backlog path is gated by the mark, not by `markSeen`.
 
 ## Access control (`access.json`)
 

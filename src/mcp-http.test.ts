@@ -11,6 +11,7 @@ import {
   pushToChannel,
   pushPermissionVerdict,
   mcpSessionCount,
+  assertMcpSdkStreamContract,
   _resetSessionsForTest,
 } from "./mcp-http.ts";
 import { createFetchHandler } from "./daemon.ts";
@@ -97,6 +98,41 @@ describe("per-channel MCP session registry + wake push", () => {
   test("push to an unknown channel delivers to nobody (0)", () => {
     expect(pushToChannel("nope", "x", {})).toBe(0);
     expect(pushPermissionVerdict("nope", { request_id: "r", behavior: "deny" })).toBe(0);
+  });
+
+  test("a streamless session (registered, no live GET stream) is NOT counted as delivered", () => {
+    // The bug this guards: a session that POSTed `initialize` but hasn't opened (or
+    // has dropped) its standalone GET stream is registered, but the SDK silently
+    // drops any notification to it. If pushToChannel counted it, the daemon would
+    // advance the channel's delivery mark and the message would be lost.
+    const a = fakeSession();
+    _registerSessionForTest("A", "sid-streamless", a.server as never, ["channel:read"], {
+      streamless: true,
+    });
+    expect(mcpSessionCount("A")).toBe(1); // it IS registered…
+    expect(pushToChannel("A", "into the void", {})).toBe(0); // …but NOT deliverable
+    expect(a.captured.notes).toHaveLength(0); // not even attempted
+    // Permission verdicts honor the same gate.
+    expect(pushPermissionVerdict("A", { request_id: "r", behavior: "allow" })).toBe(0);
+  });
+
+  test("pushToChannel counts only the live-stream sessions in a mixed set", () => {
+    const live = fakeSession();
+    const dead = fakeSession();
+    _registerSessionForTest("A", "sid-live", live.server as never, ["channel:read"]);
+    _registerSessionForTest("A", "sid-streamless", dead.server as never, ["channel:read"], {
+      streamless: true,
+    });
+    expect(mcpSessionCount("A")).toBe(2); // both registered
+    expect(pushToChannel("A", "hi", {})).toBe(1); // only the one with a live stream
+    expect(live.captured.notes).toHaveLength(1);
+    expect(dead.captured.notes).toHaveLength(0);
+  });
+
+  test("the installed MCP SDK still keys the standalone GET stream as we expect (contract guard)", () => {
+    // If this fails, the SDK renamed the internal sessionHasLivePushStream reads —
+    // HTTP-MCP delivery would silently break. Catch it here, not in production.
+    expect(assertMcpSdkStreamContract()).toBe(true);
   });
 
   test("mcpSessionCount tracks registration + reset", () => {
