@@ -70,6 +70,41 @@ const sessionsByChannel = new Map<string, Set<McpSession>>();
 /** mcp-session-id → session, so a follow-up POST/GET/DELETE finds its transport. */
 const sessionsById = new Map<string, McpSession>();
 
+/**
+ * Connect-hook the daemon installs (via `setOnSessionConnect`) so a NEWLY
+ * connected MCP session can replay the backlog it missed while the daemon had no
+ * subscriber on the channel (the deaf-on-restart / 0-subscriber case). It's
+ * invoked right after `onsessioninitialized` registers the session, with a
+ * `pushToThisSession` bound to ONLY the new session — so the daemon's
+ * `replayBacklog` wakes this one connection without re-waking the others.
+ *
+ * Optional: unset in unit tests that don't exercise replay; the registration path
+ * no-ops when absent.
+ */
+type OnSessionConnect = (
+  channel: string,
+  pushToThisSession: (content: string, meta: Record<string, string>) => void,
+) => void;
+let onSessionConnect: OnSessionConnect | undefined;
+
+/** The daemon calls this once at boot to install the backlog-replay connect hook. */
+export function setOnSessionConnect(hook: OnSessionConnect | undefined): void {
+  onSessionConnect = hook;
+}
+
+/** Push a `notifications/claude/channel` wake to ONE session (used by backlog replay,
+ *  so a reconnecting session gets its missed messages without re-waking the others). */
+function pushToSession(session: McpSession, content: string, meta: Record<string, string>): void {
+  try {
+    void session.server.notification({
+      method: "notifications/claude/channel",
+      params: { content, meta: { source: "parachute-channel", ...meta } },
+    });
+  } catch {
+    // Dead session — its onclose handler removes it from the set; nothing to do.
+  }
+}
+
 function registerSession(channel: string, id: string, session: McpSession): void {
   let set = sessionsByChannel.get(channel);
   if (!set) {
@@ -78,6 +113,11 @@ function registerSession(channel: string, id: string, session: McpSession): void
   }
   set.add(session);
   sessionsById.set(id, session);
+  // Fire the daemon-installed connect hook so this freshly-registered session
+  // replays any backlog it missed — targeted at THIS session only.
+  if (onSessionConnect) {
+    onSessionConnect(channel, (content, meta) => pushToSession(session, content, meta));
+  }
 }
 
 function unregisterSession(channel: string, id: string): void {
@@ -95,10 +135,13 @@ export function mcpSessionCount(channel: string): number {
   return sessionsByChannel.get(channel)?.size ?? 0;
 }
 
-/** Test/teardown helper — drop every registered session without touching transports. */
+/** Test/teardown helper — drop every registered session without touching transports.
+ *  Also clears the connect hook so a hook installed by one test's createFetchHandler
+ *  can't leak into the next test's `_registerSessionForTest`. */
 export function _resetSessionsForTest(): void {
   sessionsByChannel.clear();
   sessionsById.clear();
+  onSessionConnect = undefined;
 }
 
 /**
