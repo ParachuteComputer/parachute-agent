@@ -340,6 +340,12 @@ export async function replayBacklog(
 
   let delivered = 0;
   for (const m of pending) {
+    // Re-read the LIVE mark each iteration. `mark` above was snapshotted BEFORE the
+    // `await loadTranscript()`, so a concurrent emit (a live delivery) or a racing
+    // second (re)connect on the same channel may have advanced the mark past this
+    // message in the meantime. Skip anything already delivered so two near-
+    // simultaneous connects can't double-deliver the same backlog. (Reviewer nit, PR #67.)
+    if (m.ts <= deliveryState.getLastDelivered(channel)) continue;
     // Shape the replayed wake to match a live `ingestInbound` emit: content +
     // flattened meta (carrying the ORIGINAL ts so the receiving session sees the
     // real arrival time) + provenance fields the session keys off.
@@ -1058,9 +1064,10 @@ export function createFetchHandler(
   // the SSE `/events` replay below both run `replayBacklog` against it.
   const deliveryState: DeliveryState = opts?.deliveryState ?? new DeliveryState();
 
-  // Install the MCP connect hook: when a NEW MCP session registers (in
-  // mcp-http's onsessioninitialized), replay its missed backlog to THAT session
-  // only. Last-handler-wins is fine — there's one live daemon; tests reset it.
+  // Install the MCP connect hook: when an MCP session's GET push stream goes live
+  // (mcp-http's handleMcp GET branch → fireConnectReplay — NOT at registration,
+  // which precedes the stream and would drop the pushes), replay its missed backlog
+  // to THAT session only. Last-handler-wins is fine — one live daemon; tests reset it.
   setOnSessionConnect((channel, pushToThisSession) => {
     void replayBacklog(channels, deliveryState, channel, (msg) =>
       pushToThisSession(msg.content, msg.meta),

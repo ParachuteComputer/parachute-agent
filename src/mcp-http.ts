@@ -113,11 +113,43 @@ function registerSession(channel: string, id: string, session: McpSession): void
   }
   set.add(session);
   sessionsById.set(id, session);
-  // Fire the daemon-installed connect hook so this freshly-registered session
-  // replays any backlog it missed — targeted at THIS session only.
-  if (onSessionConnect) {
-    onSessionConnect(channel, (content, meta) => pushToSession(session, content, meta));
-  }
+  // NOTE: backlog replay is deliberately NOT fired here. Registration happens at
+  // `onsessioninitialized` — DURING the POST initialize, BEFORE the client opens
+  // its standalone GET SSE stream. The SDK silently drops server-initiated
+  // notifications when that stream isn't open yet (webStandardStreamableHttp
+  // send(): "Stream is disconnected ... nothing more to do" — no event store, so
+  // nothing is buffered). Replaying here would push the backlog into the void
+  // while the channel's delivery mark advanced past it — silent loss. Replay is
+  // fired from `fireConnectReplay` once the GET stream is provably live (see
+  // handleMcp's GET branch).
+}
+
+/**
+ * Whether a session has a LIVE standalone GET SSE push stream — the stream the
+ * SDK writes `notifications/claude/channel` onto. A session that has only POSTed
+ * `initialize` (registered) but not yet opened — or has since dropped — its GET
+ * stream is NOT deliverable: `transport.send()` silently no-ops for it (no event
+ * store is configured, so the message is dropped, not buffered). We read the SAME
+ * internal map the SDK's send() consults (`_streamMapping['_GET_stream']`), so our
+ * notion of "deliverable" can never disagree with whether the SDK actually writes.
+ */
+function sessionHasLivePushStream(session: McpSession): boolean {
+  const t = session.transport as unknown as
+    | { _streamMapping?: Map<string, unknown> }
+    | undefined;
+  return !!t && t._streamMapping?.get("_GET_stream") !== undefined;
+}
+
+/**
+ * Fire the daemon-installed backlog-replay hook for ONE session whose GET stream
+ * is now live — replays the messages it missed, targeted at this session only.
+ * No-ops when no hook is installed or the session has no live push stream (so a
+ * streamless session waits to be replayed until it actually opens its stream).
+ */
+function fireConnectReplay(channel: string, session: McpSession): void {
+  if (!onSessionConnect) return;
+  if (!sessionHasLivePushStream(session)) return;
+  onSessionConnect(channel, (content, meta) => pushToSession(session, content, meta));
 }
 
 function unregisterSession(channel: string, id: string): void {
@@ -154,8 +186,22 @@ export function _registerSessionForTest(
   id: string,
   server: Server,
   scopes: string[],
+  opts?: { streamless?: boolean },
 ): void {
-  registerSession(channel, id, { server, transport: undefined as never, scopes });
+  // Model the real transport's deliverability: a connected session whose GET
+  // stream is open carries `_streamMapping['_GET_stream']` — the same key
+  // sessionHasLivePushStream + the SDK's send() consult. `streamless: true` models
+  // a session that registered (POSTed initialize) but never opened — or has since
+  // dropped — its GET stream: registered but NOT deliverable.
+  const transport = opts?.streamless
+    ? (undefined as never)
+    : ({ _streamMapping: new Map<string, unknown>([["_GET_stream", {}]]) } as never);
+  const session: McpSession = { server, transport, scopes };
+  registerSession(channel, id, session);
+  // Production fires replay from handleMcp's GET branch once the stream is live;
+  // mirror that here so the connect-replay tests exercise the real trigger path.
+  // No-ops for a streamless session (it has no live stream to receive a push).
+  fireConnectReplay(channel, session);
 }
 
 /** Test-only: remove a registered session — exercises the empty-set cleanup path. */
@@ -182,6 +228,12 @@ export function pushToChannel(
   if (!set) return 0;
   let delivered = 0;
   for (const session of set) {
+    // Only sessions with a LIVE GET push stream are deliverable. The SDK silently
+    // drops a notification to a streamless session (no throw, nothing buffered), so
+    // counting one here would falsely advance the channel's delivery mark and lose
+    // the message. A skipped session receives the message via backlog replay when
+    // it (re)opens its GET stream (handleMcp's GET branch → fireConnectReplay).
+    if (!sessionHasLivePushStream(session)) continue;
     try {
       void session.server.notification({
         method: "notifications/claude/channel",
@@ -209,6 +261,9 @@ export function pushPermissionVerdict(
   if (!set) return 0;
   let delivered = 0;
   for (const session of set) {
+    // Same deliverability gate as pushToChannel: a streamless session can't
+    // receive the verdict (the SDK would drop it), so don't claim it did.
+    if (!sessionHasLivePushStream(session)) continue;
     try {
       void session.server.notification({
         method: "notifications/claude/channel/permission",
@@ -514,7 +569,15 @@ export async function handleMcp(
     // a re-auth with a narrower/wider token takes effect (the daemon re-validates
     // channel:read on every call before reaching here).
     existing.scopes = scopes;
-    return existing.transport.handleRequest(req);
+    const res = await existing.transport.handleRequest(req);
+    // A GET opens (or reopens, after a drop) the standalone SSE push stream. The
+    // SDK registers it synchronously inside handleRequest, so it's provably live
+    // now — replay the backlog this session missed. Firing at registration would
+    // push into a not-yet-open stream and the SDK would silently drop it. This is
+    // idempotent: replayBacklog only delivers messages newer than the channel's
+    // delivery mark, so a reconnect (or a redundant GET) replays nothing already seen.
+    if (req.method === "GET") fireConnectReplay(channel, existing);
+    return res;
   }
 
   if (req.method === "DELETE") {

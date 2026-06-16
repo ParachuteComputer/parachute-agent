@@ -353,6 +353,31 @@ describe("MCP connect replays the backlog to the new session only", () => {
     // Mark advanced past the replayed message → a third connect replays nothing.
     expect(ds.getLastDelivered("eng")).toBe("2026-06-16T10:05:00.000Z");
   });
+
+  test("a STREAMLESS session does not replay or advance the mark (it waits for its GET stream)", async () => {
+    // A session that registered but never opened its GET push stream is not
+    // deliverable; replay must NOT fire for it (firing would push into the void and
+    // advance the mark past a message nobody received — the silent-loss bug). The
+    // backlog stays pending until the session opens its stream.
+    const ds = new DeliveryState({ stateDir, defaultMark: "2026-01-01T00:00:00.000Z" });
+    ds.advance("eng", "2026-06-16T10:00:00.000Z");
+    const t = stubVault("eng", [
+      { id: "in-pending", text: "still here?", direction: "inbound", sender: "a", ts: "2026-06-16T10:05:00.000Z" },
+    ]);
+    const channels = vaultChannels("eng", t);
+    const registry = new ClientRegistry();
+    createFetchHandler(channels, registry, { deliveryState: ds });
+
+    const streamless = capture();
+    _registerSessionForTest("eng", "sid-streamless", streamless.server as never, ["channel:read"], {
+      streamless: true,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(mcpSessionCount("eng")).toBe(1); // registered…
+    expect(streamless.wakes()).toHaveLength(0); // …but got no replay
+    expect(ds.getLastDelivered("eng")).toBe("2026-06-16T10:00:00.000Z"); // mark held — message still pending
+  });
 });
 
 // ---------------------------------------------------------------------------

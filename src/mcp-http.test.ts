@@ -99,6 +99,35 @@ describe("per-channel MCP session registry + wake push", () => {
     expect(pushPermissionVerdict("nope", { request_id: "r", behavior: "deny" })).toBe(0);
   });
 
+  test("a streamless session (registered, no live GET stream) is NOT counted as delivered", () => {
+    // The bug this guards: a session that POSTed `initialize` but hasn't opened (or
+    // has dropped) its standalone GET stream is registered, but the SDK silently
+    // drops any notification to it. If pushToChannel counted it, the daemon would
+    // advance the channel's delivery mark and the message would be lost.
+    const a = fakeSession();
+    _registerSessionForTest("A", "sid-streamless", a.server as never, ["channel:read"], {
+      streamless: true,
+    });
+    expect(mcpSessionCount("A")).toBe(1); // it IS registered…
+    expect(pushToChannel("A", "into the void", {})).toBe(0); // …but NOT deliverable
+    expect(a.captured.notes).toHaveLength(0); // not even attempted
+    // Permission verdicts honor the same gate.
+    expect(pushPermissionVerdict("A", { request_id: "r", behavior: "allow" })).toBe(0);
+  });
+
+  test("pushToChannel counts only the live-stream sessions in a mixed set", () => {
+    const live = fakeSession();
+    const dead = fakeSession();
+    _registerSessionForTest("A", "sid-live", live.server as never, ["channel:read"]);
+    _registerSessionForTest("A", "sid-streamless", dead.server as never, ["channel:read"], {
+      streamless: true,
+    });
+    expect(mcpSessionCount("A")).toBe(2); // both registered
+    expect(pushToChannel("A", "hi", {})).toBe(1); // only the one with a live stream
+    expect(live.captured.notes).toHaveLength(1);
+    expect(dead.captured.notes).toHaveLength(0);
+  });
+
   test("mcpSessionCount tracks registration + reset", () => {
     expect(mcpSessionCount("A")).toBe(0);
     const a = fakeSession();
