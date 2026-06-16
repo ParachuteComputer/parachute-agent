@@ -101,6 +101,7 @@ import {
   pushPermissionVerdict as mcpPushPermissionVerdict,
   mcpSessionCount,
   setOnSessionConnect,
+  assertMcpSdkStreamContract,
 } from "./mcp-http.ts";
 import { renderAdminPage } from "./admin-ui.ts";
 import { THEME_CSS, appShell, SHELL_JS } from "./ui-kit.ts";
@@ -2045,6 +2046,11 @@ function toReplyArgs(body: {
 function main(): void {
   mkdirSync(STATE_DIR, { recursive: true });
   mkdirSync(INBOX_DIR, { recursive: true });
+
+  // Verify the one MCP SDK internal our HTTP-MCP delivery accounting reads
+  // (`_streamMapping['_GET_stream']`, see assertMcpSdkStreamContract). A screaming
+  // boot error on SDK drift beats discovering it as silent message loss later.
+  assertMcpSdkStreamContract();
 
   let channels: Map<string, Channel>;
   try {

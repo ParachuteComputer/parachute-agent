@@ -167,6 +167,45 @@ export function mcpSessionCount(channel: string): number {
   return sessionsByChannel.get(channel)?.size ?? 0;
 }
 
+/**
+ * Boot-time guard for the ONE SDK internal `sessionHasLivePushStream` depends on:
+ * the standalone GET stream is keyed by `_standaloneSseStreamId === "_GET_stream"`
+ * inside the transport's `_streamMapping`. We read that private field (the SDK
+ * exposes no public "is the push stream open?" API), so an SDK upgrade that renamed
+ * it would make `sessionHasLivePushStream` return false forever — silently breaking
+ * ALL HTTP-MCP delivery (both the live wake AND backlog replay), since both now gate
+ * on it. The caret pin (`^1.x`) lets a `bun update` pull such a version, so we verify
+ * the contract LOUDLY at boot rather than discover it as silent message loss in
+ * production. Verified against @modelcontextprotocol/sdk 1.29.x. Returns true when
+ * the contract holds; logs a screaming error and returns false otherwise.
+ */
+export function assertMcpSdkStreamContract(): boolean {
+  try {
+    const probe = new WebStandardStreamableHTTPServerTransport({
+      sessionIdGenerator: () => "contract-probe",
+      enableJsonResponse: false,
+    });
+    const id = (probe as unknown as { _standaloneSseStreamId?: unknown })._standaloneSseStreamId;
+    const hasMap =
+      (probe as unknown as { _streamMapping?: unknown })._streamMapping instanceof Map;
+    if (id === "_GET_stream" && hasMap) return true;
+    console.error(
+      "parachute-channel: FATAL CONTRACT DRIFT — the MCP SDK's standalone-GET-stream " +
+        `internals changed (expected _standaloneSseStreamId="_GET_stream" + a _streamMapping Map; ` +
+        `got id=${JSON.stringify(id)}, map=${hasMap}). sessionHasLivePushStream() can no longer ` +
+        "detect a live push stream, so HTTP-MCP channel delivery (live wake AND backlog replay) is " +
+        "BROKEN. Pin @modelcontextprotocol/sdk back, or update mcp-http.ts to the new internals.",
+    );
+    return false;
+  } catch (err) {
+    console.error(
+      `parachute-channel: could not verify MCP SDK stream contract (${(err as Error).message}); ` +
+        "HTTP-MCP delivery may be unreliable.",
+    );
+    return false;
+  }
+}
+
 /** Test/teardown helper — drop every registered session without touching transports.
  *  Also clears the connect hook so a hook installed by one test's createFetchHandler
  *  can't leak into the next test's `_registerSessionForTest`. */

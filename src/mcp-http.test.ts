@@ -11,6 +11,7 @@ import {
   pushToChannel,
   pushPermissionVerdict,
   mcpSessionCount,
+  assertMcpSdkStreamContract,
   _resetSessionsForTest,
 } from "./mcp-http.ts";
 import { createFetchHandler } from "./daemon.ts";
@@ -126,6 +127,12 @@ describe("per-channel MCP session registry + wake push", () => {
     expect(pushToChannel("A", "hi", {})).toBe(1); // only the one with a live stream
     expect(live.captured.notes).toHaveLength(1);
     expect(dead.captured.notes).toHaveLength(0);
+  });
+
+  test("the installed MCP SDK still keys the standalone GET stream as we expect (contract guard)", () => {
+    // If this fails, the SDK renamed the internal sessionHasLivePushStream reads —
+    // HTTP-MCP delivery would silently break. Catch it here, not in production.
+    expect(assertMcpSdkStreamContract()).toBe(true);
   });
 
   test("mcpSessionCount tracks registration + reset", () => {
