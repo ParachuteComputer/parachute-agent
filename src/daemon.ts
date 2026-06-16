@@ -57,6 +57,10 @@ import {
   setChannelClaudeCredential,
   removeChannelClaudeCredential,
   describeClaudeCredentials,
+  setChannelEnvVar,
+  removeChannelEnvVar,
+  describeChannelEnv,
+  DenylistedEnvError,
 } from "./credentials.ts";
 import { ClientRegistry, sseFrame } from "./routing.ts";
 import { DeliveryState } from "./delivery-state.ts";
@@ -1452,6 +1456,76 @@ export function createFetchHandler(
     }
 
     // ---------------------------------------------------------------------
+    // Generic per-channel ENV-VAR store (GH_TOKEN / CLOUDFLARE_API_TOKEN / …) —
+    // the secrets a launched agent's `gh`/`git`/build tooling needs. Same
+    // `channel:admin` gate + 0600 file-store + redaction-on-read posture as the
+    // Claude credential API above. A blank/omitted `channel` targets the
+    // operator-level DEFAULT layer; a channel name targets that channel's override.
+    // Denylisted names (the Claude-auth trio) are REJECTED with a 400 — they'd break
+    // the managed subscription-billing guarantee.
+    //
+    //   GET    /api/credentials/env          → { default:[names], channels:{ch:[names]} } (NO values)
+    //   POST   /api/credentials/env  { channel?, name, value } → set
+    //   DELETE /api/credentials/env  { channel?, name } (or ?channel=&name=) → remove
+    //
+    // Externally hub strips `/channel`, so these are `<hub>/channel/api/credentials/env`.
+    // ---------------------------------------------------------------------
+    if (
+      url.pathname === "/api/credentials/env" &&
+      (req.method === "GET" || req.method === "POST" || req.method === "DELETE")
+    ) {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+
+      if (req.method === "GET") {
+        // Inspect WITHOUT leaking values: names per channel + the default layer.
+        return json(describeChannelEnv(defaultStateDir()));
+      }
+
+      let envBody: { channel?: unknown; name?: unknown; value?: unknown };
+      try {
+        envBody = (await req.json()) as typeof envBody;
+      } catch {
+        return json({ error: "invalid JSON body" }, 400);
+      }
+      // `channel` is optional — blank/absent/empty means the operator-level default.
+      const channelRaw = typeof envBody.channel === "string" ? envBody.channel : "";
+      const channel = channelRaw.length > 0 ? channelRaw : null;
+      if (typeof envBody.name !== "string" || envBody.name.length === 0) {
+        return json({ error: "body.name (non-empty string) is required" }, 400);
+      }
+      const name = envBody.name;
+
+      if (req.method === "DELETE") {
+        let removed: boolean;
+        try {
+          removed = removeChannelEnvVar(channel, name, defaultStateDir());
+        } catch (err) {
+          return json({ error: `failed to update credentials.json: ${(err as Error).message}` }, 500);
+        }
+        return json({ ok: true, scope: channel ? "channel" : "default", ...(channel ? { channel } : {}), name, removed });
+      }
+
+      // POST — set the var.
+      if (typeof envBody.value !== "string" || envBody.value.length === 0) {
+        return json({ error: "body.value (non-empty string) is required" }, 400);
+      }
+      try {
+        setChannelEnvVar(channel, name, envBody.value, defaultStateDir());
+      } catch (err) {
+        // A denylisted name (ANTHROPIC_API_KEY/CLAUDE_API_KEY/CLAUDE_CODE_OAUTH_TOKEN)
+        // or a malformed name is the operator's mistake → 400 with the clear reason.
+        if (err instanceof DenylistedEnvError) return json({ error: err.message }, 400);
+        if ((err as Error).message?.startsWith("credentials:")) {
+          return json({ error: (err as Error).message }, 400);
+        }
+        return json({ error: `failed to write credentials.json: ${(err as Error).message}` }, 500);
+      }
+      // Echo back only the fact of the write — never the value.
+      return json({ ok: true, scope: channel ? "channel" : "default", ...(channel ? { channel } : {}), name });
+    }
+
+    // ---------------------------------------------------------------------
     // Agent management API (the web spawn/list/kill surface, design §4/§5) —
     // the SAME least-privilege launch path as the operator CLI
     // (`scripts/spawn-agent.ts`), driven from the browser. Operator-gated on
@@ -1508,6 +1582,33 @@ export function createFetchHandler(
           return json({ error: `token mint failed: ${err.message}` }, err.status >= 400 && err.status < 600 ? err.status : 502);
         }
         // A bad slug (spawnAgent's guard) or any other launch fault.
+        return json({ error: (err as Error).message }, 400);
+      }
+    }
+
+    // PER-SESSION restart — POST /api/agents/:name/restart (channel:admin). Kills
+    // `<name>-agent`, then re-spawns from the persisted spec, re-resolving the env
+    // store + Claude credential, so a newly-set credential applies in ONE click.
+    // PER-SESSION ONLY — no blanket "restart all" (the operator controls each
+    // session; restarting one never disrupts another). Must match BEFORE the
+    // single-segment DELETE below (this is a 2-segment subpath). Same error→status
+    // mapping as the spawn route (a missing spec / bad slug → 400; no operator token
+    // → 503; a refused mint → the hub status; a missing credential → 400 with the fix).
+    const restartMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/restart$/);
+    if (restartMatch && req.method === "POST") {
+      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      if (denied) return denied;
+      const name = decodeURIComponent(restartMatch[1]!);
+      try {
+        const result = await agentOps.restart(name);
+        return json(result);
+      } catch (err) {
+        if (err instanceof SpawnRequestError) return json({ error: err.message }, 400);
+        if (err instanceof SpawnDepsError) return json({ error: err.message }, 503);
+        if (err instanceof CredentialNotConfiguredError) return json({ error: err.message }, 400);
+        if (err instanceof MintError) {
+          return json({ error: `token mint failed: ${err.message}` }, err.status >= 400 && err.status < 600 ? err.status : 502);
+        }
         return json({ error: (err as Error).message }, 400);
       }
     }

@@ -30,6 +30,7 @@ import {
   spawnAgent,
   sessionName,
   sessionWorkspace,
+  readPersistedSpec,
   type SpawnAgentResult,
   type SpawnAgentDeps,
 } from "./spawn-agent.ts";
@@ -90,7 +91,13 @@ export interface RedactedSpawnResult {
   egress: string[];
 }
 
-/** The spawn/list/kill operations the daemon routes call. Injectable for tests. */
+/** The redacted result a per-session restart returns. */
+export interface RedactedRestartResult extends RedactedSpawnResult {
+  /** Whether a previous live session was killed (false = it wasn't running). */
+  killed: boolean;
+}
+
+/** The spawn/list/kill/restart operations the daemon routes call. Injectable for tests. */
 export interface AgentOps {
   /** Launch a sandboxed agent session from a validated spec. */
   spawn(spec: AgentSpec): Promise<SpawnAgentResult>;
@@ -98,6 +105,12 @@ export interface AgentOps {
   list(): Promise<AgentInfo[]>;
   /** Kill an agent session by name (returns whether one existed). */
   kill(name: string): Promise<{ killed: boolean }>;
+  /**
+   * PER-SESSION restart: kill `<name>-agent`, then re-spawn from the persisted spec
+   * (re-resolving env + the Claude credential), so a newly-set credential applies.
+   * Returns the redacted spawn result + whether a prior session was killed.
+   */
+  restart(name: string): Promise<RedactedRestartResult>;
 }
 
 /** A tmux admin seam — real impl shells out to tmux; tests inject a recorder. */
@@ -420,6 +433,38 @@ export function createRealAgentOps(opts?: {
       }
       const killed = await tmux.killSession(sessionName(name));
       return { killed };
+    },
+    async restart(name) {
+      if (!AGENT_NAME_SLUG.test(name)) {
+        throw new SpawnRequestError(
+          `agent name "${name}" must be a slug (alphanumeric, dash, underscore only)`,
+        );
+      }
+      // Recover the original launch params from the persisted spec (the live tmux
+      // session carries none of them; the workspace's .mcp.json inlines minted
+      // tokens, not a clean spec). No spec → can't faithfully reproduce → a clear
+      // error (the operator kills + re-spawns from the form instead).
+      const workspace = sessionWorkspace(dir, name);
+      const spec = readPersistedSpec(workspace);
+      if (!spec) {
+        throw new SpawnRequestError(
+          `cannot restart agent "${name}": no persisted spec at ${workspace}/spec.json ` +
+            `(it predates spawn-spec persistence, or was never spawned through this daemon). ` +
+            `Kill it and spawn a fresh session from the Agents page.`,
+        );
+      }
+      // Kill the existing session FIRST — spawnAgent is idempotent (a live session is
+      // a no-op), so without the kill a restart wouldn't re-source env. killSession is
+      // a no-op for a missing session (the restart still re-spawns), so a restart also
+      // doubles as "bring back a crashed/stopped session from its spec."
+      const killed = await tmux.killSession(sessionName(name));
+      // Re-spawn with FRESHLY-resolved deps — the env store + Claude credential are
+      // re-read here, so a credential set just before this restart is now applied. A
+      // fresh spawn (NOT `claude -c`) is deliberate: see the daemon route's note on
+      // the context-loss tradeoff. The MCP/channel reconnect is inherent — the new
+      // session re-establishes its channel MCP entries from the regenerated config.
+      const result = await spawnAgent(spec, depsFactory());
+      return { ...redactSpawnResult(result), killed };
     },
   };
 }

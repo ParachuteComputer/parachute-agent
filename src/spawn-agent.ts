@@ -45,7 +45,7 @@ import {
   type MintTokenDeps,
   type MintResult,
 } from "./mint-token.ts";
-import { resolveClaudeCredential } from "./credentials.ts";
+import { resolveClaudeCredential, resolveChannelEnv, DENYLISTED_ENV } from "./credentials.ts";
 
 /**
  * Slug guard for `spec.name`. The name is used UNESCAPED as a tmux session
@@ -121,6 +121,16 @@ export interface SpawnAgentDeps {
    * runs without auth).
    */
   resolveClaudeToken?: (channel: string) => string;
+  /**
+   * Resolve the per-channel ENV vars (the GH_TOKEN/CLOUDFLARE_* slice) to inject
+   * into the sandboxed child, given the spec's wake channel. Defaults to the real
+   * env store (`credentials.ts` — `{ ...default, ...channels[ch] }`, denylisted
+   * keys stripped). Tests inject a stub so they never read a real store. Read at
+   * spawn time so a var set via the config API applies on the next spawn / restart
+   * without a daemon restart. A missing/empty store resolves to `{}` (a channel
+   * with no scoped env is fine — unlike the Claude token, env injection is optional).
+   */
+  resolveChannelEnv?: (channel: string) => Record<string, string>;
   /** Sandbox engine override (tests inject a fake). */
   sandboxEngine?: SandboxEngine;
   /** tmux launcher (tests inject a recorder). */
@@ -163,6 +173,42 @@ export function sessionWorkspace(sessionsDir: string, specName: string): string 
   return join(sessionsDir, specName);
 }
 
+/** Path to the persisted spawn-spec for a session (recovered by restart). */
+export function specFilePath(workspace: string): string {
+  return join(workspace, "spec.json");
+}
+
+/**
+ * Persist the spawn {@link AgentSpec} alongside the session workspace so a
+ * per-session restart can faithfully reproduce the original launch (same channels,
+ * vault, network, mounts) WITHOUT re-asking the operator. The live tmux session
+ * carries none of this — `GET /api/agents` only knows name + attached — and the
+ * workspace's `.mcp.json` inlines minted tokens (not a clean spec), so the spec
+ * itself is the recoverable source of truth.
+ *
+ * The spec is NON-SECRET (channel names, access verbs, vault name, host paths) —
+ * the actual credentials live in credentials.json (Claude) / the env store and are
+ * re-resolved at each (re)spawn — so 0644 is fine; we still write under the 0700-ish
+ * per-session workspace. Returns the path written.
+ */
+export function persistSpec(workspace: string, spec: AgentSpec): string {
+  mkdirSync(workspace, { recursive: true });
+  const path = specFilePath(workspace);
+  writeFileSync(path, JSON.stringify(spec, null, 2) + "\n");
+  return path;
+}
+
+/** Read a persisted spawn-spec, or null if absent/unreadable. */
+export function readPersistedSpec(workspace: string): AgentSpec | null {
+  const path = specFilePath(workspace);
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as AgentSpec;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Build the scrubbed child env for the sandboxed claude. Mirrors runner's
  * passthrough allowlist MINUS `ANTHROPIC_API_KEY` (and the `ANTHROPIC_*`/`CLAUDE_*`
@@ -172,12 +218,50 @@ export function sessionWorkspace(sessionsDir: string, specName: string): string 
  *
  * The sandbox engine's own env (proxy vars, sandbox markers) is layered on TOP of
  * this by the wrap step; this is the base the wrapper extends.
+ *
+ * SECURITY POSTURE — the per-channel env injection (`channelEnv`):
+ *
+ *   The operator scopes a channel's spawned agent extra credentials/vars
+ *   (`GH_TOKEN`, `CLOUDFLARE_API_TOKEN`, …) via the env store (credentials.ts).
+ *   They are resolved at SPAWN time (issuance-time scoping: the sandbox only ever
+ *   sees the minimal set the operator configured for THAT channel, never the
+ *   daemon's own ambient process env), then merged here. The layering is precise
+ *   so the injection can only ADD capability, never subvert the two guarantees:
+ *
+ *     1. `channelEnv` is applied FIRST (as the base), THEN the structural
+ *        passthrough (PATH/HOME/locale) and FINALLY `CLAUDE_CODE_OAUTH_TOKEN` —
+ *        so a channel-set var can never clobber the Claude auth token or a
+ *        structural fundamental. (seedAgentHome's CLAUDE_CONFIG_DIR/XDG/TMP layer
+ *        even later, in spawnAgent, so those win too.)
+ *     2. Denylisted keys (ANTHROPIC_API_KEY / CLAUDE_API_KEY / CLAUDE_CODE_OAUTH_TOKEN)
+ *        are dropped defensively with a warning — the setter already blocks them
+ *        and `resolveChannelEnv` already strips them, so this is belt-and-suspenders
+ *        for a hand-edited credentials.json: the subscription-billing + managed-auth
+ *        guarantee holds even if the store is tampered with.
  */
 export function buildAgentChildEnv(
   parentEnv: Record<string, string | undefined>,
   claudeOauthToken: string,
+  channelEnv: Record<string, string> = {},
 ): Record<string, string> {
   const out: Record<string, string> = {};
+
+  // 1. The operator-scoped per-channel env goes in FIRST (lowest precedence) so the
+  //    structural passthrough + the Claude auth token below always win. Drop any
+  //    denylisted key defensively (the store already blocks them; this guards a
+  //    hand-edited file from smuggling an API key / a swapped OAuth token in).
+  for (const [k, v] of Object.entries(channelEnv)) {
+    if (typeof v !== "string" || v.length === 0) continue;
+    if (DENYLISTED_ENV.has(k)) {
+      console.warn(
+        `parachute-channel: refusing to inject denylisted env var "${k}" from the channel env store ` +
+          `(it controls Claude auth/billing) — skipping. Remove it from credentials.json.`,
+      );
+      continue;
+    }
+    out[k] = v;
+  }
+
   // Fundamentals + locale, like runner — but NOT ANTHROPIC_API_KEY / CLAUDE_API_KEY.
   const passthrough = [
     "PATH",
@@ -208,7 +292,8 @@ export function buildAgentChildEnv(
   if (!out.PATH) out.PATH = "/usr/local/bin:/usr/bin:/bin";
 
   // The interactive subscription credential (design §6). Explicitly the ONLY
-  // Claude auth var set; ANTHROPIC_API_KEY is intentionally absent.
+  // Claude auth var set; ANTHROPIC_API_KEY is intentionally absent. Set LAST so no
+  // channel-injected var can ever override the session's managed auth.
   out.CLAUDE_CODE_OAUTH_TOKEN = claudeOauthToken;
   return out;
 }
@@ -403,6 +488,13 @@ export async function spawnAgent(
   const resolveToken = deps.resolveClaudeToken ?? ((ch: string) => resolveClaudeCredential(ch));
   const claudeOauthToken = resolveToken(wakeChannel);
 
+  // Resolve the per-channel env injection (GH_TOKEN/CLOUDFLARE_*/…). Keyed on the
+  // wake channel, like the Claude credential, and read at spawn time so a var set
+  // (or a per-session restart's re-source) takes effect without a daemon restart.
+  // Empty when nothing is configured — env injection is optional.
+  const resolveEnv = deps.resolveChannelEnv ?? ((ch: string) => resolveChannelEnv(ch));
+  const channelEnv = resolveEnv(wakeChannel);
+
   const mintDeps: MintTokenDeps = {
     hubOrigin: deps.hubOrigin,
     managerBearer: deps.managerBearer,
@@ -466,6 +558,10 @@ export async function spawnAgent(
     ...(otherEntries.length > 0 ? { otherMcps: otherEntries } : {}),
   });
   mkdirSync(workspace, { recursive: true });
+  // Persist the spec so a per-session restart can reproduce this exact launch
+  // (channels/vault/network/mounts) without re-asking the operator. Non-secret —
+  // credentials are re-resolved at each (re)spawn from the stores.
+  persistSpec(workspace, spec);
   const mcpConfigPath = join(workspace, ".mcp.json");
   // `mode: 0o600` on the write is sufficient here — the file is always newly
   // created per-launch under the per-session workspace, so there's no pre-existing
@@ -521,7 +617,7 @@ export async function spawnAgent(
   // LAST so they override even the engine's own (e.g. its non-writable TMPDIR) —
   // pointing claude at its private writable home is what stops the EPERM /
   // "could not start" deaths.
-  const childEnv = buildAgentChildEnv(deps.parentEnv ?? process.env, claudeOauthToken);
+  const childEnv = buildAgentChildEnv(deps.parentEnv ?? process.env, claudeOauthToken, channelEnv);
   const launchEnv: Record<string, string | undefined> = {
     ...childEnv,
     ...wrapped.env,

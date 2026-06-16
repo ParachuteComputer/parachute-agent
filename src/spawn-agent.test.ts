@@ -11,6 +11,9 @@ import {
   seedAgentHome,
   sessionName,
   shellJoin,
+  persistSpec,
+  readPersistedSpec,
+  specFilePath,
   type SpawnAgentDeps,
   type TmuxLauncher,
 } from "./spawn-agent.ts";
@@ -145,6 +148,63 @@ describe("buildAgentChildEnv — scrub, inject OAuth, NEVER ANTHROPIC_API_KEY", 
   test("provides a default PATH if the parent had none", () => {
     const env = buildAgentChildEnv({}, "tok");
     expect(env.PATH).toBe("/usr/local/bin:/usr/bin:/bin");
+  });
+
+  test("INJECTION: the per-channel env reaches the child (gh/git see the token)", () => {
+    const env = buildAgentChildEnv(
+      { PATH: "/usr/bin", HOME: "/h" },
+      "tok",
+      { GH_TOKEN: "ghp_X", CLOUDFLARE_API_TOKEN: "cf_Y" },
+    );
+    expect(env.GH_TOKEN).toBe("ghp_X");
+    expect(env.CLOUDFLARE_API_TOKEN).toBe("cf_Y");
+  });
+
+  test("INJECTION: a channel-set var can NOT clobber CLAUDE_CODE_OAUTH_TOKEN (auth wins)", () => {
+    // Even if the store somehow carried CLAUDE_CODE_OAUTH_TOKEN, the managed token
+    // set last must win — and the denylist drop means it never even lands.
+    const env = buildAgentChildEnv(
+      { PATH: "/usr/bin" },
+      "THE-REAL-OAUTH",
+      { CLAUDE_CODE_OAUTH_TOKEN: "ATTACKER-SWAP", GH_TOKEN: "ghp_X" },
+    );
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("THE-REAL-OAUTH");
+    expect(env.GH_TOKEN).toBe("ghp_X");
+  });
+
+  test("INJECTION: a channel-set var can NOT clobber a structural passthrough (PATH/HOME)", () => {
+    const env = buildAgentChildEnv(
+      { PATH: "/real/path", HOME: "/real/home" },
+      "tok",
+      { PATH: "/evil", HOME: "/evil" },
+    );
+    expect(env.PATH).toBe("/real/path");
+    expect(env.HOME).toBe("/real/home");
+  });
+
+  test("INJECTION: denylisted keys (API keys) are dropped defensively with a warning", () => {
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (...a: unknown[]) => warnings.push(a.map(String).join(" "));
+    try {
+      const env = buildAgentChildEnv(
+        { PATH: "/usr/bin" },
+        "tok",
+        { ANTHROPIC_API_KEY: "sk-ant-SMUGGLED", CLAUDE_API_KEY: "y", GH_TOKEN: "ghp_X" },
+      );
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+      expect(env.CLAUDE_API_KEY).toBeUndefined();
+      expect(env.GH_TOKEN).toBe("ghp_X"); // the legit var still passes
+      expect(warnings.some((w) => w.includes("ANTHROPIC_API_KEY") && w.includes("denylisted"))).toBe(true);
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  test("INJECTION: an empty channel env is a no-op (back-compat default arg)", () => {
+    const env = buildAgentChildEnv({ PATH: "/usr/bin" }, "tok");
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("tok");
+    expect(env.PATH).toBe("/usr/bin");
   });
 });
 
@@ -406,6 +466,56 @@ describe("spawnAgent — full wiring with stubs (no real token)", () => {
     expect(res.session).toBe("aaron_dev-2-agent");
   });
 
+  test("ENV INJECTION: the resolved per-channel env reaches the tmux launch env (Claude auth intact)", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-env-"));
+    const tmux = recordingTmux();
+    const deps = baseDeps({
+      tmux,
+      // The wake channel is the first channel ("aaron-dev") — env resolves on it.
+      resolveChannelEnv: (ch): Record<string, string> =>
+        ch === "aaron-dev" ? { GH_TOKEN: "ghp_INJECTED", CLOUDFLARE_API_TOKEN: "cf_INJECTED" } : {},
+    });
+    await spawnAgent({ name: "aaron-dev", channels: ["aaron-dev"] }, deps);
+    expect(tmux.launched).toHaveLength(1);
+    const env = tmux.launched[0]!.env;
+    // The injected vars reach the child…
+    expect(env.GH_TOKEN).toBe("ghp_INJECTED");
+    expect(env.CLOUDFLARE_API_TOKEN).toBe("cf_INJECTED");
+    // …Claude auth is the stub placeholder (not clobbered), and no API key leaked.
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe("OAUTH-CRED-PLACEHOLDER");
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  test("ENV INJECTION: a denylisted key planted in the resolver is dropped at launch", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-env-deny-"));
+    const tmux = recordingTmux();
+    const deps = baseDeps({
+      tmux,
+      resolveChannelEnv: () => ({ ANTHROPIC_API_KEY: "sk-ant-SMUGGLED", GH_TOKEN: "ghp_OK" }),
+    });
+    await spawnAgent({ name: "x", channels: ["c"] }, deps);
+    const env = tmux.launched[0]!.env;
+    expect(env.GH_TOKEN).toBe("ghp_OK");
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined(); // dropped defensively in buildAgentChildEnv
+  });
+
+  test("SPEC PERSISTENCE: spawn writes spec.json so a restart can reproduce the launch", async () => {
+    sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-spec-"));
+    const spec: AgentSpec = {
+      name: "weaver",
+      channels: [{ name: "weave", access: "read" }],
+      vault: { name: "default", access: "read", tags: ["#channel-message"] },
+      network: "restricted",
+      egress: ["registry.npmjs.org"],
+    };
+    const res = await spawnAgent(spec, baseDeps());
+    // The persisted spec round-trips to the exact spec the launch used.
+    const recovered = readPersistedSpec(res.workspace);
+    expect(recovered).toEqual(spec);
+    // And it's at the conventional path.
+    expect(specFilePath(res.workspace)).toBe(join(res.workspace, "spec.json"));
+  });
+
   test("read-only channel mints channel:read ONLY (not read+write)", async () => {
     sessionsDir = mkdtempSync(join(tmpdir(), "spawn-agent-roch-"));
     const scopes: string[] = [];
@@ -663,6 +773,23 @@ describe("realTmuxLauncher — launch-script indirection (tmux can't take the ~8
       expect(body).not.toContain("OAUTH-SECRET");
     } finally {
       rmSync(workspace, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("persistSpec / readPersistedSpec — spawn-spec recovery for restart", () => {
+  test("round-trips a spec; readPersistedSpec returns null for a missing/garbage file", () => {
+    const ws = mkdtempSync(join(tmpdir(), "spec-rt-"));
+    try {
+      expect(readPersistedSpec(ws)).toBeNull(); // nothing written yet
+      const spec: AgentSpec = { name: "a", channels: ["c"], filesystem: "full" };
+      persistSpec(ws, spec);
+      expect(readPersistedSpec(ws)).toEqual(spec);
+      // Corrupt it -> null (the restart path treats this as "no spec").
+      writeFileSync(specFilePath(ws), "{not json");
+      expect(readPersistedSpec(ws)).toBeNull();
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
     }
   });
 });
