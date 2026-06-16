@@ -49,7 +49,12 @@ import { ClientRegistry } from "./routing.ts";
 import { VaultTransport, CHANNEL_VAULT_TRIGGER_TEMPLATE } from "./transports/vault.ts";
 import { channelsFilePath } from "./registry.ts";
 import type { Channel } from "./registry.ts";
-import { credentialsFilePath, resolveClaudeCredential } from "./credentials.ts";
+import {
+  credentialsFilePath,
+  resolveClaudeCredential,
+  resolveChannelEnv,
+  describeChannelEnv,
+} from "./credentials.ts";
 import type { TransportContext, InboundMessage } from "./transport.ts";
 
 const sendAuth = { authorization: "Bearer " + SEND_TOKEN } as const;
@@ -725,6 +730,188 @@ describe("D — Claude credential store API (channel:admin)", () => {
         (await fetch(`${base}/api/credentials/claude/c`, { method: "DELETE", headers: { ...readAuth } })).status,
       ).toBe(403);
       // Nothing was persisted by any unauthorized call.
+      expect(existsSync(credentialsFilePath(stateDir))).toBe(false);
+    } finally {
+      srv.stop(true);
+    }
+  });
+});
+
+// ===========================================================================
+// E. Generic per-channel ENV-VAR store API (channel:admin)
+// ===========================================================================
+describe("E — per-channel env-var store API (channel:admin)", () => {
+  test("POST /api/credentials/env sets a default var; 0600; resolves for any channel", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      const res = await fetch(`${base}/api/credentials/env`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ name: "GH_TOKEN", value: "ghp_DEFAULT-SECRET" }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, scope: "default", name: "GH_TOKEN" });
+
+      const file = credentialsFilePath(stateDir);
+      expect(existsSync(file)).toBe(true);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+      expect(resolveChannelEnv("any-channel", stateDir)).toEqual({ GH_TOKEN: "ghp_DEFAULT-SECRET" });
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("POST with a channel sets an override that WINS over the default", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      await fetch(`${base}/api/credentials/env`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ name: "GH_TOKEN", value: "ghp_DEFAULT" }),
+      });
+      const res = await fetch(`${base}/api/credentials/env`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ channel: "aaron-dev", name: "GH_TOKEN", value: "ghp_AARON" }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, scope: "channel", channel: "aaron-dev", name: "GH_TOKEN" });
+
+      expect(resolveChannelEnv("aaron-dev", stateDir)).toEqual({ GH_TOKEN: "ghp_AARON" }); // override wins
+      expect(resolveChannelEnv("other", stateDir)).toEqual({ GH_TOKEN: "ghp_DEFAULT" }); // other → default
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("POST a DENYLISTED name → 400, nothing persisted (subscription-billing guarantee)", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      for (const name of ["ANTHROPIC_API_KEY", "CLAUDE_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]) {
+        const res = await fetch(`${base}/api/credentials/env`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...adminAuth },
+          body: JSON.stringify({ name, value: "x" }),
+        });
+        expect(res.status).toBe(400);
+        expect(((await res.json()) as { error: string }).error).toMatch(/Claude auth|reserved|not settable/);
+      }
+      expect(existsSync(credentialsFilePath(stateDir))).toBe(false);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("GET reports names per layer — NEVER the values", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      await fetch(`${base}/api/credentials/env`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ name: "GH_TOKEN", value: "ghp_SECRET-DEFAULT" }),
+      });
+      await fetch(`${base}/api/credentials/env`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ channel: "aaron-dev", name: "CLOUDFLARE_API_TOKEN", value: "cf_SECRET" }),
+      });
+      const res = await fetch(`${base}/api/credentials/env`, { headers: { ...adminAuth } });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { default: string[]; channels: Record<string, string[]> };
+      expect(body.default).toEqual(["GH_TOKEN"]);
+      expect(body.channels["aaron-dev"]).toEqual(["CLOUDFLARE_API_TOKEN"]);
+      const serialized = JSON.stringify(body);
+      expect(serialized).not.toContain("ghp_SECRET-DEFAULT");
+      expect(serialized).not.toContain("cf_SECRET");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("DELETE removes a var (default + channel); the default re-emerges after a channel delete", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      await fetch(`${base}/api/credentials/env`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ name: "GH_TOKEN", value: "ghp_DEFAULT" }),
+      });
+      await fetch(`${base}/api/credentials/env`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ channel: "aaron-dev", name: "GH_TOKEN", value: "ghp_AARON" }),
+      });
+      // Delete the channel override (via body).
+      const del = await fetch(`${base}/api/credentials/env`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ channel: "aaron-dev", name: "GH_TOKEN" }),
+      });
+      expect(del.status).toBe(200);
+      expect(await del.json()).toMatchObject({ ok: true, scope: "channel", channel: "aaron-dev", name: "GH_TOKEN", removed: true });
+      expect(resolveChannelEnv("aaron-dev", stateDir)).toEqual({ GH_TOKEN: "ghp_DEFAULT" }); // back to default
+
+      // Delete the default too.
+      const delDef = await fetch(`${base}/api/credentials/env`, {
+        method: "DELETE",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ name: "GH_TOKEN" }),
+      });
+      expect(delDef.status).toBe(200);
+      expect(await delDef.json()).toMatchObject({ ok: true, scope: "default", name: "GH_TOKEN", removed: true });
+      expect(describeChannelEnv(stateDir)).toEqual({ default: [], channels: {} });
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("POST with an empty/missing name or value → 400, nothing persisted", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      const noName = await fetch(`${base}/api/credentials/env`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ value: "x" }),
+      });
+      expect(noName.status).toBe(400);
+      const noVal = await fetch(`${base}/api/credentials/env`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...adminAuth },
+        body: JSON.stringify({ name: "GH_TOKEN" }),
+      });
+      expect(noVal.status).toBe(400);
+      expect(existsSync(credentialsFilePath(stateDir))).toBe(false);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("env API without channel:admin → 401 (none) / 403 (wrong scope), on every verb", async () => {
+    const { srv, base } = buildServer([]);
+    try {
+      expect((await fetch(`${base}/api/credentials/env`)).status).toBe(401);
+      expect((await fetch(`${base}/api/credentials/env`, { headers: { ...readAuth } })).status).toBe(403);
+      expect(
+        (await fetch(`${base}/api/credentials/env`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "GH_TOKEN", value: "x" }),
+        })).status,
+      ).toBe(401);
+      expect(
+        (await fetch(`${base}/api/credentials/env`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...sendAuth },
+          body: JSON.stringify({ name: "GH_TOKEN", value: "x" }),
+        })).status,
+      ).toBe(403);
+      expect(
+        (await fetch(`${base}/api/credentials/env`, {
+          method: "DELETE",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "GH_TOKEN" }),
+        })).status,
+      ).toBe(401);
       expect(existsSync(credentialsFilePath(stateDir))).toBe(false);
     } finally {
       srv.stop(true);

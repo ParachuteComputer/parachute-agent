@@ -35,6 +35,9 @@ mock.module("./hub-jwt.ts", () => ({
   resetRevocationCache() {},
 }));
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   parseTmuxSessions,
   agentInfoFromSessions,
@@ -52,7 +55,15 @@ import { CredentialNotConfiguredError } from "./credentials.ts";
 import { SpawnDepsError } from "./spawn-deps.ts";
 import { MintError } from "./mint-token.ts";
 import type { Channel } from "./registry.ts";
-import type { SpawnAgentResult } from "./spawn-agent.ts";
+import {
+  persistSpec,
+  sessionWorkspace,
+  type SpawnAgentResult,
+  type SpawnAgentDeps,
+  type TmuxLauncher,
+} from "./spawn-agent.ts";
+import type { SandboxEngine } from "./sandbox/index.ts";
+import type { AgentSpec } from "./sandbox/types.ts";
 
 const adminAuth = { authorization: "Bearer " + ADMIN_TOKEN } as const;
 const readAuth = { authorization: "Bearer " + READ_TOKEN } as const;
@@ -254,6 +265,132 @@ describe("createRealAgentOps — list + kill", () => {
 });
 
 // ===========================================================================
+// 2b. createRealAgentOps.restart — kill + re-spawn from the persisted spec
+// ===========================================================================
+describe("createRealAgentOps — restart (param recovery via persisted spec)", () => {
+  // A recording spawn-launcher (the tmux launcher spawnAgent uses) + a fake sandbox
+  // engine, so restart drives the REAL spawnAgent through a persisted spec without a
+  // hub/sandbox/tmux server.
+  function spawnDeps(sessionsDirPath: string): {
+    deps: SpawnAgentDeps;
+    launched: Array<{ name: string }>;
+  } {
+    const launched: Array<{ name: string }> = [];
+    const launcher: TmuxLauncher = {
+      async hasSession() {
+        return false;
+      },
+      async newSession(opts) {
+        launched.push({ name: opts.name });
+      },
+    };
+    const engine: SandboxEngine = {
+      isSupportedPlatform: () => true,
+      isSandboxingEnabled: () => true,
+      async initialize() {},
+      async wrapWithSandboxArgv(command: string) {
+        return { argv: ["/bin/bash", "-c", command], env: {} };
+      },
+      async reset() {},
+    };
+    const fetchFn = (async (_u: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { scope: string };
+      return new Response(
+        JSON.stringify({ jti: "j", token: "TOK", expires_at: "2026-09-01T00:00:00Z", scope: body.scope }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const deps: SpawnAgentDeps = {
+      hubOrigin: "https://hub.example.com",
+      managerBearer: "MANAGER",
+      channelUrl: "http://127.0.0.1:1941",
+      vaultUrl: "http://127.0.0.1:1940",
+      sessionsDir: sessionsDirPath,
+      runtimeReadOnly: [],
+      resolveClaudeToken: () => "OAUTH-PLACEHOLDER",
+      resolveChannelEnv: () => ({ GH_TOKEN: "ghp_FROM-STORE" }),
+      sandboxEngine: engine,
+      tmux: launcher,
+      fetchFn,
+      parentEnv: { PATH: "/usr/bin" },
+      claudeBin: "claude",
+    };
+    return { deps, launched };
+  }
+
+  test("recovers the persisted spec, kills the old session, re-spawns it", async () => {
+    const sessionsDirPath = mkdtempSync(join(tmpdir(), "restart-ops-"));
+    try {
+      const spec: AgentSpec = { name: "aaron", channels: ["aaron"], network: "open" };
+      // Seed a persisted spec where a prior spawn would have written it.
+      persistSpec(sessionWorkspace(sessionsDirPath, "aaron"), spec);
+
+      const killed: string[] = [];
+      const tmux: TmuxAdmin = {
+        async listSessions() {
+          return [{ name: "aaron-agent", attached: false }];
+        },
+        async killSession(name) {
+          killed.push(name);
+          return true;
+        },
+      };
+      const { deps, launched } = spawnDeps(sessionsDirPath);
+      const ops = createRealAgentOps({ tmux, sessionsDirPath, depsFactory: () => deps });
+
+      const result = await ops.restart("aaron");
+      // It killed the old `<name>-agent` first…
+      expect(killed).toEqual(["aaron-agent"]);
+      // …then re-spawned from the recovered spec (the spawn launcher fired).
+      expect(launched).toEqual([{ name: "aaron-agent" }]);
+      expect(result.killed).toBe(true);
+      expect(result.session).toBe("aaron-agent");
+      // The result is redacted (scopes surfaced, no token values).
+      expect(JSON.stringify(result)).not.toContain("TOK");
+    } finally {
+      rmSync(sessionsDirPath, { recursive: true, force: true });
+    }
+  });
+
+  test("a missing persisted spec → SpawnRequestError (kill not attempted)", async () => {
+    const sessionsDirPath = mkdtempSync(join(tmpdir(), "restart-nospec-"));
+    try {
+      const killed: string[] = [];
+      const tmux: TmuxAdmin = {
+        async listSessions() {
+          return [];
+        },
+        async killSession(name) {
+          killed.push(name);
+          return true;
+        },
+      };
+      const { deps } = spawnDeps(sessionsDirPath);
+      const ops = createRealAgentOps({ tmux, sessionsDirPath, depsFactory: () => deps });
+      await expect(ops.restart("ghost")).rejects.toThrow(SpawnRequestError);
+      await expect(ops.restart("ghost")).rejects.toThrow(/no persisted spec/);
+      expect(killed).toEqual([]); // bailed before touching tmux
+    } finally {
+      rmSync(sessionsDirPath, { recursive: true, force: true });
+    }
+  });
+
+  test("restart rejects a non-slug name before touching anything", async () => {
+    const tmux: TmuxAdmin = {
+      async listSessions() {
+        return [];
+      },
+      async killSession() {
+        return false;
+      },
+    };
+    const { deps } = spawnDeps("/tmp/s");
+    const ops = createRealAgentOps({ tmux, sessionsDirPath: "/tmp/s", depsFactory: () => deps });
+    await expect(ops.restart("../escape")).rejects.toThrow(SpawnRequestError);
+  });
+});
+
+// ===========================================================================
 // 3. The daemon routes (real handler, mocked JWT, stub AgentOps)
 // ===========================================================================
 function buildServer(agentOps?: Partial<AgentOps>) {
@@ -272,6 +409,9 @@ function buildServer(agentOps?: Partial<AgentOps>) {
     },
     async kill() {
       return { killed: false };
+    },
+    async restart() {
+      throw new Error("restart not stubbed");
     },
     ...agentOps,
   };
@@ -558,6 +698,131 @@ describe("DELETE /api/agents/:name", () => {
     try {
       const res = await fetch(`${base}/api/agents/whatever`, { method: "DELETE", headers: adminAuth });
       expect(res.status).toBe(400);
+    } finally {
+      srv.stop(true);
+    }
+  });
+});
+
+describe("POST /api/agents/:name/restart — per-session restart (channel:admin)", () => {
+  function restartResult(name: string, killed: boolean) {
+    return {
+      session: name + "-agent",
+      workspace: "/s/" + name,
+      alreadyRunning: false,
+      killed,
+      tokens: [{ resource: name, scope: "channel:read channel:write", expiresAt: "2026-07-01T00:00:00Z" }],
+      mcpServers: ["channel-" + name],
+      filesystem: "workspace" as const,
+      network: "open" as const,
+      egress: [],
+    };
+  }
+
+  test("no token → 401 (restart never called)", async () => {
+    let restarted = false;
+    const { srv, base } = buildServer({
+      async restart() {
+        restarted = true;
+        return restartResult("aaron", true);
+      },
+    });
+    try {
+      const res = await fetch(`${base}/api/agents/aaron/restart`, { method: "POST" });
+      expect(res.status).toBe(401);
+      expect(restarted).toBe(false);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("channel:read (insufficient) → 403 (restart never called)", async () => {
+    let restarted = false;
+    const { srv, base } = buildServer({
+      async restart() {
+        restarted = true;
+        return restartResult("aaron", true);
+      },
+    });
+    try {
+      const res = await fetch(`${base}/api/agents/aaron/restart`, { method: "POST", headers: readAuth });
+      expect(res.status).toBe(403);
+      expect(restarted).toBe(false);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("admin token → 200 redacted restart result (killed + new session, no token values)", async () => {
+    const { srv, base } = buildServer({
+      async restart(name) {
+        expect(name).toBe("aaron");
+        return restartResult("aaron", true);
+      },
+    });
+    try {
+      const res = await fetch(`${base}/api/agents/aaron/restart`, { method: "POST", headers: adminAuth });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { session: string; killed: boolean; mcpServers: string[] };
+      expect(body.session).toBe("aaron-agent");
+      expect(body.killed).toBe(true);
+      expect(body.mcpServers).toEqual(["channel-aaron"]);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("a missing persisted spec (SpawnRequestError) → 400 with the fix", async () => {
+    const { srv, base } = buildServer({
+      async restart() {
+        throw new SpawnRequestError("no persisted spec at .../spec.json");
+      },
+    });
+    try {
+      const res = await fetch(`${base}/api/agents/aaron/restart`, { method: "POST", headers: adminAuth });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("no persisted spec");
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("a missing operator token (SpawnDepsError) → 503; a missing credential → 400", async () => {
+    const deps = buildServer({
+      async restart() {
+        throw new SpawnDepsError("no operator token");
+      },
+    });
+    try {
+      const res = await fetch(`${deps.base}/api/agents/aaron/restart`, { method: "POST", headers: adminAuth });
+      expect(res.status).toBe(503);
+    } finally {
+      deps.srv.stop(true);
+    }
+    const creds = buildServer({
+      async restart() {
+        throw new CredentialNotConfiguredError("aaron");
+      },
+    });
+    try {
+      const res = await fetch(`${creds.base}/api/agents/aaron/restart`, { method: "POST", headers: adminAuth });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("no Claude credential");
+    } finally {
+      creds.srv.stop(true);
+    }
+  });
+
+  test("a refused mint (MintError) → forwards the hub status", async () => {
+    const { srv, base } = buildServer({
+      async restart() {
+        throw new MintError("over-broad scope", 403, "forbidden");
+      },
+    });
+    try {
+      const res = await fetch(`${base}/api/agents/aaron/restart`, { method: "POST", headers: adminAuth });
+      expect(res.status).toBe(403);
+      expect(((await res.json()) as { error: string }).error).toContain("mint failed");
     } finally {
       srv.stop(true);
     }

@@ -22,7 +22,7 @@ import {
   realTmuxLauncher,
   type SpawnAgentDeps,
 } from "./spawn-agent.ts";
-import { resolveClaudeCredential } from "./credentials.ts";
+import { resolveClaudeCredential, resolveChannelEnv } from "./credentials.ts";
 import { defaultStateDir } from "./registry.ts";
 import { getHubOrigin } from "./hub-jwt.ts";
 
@@ -155,6 +155,8 @@ export function resolveSpawnDeps(): SpawnAgentDeps {
     runtimeReadOnly,
     // The real per-channel Claude OAuth resolver (channel override ?? default ?? throw).
     resolveClaudeToken: (channel: string) => resolveClaudeCredential(channel, stateDir),
+    // The real per-channel env resolver (GH_TOKEN/CLOUDFLARE_*/… — { default, channel } merged).
+    resolveChannelEnv: (channel: string) => resolveChannelEnv(channel, stateDir),
     // The real tmux launcher (writes the per-session launch script, runs tmux).
     tmux: realTmuxLauncher(),
     // Absolute claude path so the sandbox doesn't depend on PATH resolution at run

@@ -11,11 +11,16 @@
  *   - GET    /api/credentials/claude   → credential status (default set? overrides?)
  *   - POST   /api/credentials/claude[/:channel]  → set default / per-channel token
  *   - DELETE /api/credentials/claude/:channel    → remove an override
+ *   - GET    /api/credentials/env      → per-channel env-var NAMES (values redacted)
+ *   - POST   /api/credentials/env      → set an env var ({ channel?, name, value })
+ *   - DELETE /api/credentials/env      → remove an env var ({ channel?, name })
  *   - GET    /api/agents               → list running agent sessions
  *   - POST   /api/agents               → spawn a sandboxed agent from a spec
+ *   - POST   /api/agents/:name/restart → per-session restart (re-source env + reconnect)
  *   - DELETE /api/agents/:name         → kill a session
  *   - GET    /api/vaults               → installed vault instances (the picker)
  *   - GET    /.parachute/config        → channel list (the picker)
+ *   - GET    /health                   → live per-channel connection status (mcp_sessions)
  *
  * UX: the DEFAULT flow is one-agent-one-channel — pick a channel, the agent name
  * auto-fills from it, click Spawn. Everything else (extra channels, vault binding,
@@ -91,6 +96,15 @@ ${THEME_CSS}
   code { font-family: var(--font-mono); color: var(--fg); background: var(--bg-soft); padding: 1px 5px; border-radius: 4px; font-size: 0.8rem; }
   .scopes { margin: 8px 0 0; font-size: 0.78rem; color: var(--fg-muted); }
   .empty { color: var(--fg-muted); font-size: 0.85rem; padding: 8px 2px; }
+  /* Env-var chips: name + inline remove, grouped per scope. */
+  .env-block { margin: 6px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .env-scope { font-size: 0.78rem; color: var(--fg-muted); font-weight: 500; }
+  .env-chip { display: inline-flex; align-items: center; gap: 2px; background: var(--bg-soft); border: 1px solid var(--border); border-radius: 6px; padding: 2px 4px 2px 8px; }
+  .env-chip code { background: transparent; padding: 0; font-size: 0.8rem; }
+  .env-chip button { padding: 0 6px; font-size: 14px; line-height: 1; }
+  /* Connection-status pill on the running-agents list (mcp_sessions from /health). */
+  .pill.connected { color: var(--success); }
+  .pill.idle-conn { color: var(--fg-dim); }
 </style>
 </head>
 <body>
@@ -127,6 +141,42 @@ ${THEME_CSS}
         </div>
       </details>
       <div id="cred-msg" class="msg"></div>
+    </section>
+
+    <!-- Per-channel env / credentials (GH_TOKEN, CLOUDFLARE_API_TOKEN, …) -->
+    <section id="env-section">
+      <h2>Channel env / credentials</h2>
+      <p class="hint">Scope a channel's spawned agent extra secrets &mdash; a
+        <code>GH_TOKEN</code>, <code>CLOUDFLARE_API_TOKEN</code>, etc. These are injected
+        into the session's shell (its <code>gh</code>/<code>git</code>/build tooling) &mdash;
+        Claude's own login is never touched. Set a default for every channel, or override per
+        channel. After setting one, hit <strong>Restart / reconnect</strong> on a running session
+        to apply it.</p>
+      <div id="env-list" class="scopes"></div>
+      <details open>
+        <summary>Set an env var</summary>
+        <div class="sub">
+          <div class="grid3">
+            <div>
+              <label for="env-channel">Channel (blank = default/all)</label>
+              <input type="text" id="env-channel" placeholder="channel name, or blank for default" autocomplete="off" />
+            </div>
+            <div>
+              <label for="env-name">Name</label>
+              <input type="text" id="env-name" placeholder="GH_TOKEN" autocomplete="off" />
+            </div>
+            <div>
+              <label for="env-value">Value</label>
+              <input type="password" id="env-value" placeholder="ghp_…" autocomplete="off" />
+            </div>
+          </div>
+          <div class="row">
+            <button id="env-save" class="primary" type="button">Save env var</button>
+            <span class="muted" style="font-size:12px;">Stored 0600, never shown again. <code>ANTHROPIC_API_KEY</code> &amp; the Claude-auth vars are reserved.</span>
+          </div>
+        </div>
+      </details>
+      <div id="env-msg" class="msg"></div>
     </section>
 
     <!-- Spawn -->
@@ -338,6 +388,75 @@ ${SHELL_JS}
     }).catch(function (err) { showMsg(msg, "Failed: " + err.message, true); });
   }
 
+  // --- per-channel env vars (GH_TOKEN, CLOUDFLARE_API_TOKEN, …) ------------
+  // GET /api/credentials/env returns { default:[names], channels:{ch:[names]} } —
+  // NAMES only, values are never returned. Render each as a removable chip; the
+  // scope ("default" or a channel) rides on the delete button.
+  function envChip(scope, name) {
+    // scope is "" for the default layer, else the channel name. Data-attrs are
+    // server-enforced shapes (env name regex; channel slug) but esc() anyway.
+    return "<span class='env-chip'><code>" + esc(name) + "</code>" +
+      "<button class='ghost danger' data-env-scope='" + esc(scope) + "' data-env-name='" + esc(name) +
+      "' type='button' title='remove'>&times;</button></span>";
+  }
+  function loadEnv() {
+    return apiJson("/api/credentials/env").then(function (j) {
+      var host = document.getElementById("env-list");
+      var blocks = [];
+      var dflt = (j && j.default) || [];
+      if (dflt.length) {
+        blocks.push("<div class='env-block'><span class='env-scope'>default (all channels):</span> " +
+          dflt.map(function (n) { return envChip("", n); }).join(" ") + "</div>");
+      }
+      var chans = (j && j.channels) || {};
+      Object.keys(chans).sort().forEach(function (ch) {
+        var names = chans[ch] || [];
+        if (!names.length) return;
+        blocks.push("<div class='env-block'><span class='env-scope'>" + esc(ch) + ":</span> " +
+          names.map(function (n) { return envChip(ch, n); }).join(" ") + "</div>");
+      });
+      host.innerHTML = blocks.length ? blocks.join("") :
+        "<div class='muted' style='font-size:13px;'>No env vars set. Add one below to scope a channel's agent a token.</div>";
+      host.querySelectorAll("[data-env-name]").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          removeEnv(btn.getAttribute("data-env-scope") || "", btn.getAttribute("data-env-name"));
+        });
+      });
+      return j;
+    }).catch(function (err) {
+      document.getElementById("env-list").innerHTML =
+        "<div class='muted' style='font-size:13px;'>Could not load env vars: " + esc(err.message) + "</div>";
+    });
+  }
+  document.getElementById("env-save").addEventListener("click", function () {
+    var msg = document.getElementById("env-msg");
+    clearMsg(msg);
+    var channel = document.getElementById("env-channel").value.trim();
+    var name = document.getElementById("env-name").value.trim();
+    var value = document.getElementById("env-value").value;
+    if (!name) { showMsg(msg, "Enter a variable name (e.g. GH_TOKEN).", true); return; }
+    if (!value) { showMsg(msg, "Enter a value.", true); return; }
+    var body = { name: name, value: value };
+    if (channel) body.channel = channel;
+    apiJson("/api/credentials/env", { method: "POST", body: JSON.stringify(body) }).then(function () {
+      document.getElementById("env-name").value = "";
+      document.getElementById("env-value").value = "";
+      showMsg(msg, "Saved " + name + (channel ? (" for channel " + channel) : " (default)") +
+        ". Restart a session to apply it.", false);
+      loadEnv();
+    }).catch(function (err) { showMsg(msg, "Failed: " + err.message, true); });
+  });
+  function removeEnv(scope, name) {
+    var msg = document.getElementById("env-msg");
+    clearMsg(msg);
+    var body = { name: name };
+    if (scope) body.channel = scope;
+    apiJson("/api/credentials/env", { method: "DELETE", body: JSON.stringify(body) }).then(function () {
+      showMsg(msg, "Removed " + name + (scope ? (" for " + scope) : " (default)") + ".", false);
+      loadEnv();
+    }).catch(function (err) { showMsg(msg, "Failed: " + err.message, true); });
+  }
+
   // --- spawn form ---------------------------------------------------------
   function channelOptions(selected) {
     return knownChannels.map(function (c) {
@@ -480,8 +599,32 @@ ${SHELL_JS}
   // name as the channel (?channel=<name>). When an agent was custom-named off its
   // channel, the chat page still loads on its picker — no fabricated data.
   function chatUrl(channel) { return MOUNT + "/ui?channel=" + encodeURIComponent(channel); }
+  // /health is OPEN (no token) and carries per-channel { mcp_sessions, clients }.
+  // The default is one-agent-one-channel (the agent name IS its wake channel), so we
+  // key live connection status by the agent name. An agent custom-named off its
+  // channel shows "—" (no fabricated data), which is honest.
+  function fetchHealth() {
+    return fetch(MOUNT + "/health").then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
+  }
+  function connectionCell(h) {
+    // h is the channel's /health row ({ mcp_sessions, clients }) or undefined.
+    if (!h) return "<span class='pill idle-conn' title='no matching channel in /health'>—</span>";
+    var sessions = (typeof h.mcp_sessions === "number") ? h.mcp_sessions : 0;
+    var clients = (typeof h.clients === "number") ? h.clients : 0;
+    if (sessions + clients > 0) {
+      return "<span class='pill connected'>● connected</span> " +
+        "<span class='muted' style='font-size:11px;'>(" + sessions + " mcp, " + clients + " sse)</span>";
+    }
+    return "<span class='pill idle-conn'>○ not connected</span>";
+  }
   function loadAgents() {
-    return apiJson("/api/agents").then(function (j) {
+    return Promise.all([apiJson("/api/agents"), fetchHealth()]).then(function (res) {
+      var j = res[0];
+      var health = res[1];
+      var liveByChannel = {};
+      if (health && Array.isArray(health.channels)) {
+        health.channels.forEach(function (c) { liveByChannel[c.name] = c; });
+      }
       var host = document.getElementById("agents-table");
       var agents = j.agents || [];
       if (!agents.length) {
@@ -494,16 +637,21 @@ ${SHELL_JS}
           "<td><strong>" + esc(a.name) + "</strong></td>" +
           "<td><code>" + esc(a.session) + "</code></td>" +
           "<td>" + att + "</td>" +
+          "<td>" + connectionCell(liveByChannel[a.name]) + "</td>" +
           "<td class='actions'>" +
             "<a href='" + esc(chatUrl(a.name)) + "'>chat →</a>" +
             "<a href='" + esc(terminalUrl(a.name)) + "' target='_blank' rel='noopener'>terminal ↗</a>" +
+            "<button class='ghost' data-restart='" + esc(a.name) + "' type='button' title='Re-source env + reconnect this session'>restart / reconnect</button>" +
             "<button class='ghost danger' data-kill='" + esc(a.name) + "' type='button'>kill</button>" +
           "</td></tr>";
       }).join("");
-      host.innerHTML = "<table><thead><tr><th>Agent</th><th>tmux session</th><th>State</th><th></th></tr></thead><tbody>" +
+      host.innerHTML = "<table><thead><tr><th>Agent</th><th>tmux session</th><th>State</th><th>Connection</th><th></th></tr></thead><tbody>" +
         rows + "</tbody></table>";
       host.querySelectorAll("[data-kill]").forEach(function (btn) {
         btn.addEventListener("click", function () { killAgent(btn.getAttribute("data-kill")); });
+      });
+      host.querySelectorAll("[data-restart]").forEach(function (btn) {
+        btn.addEventListener("click", function () { restartAgent(btn.getAttribute("data-restart"), btn); });
       });
     }).catch(function (err) {
       document.getElementById("agents-table").innerHTML = "<div class='empty'>Could not load agents: " + esc(err.message) + "</div>";
@@ -517,6 +665,27 @@ ${SHELL_JS}
     apiJson("/api/agents/" + encodeURIComponent(name), { method: "DELETE" }).then(function () {
       loadAgents();
     }).catch(function (err) { alert("Kill failed: " + err.message); });
+  }
+
+  // Restart = kill + re-spawn from the persisted spec, re-resolving env + the Claude
+  // credential — so setting a token then applying it is one click. A fresh spawn
+  // (NOT claude -c): the prior conversation context is not resumed (the channel MCP
+  // reconnects either way). The server returns 400 if there's no persisted spec (an
+  // older session) — surfaced as a clear message.
+  function restartAgent(name, btn) {
+    if (!confirm("Restart agent " + name + "? It re-sources env (picks up newly-set credentials) and reconnects. The current conversation context is not resumed.")) return;
+    var orig = btn ? btn.textContent : "";
+    if (btn) { btn.disabled = true; btn.textContent = "restarting…"; }
+    apiJson("/api/agents/" + encodeURIComponent(name) + "/restart", { method: "POST" }).then(function (r) {
+      var msg = document.getElementById("spawn-msg");
+      clearMsg(msg);
+      showMsg(msg, "Restarted " + (r.session || (name + "-agent")) + " — env re-sourced, session reconnected.", false);
+      loadAgents();
+    }).catch(function (err) {
+      alert("Restart failed: " + err.message);
+    }).then(function () {
+      if (btn) { btn.disabled = false; btn.textContent = orig; }
+    });
   }
   document.getElementById("refresh").addEventListener("click", function () { loadAgents(); });
 
@@ -569,7 +738,7 @@ ${SHELL_JS}
   setStatus("authenticating…");
   fetchToken().then(function () {
     setStatus("● ready", "live");
-    return Promise.all([loadChannels(), loadVaults(), loadCreds(), loadAgents()]);
+    return Promise.all([loadChannels(), loadVaults(), loadCreds(), loadEnv(), loadAgents()]);
   }).then(function () {
     setInterval(loadAgents, 5000);
   }).catch(function (err) {

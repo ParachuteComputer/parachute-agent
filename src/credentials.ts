@@ -43,9 +43,74 @@ export interface ClaudeCredentialStore {
   channels?: Record<string, string>;
 }
 
+/**
+ * The generic per-channel ENVIRONMENT-VARIABLE slice (`env`). Same two-principal
+ * shape as the Claude slice (an operator-level default layer + per-channel
+ * overrides), but each layer is a NAME→VALUE map rather than a single token: an
+ * operator scopes a channel's spawned agent a `GH_TOKEN`, `CLOUDFLARE_API_TOKEN`,
+ * etc. {@link resolveChannelEnv} flattens the two layers into one map (channel
+ * wins) at spawn time, and {@link buildAgentChildEnv} (spawn-agent.ts) merges that
+ * into the sandboxed child's env so the agent's `gh`/`git`/build tooling sees the
+ * tokens — while Claude's own auth (`CLAUDE_CODE_OAUTH_TOKEN`) stays untouched.
+ */
+export interface ChannelEnvStore {
+  /** Operator-level default env vars, used by every channel (lowest precedence). */
+  default?: Record<string, string>;
+  /** Per-channel env overrides, keyed by channel name (wins over the default). */
+  channels?: Record<string, Record<string, string>>;
+}
+
 /** The on-disk `credentials.json` shape (namespaced by credential type). */
 export interface CredentialsFile {
   claude?: ClaudeCredentialStore;
+  /** Generic per-channel env-var injection (the GH_TOKEN/CLOUDFLARE_* slice). */
+  env?: ChannelEnvStore;
+}
+
+/**
+ * Env-var names that MUST NEVER be settable through the env store — they'd break
+ * the module's two load-bearing guarantees:
+ *
+ *   - `ANTHROPIC_API_KEY` / `CLAUDE_API_KEY` would route the spawned session onto
+ *     METERED API billing instead of the interactive subscription (the exact thing
+ *     `buildAgentChildEnv` deliberately scrubs — see spawn-agent.ts §6).
+ *   - `CLAUDE_CODE_OAUTH_TOKEN` is the session's MANAGED auth, resolved per-channel
+ *     from the Claude slice; letting the generic env store override it would let an
+ *     operator (or a future less-trusted caller) silently swap the session's
+ *     identity out from under the credential resolver.
+ *
+ * The setters REJECT these (throw {@link DenylistedEnvError}); the injection step
+ * (`buildAgentChildEnv`) ALSO drops them defensively, so even a hand-edited
+ * credentials.json can't smuggle one through.
+ *
+ * `PATH`/`HOME` are deliberately NOT denylisted: `buildAgentChildEnv` layers the
+ * resolved channel env UNDER its own structural passthrough + the seeded-HOME
+ * overrides, so a channel-set PATH/HOME can't clobber the sandbox's own (the
+ * passthrough copies the real PATH/HOME after, and seedAgentHome's CLAUDE_CONFIG_DIR
+ * /XDG/TMP win last). Rejecting them would only deny a harmless no-op; allowing
+ * them keeps the denylist focused on the keys that actually matter (the Claude-auth
+ * trio). See the layering comment in `buildAgentChildEnv`.
+ */
+export const DENYLISTED_ENV: ReadonlySet<string> = new Set([
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+]);
+
+/** A basic POSIX-ish env-var name guard (letters/digits/underscore, no leading digit). */
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Thrown when a setter is asked to set/override a denylisted env-var name. */
+export class DenylistedEnvError extends Error {
+  constructor(name: string) {
+    super(
+      `env var "${name}" is not settable here: it controls Claude auth / billing ` +
+        `(ANTHROPIC_API_KEY, CLAUDE_API_KEY, CLAUDE_CODE_OAUTH_TOKEN are reserved by ` +
+        `the managed subscription-billing path). Set the Claude credential via ` +
+        `POST /api/credentials/claude instead.`,
+    );
+    this.name = "DenylistedEnvError";
+  }
 }
 
 /** The default credential reference an unspecified spec resolves against. */
@@ -185,5 +250,131 @@ export function describeClaudeCredentials(
   return {
     defaultSet: Boolean(claude?.default),
     channels: Object.keys(claude?.channels ?? {}).sort(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Generic per-channel env-var store (the GH_TOKEN / CLOUDFLARE_API_TOKEN slice).
+//
+// Mirrors the Claude helpers exactly: read-modify-write JSON, 0600 + unconditional
+// chmod, sibling-preserving, dynamic-read-at-resolve. A `null`/`undefined` channel
+// targets the operator-level DEFAULT layer; a channel name targets that channel's
+// override layer. Every setter enforces DENYLISTED_ENV (the Claude-auth trio) so
+// the subscription-billing guarantee can't be subverted via this surface.
+// ---------------------------------------------------------------------------
+
+/** Validate an env-var NAME for the setters: non-denylisted + a sane shape. */
+function assertSettableEnvName(name: string): void {
+  if (typeof name !== "string" || name.length === 0) {
+    throw new Error("credentials: an env var name is required");
+  }
+  if (DENYLISTED_ENV.has(name)) throw new DenylistedEnvError(name);
+  if (!ENV_NAME_RE.test(name)) {
+    throw new Error(
+      `credentials: env var name "${name}" is invalid (letters, digits, underscore; no leading digit)`,
+    );
+  }
+}
+
+/**
+ * Set ONE env var on the operator-level default layer (`channel` is null/undefined)
+ * or on a specific channel's override layer. Read-modify-write so the Claude slice,
+ * the other layer, and other vars are preserved. Rejects denylisted names
+ * ({@link DenylistedEnvError}) and an empty value.
+ */
+export function setChannelEnvVar(
+  channel: string | null | undefined,
+  name: string,
+  value: string,
+  stateDir?: string,
+): void {
+  assertSettableEnvName(name);
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error("credentials: a non-empty env var value is required");
+  }
+  const file = readCredentialsFile(stateDir);
+  const env = file.env ?? {};
+  if (channel === null || channel === undefined || channel === "") {
+    const def = env.default ?? {};
+    def[name] = value;
+    env.default = def;
+  } else {
+    const channels = env.channels ?? {};
+    const forChannel = channels[channel] ?? {};
+    forChannel[name] = value;
+    channels[channel] = forChannel;
+    env.channels = channels;
+  }
+  file.env = env;
+  writeCredentialsFile(file, stateDir);
+}
+
+/**
+ * Remove ONE env var from the operator-level default layer (`channel` null/undefined)
+ * or a channel's override layer. Returns true if it existed, false if there was
+ * nothing to remove. Prunes an emptied channel map so a removed-everything channel
+ * doesn't linger as `{}`. Read-modify-write; the Claude slice + other vars untouched.
+ */
+export function removeChannelEnvVar(
+  channel: string | null | undefined,
+  name: string,
+  stateDir?: string,
+): boolean {
+  const file = readCredentialsFile(stateDir);
+  const env = file.env;
+  if (!env) return false;
+  if (channel === null || channel === undefined || channel === "") {
+    if (!env.default || !(name in env.default)) return false;
+    delete env.default[name];
+    if (Object.keys(env.default).length === 0) delete env.default;
+  } else {
+    const forChannel = env.channels?.[channel];
+    if (!forChannel || !(name in forChannel)) return false;
+    delete forChannel[name];
+    if (Object.keys(forChannel).length === 0) delete env.channels![channel];
+    if (env.channels && Object.keys(env.channels).length === 0) delete env.channels;
+  }
+  writeCredentialsFile(file, stateDir);
+  return true;
+}
+
+/**
+ * Resolve the FLATTENED env a session on `channel` should run with:
+ *
+ *   { ...env.default, ...env.channels[channel] }   (the channel layer wins)
+ *
+ * Read at resolve time (not cached), like the Claude resolver — so a var set via the
+ * config API takes effect on the next spawn (or per-session restart) without a daemon
+ * restart. Defensively SKIPS any denylisted key that somehow landed on disk (a
+ * hand-edited file): the setter blocks them, but the resolver never returns one
+ * either, so `buildAgentChildEnv`'s own denylist drop is a belt to this suspenders.
+ * Returns an empty map when nothing is configured (a channel with no env is fine).
+ */
+export function resolveChannelEnv(channel: string, stateDir?: string): Record<string, string> {
+  const env = readCredentialsFile(stateDir).env;
+  const merged: Record<string, string> = { ...(env?.default ?? {}), ...(env?.channels?.[channel] ?? {}) };
+  for (const k of Object.keys(merged)) {
+    if (DENYLISTED_ENV.has(k)) delete merged[k];
+  }
+  return merged;
+}
+
+/**
+ * Describe the env store for an operator-facing read WITHOUT leaking values: the
+ * NAMES set on the default layer, and the names set per channel. The raw values are
+ * NEVER returned (`GET /api/credentials/env`) — same redaction posture as
+ * `describeClaudeCredentials`.
+ */
+export function describeChannelEnv(
+  stateDir?: string,
+): { default: string[]; channels: Record<string, string[]> } {
+  const env = readCredentialsFile(stateDir).env;
+  const channels: Record<string, string[]> = {};
+  for (const [ch, vars] of Object.entries(env?.channels ?? {})) {
+    channels[ch] = Object.keys(vars).sort();
+  }
+  return {
+    default: Object.keys(env?.default ?? {}).sort(),
+    channels,
   };
 }
