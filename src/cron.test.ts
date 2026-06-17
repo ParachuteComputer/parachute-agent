@@ -240,6 +240,99 @@ describe("nextRunAfter — DST behavior (documented v1)", () => {
   });
 });
 
+// ===========================================================================
+// REGRESSION GUARD — day-skip in a NEGATIVE-OFFSET timezone (the morning-miss bug).
+//
+// The day-skip fast path (taken whenever dom/dow restricts the date) used to jump
+// to UTC-midnight, which in America/Los_Angeles is ~17:00 of the wall-day; the
+// forward-only crawl then started in the EVENING and could never reach that
+// wall-day's MORNING. Result: morning weekday/sparse-dom jobs in PT were missed
+// (skipped to a later day) or never fired at all (returned null). These cases
+// FAIL on the old UTC-midnight code and PASS on the wall-midnight fix. They're
+// all in a negative-offset tz (where UTC-midnight ≠ wall-midnight) — the only
+// place the bug is visible — and they all exercise the day-skip (restricted dom
+// or dow), unlike the `*`-dom/dow cases above which never enter the skip path.
+// ===========================================================================
+describe("nextRunAfter — day-skip in a negative-offset tz (morning-miss regression)", () => {
+  const LA = "America/Los_Angeles";
+
+  test("'0 9 * * 1-5' from a Saturday → MONDAY 09:00 PT (not Tuesday — the morning isn't skipped)", () => {
+    // 2026-06-20 is a Saturday. The next weekday-9am is MONDAY the 22nd at 09:00 PT.
+    // The OLD code skipped Monday's morning (landed at Sun 17:00 wall after the
+    // UTC-midnight jump, crawled past Mon 09:00 having started Monday at 17:00…),
+    // returning TUESDAY. The fix returns Monday.
+    const sat = new Date("2026-06-20T18:00:00Z"); // ~11:00 Sat LA
+    expect(wall(sat, LA).wd).toBe(6); // Saturday
+    const next = nextRunAfter("0 9 * * 1-5", LA, sat)!;
+    expect(next).not.toBeNull();
+    const w = wall(next, LA);
+    expect(w.wd).toBe(1); // MONDAY (not 2/Tuesday)
+    expect(w.h).toBe(9);
+    expect(w.mi).toBe(0);
+    expect(w.d).toBe(22); // 2026-06-22 is the Monday
+  });
+
+  test("'0 6 1 * *' (sparse dom, morning) in PT → the 1st at 06:00 PT, NOT null", () => {
+    // The OLD code returned NULL here: every month's 1st has its morning stranded
+    // behind the UTC-midnight jump, so the sparse-dom search exhausted → null. The
+    // canonical "any sparse-dom morning job in PT never runs" failure.
+    const midMonth = new Date("2026-06-15T19:00:00Z"); // ~12:00 Jun 15 LA
+    const next = nextRunAfter("0 6 1 * *", LA, midMonth);
+    expect(next).not.toBeNull();
+    const w = wall(next!, LA);
+    expect(w.d).toBe(1);
+    expect(w.h).toBe(6);
+    expect(w.mi).toBe(0);
+    expect(w.mo).toBe(7); // the next 1st is July 1
+  });
+
+  test("'30 7 15 * *' (restricted-dom morning generic) in PT → the 15th at 07:30 PT", () => {
+    const from = new Date("2026-06-10T19:00:00Z"); // ~12:00 Jun 10 LA, before the 15th
+    const next = nextRunAfter("30 7 15 * *", LA, from);
+    expect(next).not.toBeNull();
+    const w = wall(next!, LA);
+    expect(w.d).toBe(15);
+    expect(w.h).toBe(7);
+    expect(w.mi).toBe(30);
+    expect(w.mo).toBe(6); // June 15
+  });
+
+  test("the canonical morning weave '53 7 * * 1-5' (weekday, restricted dow) fires Mon 07:53 PT", () => {
+    // dow restricted → day-skip path active (unlike the all-`*` '53 7 * * *' which
+    // works even on the buggy code). From a Sunday → Monday 07:53 PT.
+    const sun = new Date("2026-06-21T18:00:00Z"); // ~11:00 Sun LA
+    expect(wall(sun, LA).wd).toBe(0); // Sunday
+    const next = nextRunAfter("53 7 * * 1-5", LA, sun)!;
+    const w = wall(next, LA);
+    expect(w.wd).toBe(1); // Monday
+    expect(w.h).toBe(7);
+    expect(w.mi).toBe(53);
+  });
+
+  test("strictly-after still holds across a negative-offset day-skip", () => {
+    // from is exactly a matching morning instant; must advance to the NEXT match.
+    const at0900 = new Date("2026-06-22T16:00:00Z"); // 09:00 Mon LA (PDT) — matches '0 9 * * 1-5'
+    expect(wall(at0900, LA)).toMatchObject({ wd: 1, h: 9, mi: 0 });
+    const next = nextRunAfter("0 9 * * 1-5", LA, at0900)!;
+    expect(next.getTime()).toBeGreaterThan(at0900.getTime());
+    const w = wall(next, LA);
+    expect(w.wd).toBe(2); // the next weekday match is Tuesday 09:00
+    expect(w.h).toBe(9);
+  });
+
+  test("day-skip works in a POSITIVE-offset tz too (Tokyo, UTC+9) — morning not skipped", () => {
+    // Symmetric check: in a positive-offset zone UTC-midnight is ~09:00 wall, a
+    // different failure shape; assert the fix is correct here as well.
+    const TOKYO = "Asia/Tokyo";
+    const from = new Date("2026-06-14T03:00:00Z"); // 12:00 Jun 14 Tokyo
+    const next = nextRunAfter("0 6 15 * *", TOKYO, from)!;
+    const w = wall(next, TOKYO);
+    expect(w.d).toBe(15);
+    expect(w.h).toBe(6);
+    expect(w.mi).toBe(0);
+  });
+});
+
 describe("nextRunAfter — accepts a pre-parsed ParsedCron", () => {
   test("reuses a ParsedCron without re-parsing", () => {
     const parsed: ParsedCron = parseCron("0 0 * * *");

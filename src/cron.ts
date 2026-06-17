@@ -299,10 +299,18 @@ const MAX_LOOKAHEAD_DAYS = 5 * 366;
  * inventing skip/dedup policy; jobs are coarse ("daily 8am"), and the
  * fire-once-on-miss catch-up in the runner bounds any practical surprise.
  *
- * The day-skip itself is DST-safe: to advance "to the next wall-midnight" we step
- * the UTC day forward and zero the cursor's UTC clock, then minute-walk the small
- * residual until the wall clock actually crosses into the next wall-date. Because
- * the minute walk is the source of truth, no DST-offset arithmetic can desync it.
+ * The day-skip advances to the next WALL-midnight (00:00 of the next wall-day IN
+ * `zone`), computed from the wall clock we already read — NOT to UTC-midnight. This
+ * is load-bearing in a negative-offset zone: UTC-midnight there is ~17:00 of the
+ * wall-day, so jumping to it would strand the forward-only cursor in the *evening*
+ * and the crawl could never reach that wall-day's MORNING (a `0 9 * * *` would be
+ * missed; a sparse-dom morning job would never fire). Instead we step the cursor by
+ * the minutes from this wall-instant to the next wall-midnight
+ * (`(23-hour)*60 + (60-minute)`), which lands at/just-before the next wall-day's
+ * 00:00. A DST transition can make the landing 23:00 or 01:00 of the wall-day — the
+ * main loop self-corrects with a few minute steps, and it never lands in the
+ * evening. The minute-walk remains the source of truth, so no offset arithmetic can
+ * desync it. (Each skip advances ≥1 minute, so the search always terminates.)
  *
  * `from` defaults to now; `tz` defaults to the daemon's local timezone (resolved
  * from `Intl.DateTimeFormat().resolvedOptions().timeZone`).
@@ -341,18 +349,32 @@ export function nextRunAfter(expr: string | ParsedCron, tz?: string, from: Date 
       cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
       continue;
     }
-    // Date does NOT qualify — DAY-SKIP: jump to the next wall-midnight. Each
-    // distinct dead wall-day counts once against the lookahead bound. We advance
-    // the UTC day and zero the UTC clock; the wall clock may not be exactly
-    // midnight (DST/offset), but it lands at the START of a fresh wall-day region
-    // and the loop re-evaluates from there.
+    // Date does NOT qualify — DAY-SKIP: jump to the next WALL-midnight (00:00 of
+    // the next wall-day IN `zone`), computed from the wall clock we already have.
+    // Each distinct dead wall-day counts once against the lookahead bound.
+    //
+    // CRITICAL: we must advance to the next *wall*-midnight, NOT UTC-midnight. In a
+    // negative-offset zone (e.g. America/Los_Angeles, UTC-7/8) UTC-midnight is
+    // ~17:00 of the wall-day — so zeroing the UTC clock would land the cursor in
+    // the *evening* of a wall-day and the forward-only crawl could never reach that
+    // wall-day's MORNING (a `0 9 * * *` would be missed every cycle; a sparse-dom
+    // morning job would exhaust the search → null). Stepping by the minutes from
+    // THIS wall-instant to the next wall-midnight lands the cursor AT/BEFORE the
+    // morning of the next wall-day, so the crawl reaches it.
+    //
+    // `mins` is the minutes remaining in this wall-day plus one (to roll into the
+    // next day's 00:00): (23 - hour)*60 covers the whole hours left, +(60 - minute)
+    // covers the rest of this minute's hour AND the +1 minute to cross midnight.
+    // A DST transition can make the landing 23:00 or 01:00 of the wall-day rather
+    // than exactly 00:00 — harmless: the main loop self-corrects with a few minute
+    // steps, and it never lands at the evening (17:00) the UTC bump produced.
     const skipKey = `${wc.month}-${wc.dom}`;
     if (skipKey !== lastSkipKey) {
       lastSkipKey = skipKey;
       if (++daysTouched > MAX_LOOKAHEAD_DAYS) return null;
     }
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
-    cursor.setUTCHours(0, 0, 0, 0);
+    const mins = (23 - wc.hour) * 60 + (60 - wc.minute);
+    cursor.setUTCMinutes(cursor.getUTCMinutes() + mins);
   }
   return null;
 }
