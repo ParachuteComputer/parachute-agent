@@ -13,7 +13,7 @@
  *      and every error→status mapping, without a hub, a sandbox, or tmux.
  */
 
-import { describe, test, expect, mock } from "bun:test";
+import { describe, test, expect, mock, afterEach } from "bun:test";
 // Re-export the REAL error class + helper in the mock below so this process-wide
 // `mock.module` doesn't break hub-jwt.test.ts's assertions on the genuine shapes
 // (same discipline daemon-config-api.test.ts keeps).
@@ -35,7 +35,7 @@ mock.module("./hub-jwt.ts", () => ({
   resetRevocationCache() {},
 }));
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -236,20 +236,41 @@ describe("buildSpecFromBody", () => {
   });
 
   // Working-directory axis (design 2026-06-16-agent-filesystem-and-sharing.md):
-  // an absolute `workspace` host path is parsed; a relative path 400s; absent /
-  // blank → undefined (the private-dir cwd default).
-  test("workspace (absolute) is parsed onto the spec", () => {
-    const spec = buildSpecFromBody({ name: "a", channels: ["c"], workspace: "/Users/op/Code/repo" });
-    expect(spec.workspace).toBe("/Users/op/Code/repo");
+  // an absolute, EXISTING `workspace` dir is parsed; a relative path 400s; a
+  // non-existent path / a file 400s; absent / blank → undefined (private-dir cwd).
+  // The real-dir cases use a temp dir (the spawn cwd must pre-exist).
+  let wsDir: string;
+  afterEach(() => {
+    if (wsDir) rmSync(wsDir, { recursive: true, force: true });
+    wsDir = "";
+  });
+  test("workspace (absolute, existing dir) is parsed onto the spec", () => {
+    wsDir = mkdtempSync(join(tmpdir(), "buildspec-ws-"));
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], workspace: wsDir });
+    expect(spec.workspace).toBe(wsDir);
   });
   test("workspace is trimmed", () => {
-    const spec = buildSpecFromBody({ name: "a", channels: ["c"], workspace: "  /Users/op/Code/repo  " });
-    expect(spec.workspace).toBe("/Users/op/Code/repo");
+    wsDir = mkdtempSync(join(tmpdir(), "buildspec-ws-trim-"));
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], workspace: `  ${wsDir}  ` });
+    expect(spec.workspace).toBe(wsDir);
   });
   test("a relative workspace is rejected (must be absolute)", () => {
     expect(() =>
       buildSpecFromBody({ name: "a", channels: ["c"], workspace: "Code/repo" }),
     ).toThrow(/workspace must be an absolute path/);
+  });
+  test("a non-existent workspace is rejected (cwd must pre-exist)", () => {
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], workspace: "/Users/op/Code/does-not-exist-xyz" }),
+    ).toThrow(/does not exist/);
+  });
+  test("a workspace pointing at a FILE (not a dir) is rejected", () => {
+    wsDir = mkdtempSync(join(tmpdir(), "buildspec-ws-file-"));
+    const filePath = join(wsDir, "afile.txt");
+    writeFileSync(filePath, "x");
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], workspace: filePath }),
+    ).toThrow(/is not a directory/);
   });
   test("absent workspace → undefined (private-dir cwd default)", () => {
     expect(buildSpecFromBody({ name: "a", channels: ["c"] }).workspace).toBeUndefined();

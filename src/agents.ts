@@ -18,7 +18,7 @@
  * list/kill logic is unit-testable without a real tmux server.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type {
   AgentSpec,
@@ -335,6 +335,23 @@ export function buildSpecFromBody(body: unknown): AgentSpec {
     if (workspace.length > 0) {
       if (!workspace.startsWith("/")) {
         throw new SpawnRequestError('body.workspace must be an absolute path (start with "/")');
+      }
+      // The working dir becomes the agent's cwd — it MUST pre-exist as a directory,
+      // or the spawn would boot the agent into a missing dir (tmux `-c` / Bun.spawn
+      // `cwd` fault) with a confusing downstream error. A clean 400 at parse time is
+      // friendlier than that runtime failure. This endpoint is channel:admin-gated,
+      // so the operator owns the path they pass; we only assert it's a real dir.
+      let st: ReturnType<typeof statSync> | undefined;
+      try {
+        st = statSync(workspace);
+      } catch {
+        throw new SpawnRequestError(
+          `body.workspace "${workspace}" does not exist — the working directory must be a real ` +
+            `directory on disk (the agent's cwd).`,
+        );
+      }
+      if (!st.isDirectory()) {
+        throw new SpawnRequestError(`body.workspace "${workspace}" is not a directory.`);
       }
       spec.workspace = workspace;
     }
