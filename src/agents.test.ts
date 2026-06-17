@@ -132,6 +132,29 @@ describe("agentInfoFromSessions", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+  test("surfaces workingDir from the persisted spec when a workspace is set; absent otherwise", () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-info-workdir-"));
+    try {
+      persistSpec(sessionWorkspace(dir, "withdir"), {
+        name: "withdir",
+        channels: ["withdir"],
+        workspace: "/Users/op/Code/repo",
+      } as AgentSpec);
+      persistSpec(sessionWorkspace(dir, "nodir"), { name: "nodir", channels: ["nodir"] } as AgentSpec);
+      const infos = agentInfoFromSessions(
+        [
+          { name: "withdir-agent", attached: false },
+          { name: "nodir-agent", attached: false },
+        ],
+        dir,
+      );
+      const byName = Object.fromEntries(infos.map((i) => [i.name, i]));
+      expect(byName.withdir!.workingDir).toBe("/Users/op/Code/repo");
+      expect(byName.nodir!.workingDir).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("buildSpecFromBody", () => {
@@ -198,6 +221,34 @@ describe("buildSpecFromBody", () => {
     expect(() =>
       buildSpecFromBody({ name: "a", channels: ["c"], mounts: [{ hostPath: "/h", mountPath: "rel", mode: "ro" }] }),
     ).toThrow(/mountPath must be an absolute path/);
+  });
+
+  // Working-directory axis (design 2026-06-16-agent-filesystem-and-sharing.md):
+  // an absolute `workspace` host path is parsed; a relative path 400s; absent /
+  // blank → undefined (the private-dir cwd default).
+  test("workspace (absolute) is parsed onto the spec", () => {
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], workspace: "/Users/op/Code/repo" });
+    expect(spec.workspace).toBe("/Users/op/Code/repo");
+  });
+  test("workspace is trimmed", () => {
+    const spec = buildSpecFromBody({ name: "a", channels: ["c"], workspace: "  /Users/op/Code/repo  " });
+    expect(spec.workspace).toBe("/Users/op/Code/repo");
+  });
+  test("a relative workspace is rejected (must be absolute)", () => {
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], workspace: "Code/repo" }),
+    ).toThrow(/workspace must be an absolute path/);
+  });
+  test("absent workspace → undefined (private-dir cwd default)", () => {
+    expect(buildSpecFromBody({ name: "a", channels: ["c"] }).workspace).toBeUndefined();
+  });
+  test("a blank / whitespace-only workspace is treated as unset", () => {
+    expect(buildSpecFromBody({ name: "a", channels: ["c"], workspace: "   " }).workspace).toBeUndefined();
+  });
+  test("a non-string workspace is rejected", () => {
+    expect(() =>
+      buildSpecFromBody({ name: "a", channels: ["c"], workspace: 42 }),
+    ).toThrow(/workspace must be a string/);
   });
   // Backend default flip (design 2026-06-16 + Aaron's gating decision): a NEW
   // request that OMITS `backend` now defaults to "programmatic" (the reliable

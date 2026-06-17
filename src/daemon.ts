@@ -568,6 +568,7 @@ export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry):
       const status = s.state === "queued" ? `queued:${s.queued}` : s.state;
       const workspace = sessionWorkspace(dir, h.name);
       const hasPrompt = typeof h.spec.systemPrompt === "string" && h.spec.systemPrompt.length > 0;
+      const hasWorkingDir = typeof h.spec.workspace === "string" && h.spec.workspace.length > 0;
       return {
         name: h.name,
         session: `${h.name}-agent`,
@@ -577,6 +578,7 @@ export function listProgrammaticAgents(programmatic: ProgrammaticAgentRegistry):
         backend: "programmatic" as const,
         status,
         ...(hasPrompt ? { systemPromptMode: h.spec.systemPromptMode ?? "append" } : {}),
+        ...(hasWorkingDir ? { workingDir: h.spec.workspace } : {}),
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
