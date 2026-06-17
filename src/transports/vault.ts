@@ -277,7 +277,7 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
  * rather than the hub hardcoding it. The hub fetches this template (via
  * `GET /.parachute/config` → `triggerTemplate`), substitutes the channel name
  * into the placeholders, fills the webhook origin + the `action.auth.bearer`
- * (a `channel:send` hub JWT, per the keystone vault PR's `action.auth.bearer`
+ * (an `agent:send` hub JWT, per the keystone vault PR's `action.auth.bearer`
  * support), and registers it through the vault's runtime trigger-registration API.
  *
  * Placeholders the hub substitutes:
