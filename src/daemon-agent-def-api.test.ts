@@ -95,6 +95,24 @@ describe("POST /api/vault/agent-def", () => {
     srv.stop();
   });
 
+  // Connector 1: the two def-reload triggers (note.created + note.updated) the
+  // hub provisions send `event: "created"` / `event: "updated"` here. Both must
+  // route through to reload() — the webhook coercion accepts BOTH, not just one.
+  test("a note.created trigger payload routes to reload (created → instantiate)", async () => {
+    const { reg, reloads } = recordingRegistry();
+    const { srv, base } = serverWith(emptyChannels(), reg);
+    const res = await fetch(`${base}/api/vault/agent-def`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify({ event: "created", note: { id: "Agents/new-agent" } }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; reloaded: string };
+    expect(body.ok).toBe(true);
+    expect(reloads).toEqual([{ vault: "default", noteId: "Agents/new-agent", event: "created" }]);
+    srv.stop();
+  });
+
   test("explicit body.vault is honored", async () => {
     const { reg, reloads } = recordingRegistry({ vaults: ["default", "research"] });
     const { srv, base } = serverWith(emptyChannels(), reg);
