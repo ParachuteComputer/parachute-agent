@@ -485,7 +485,7 @@ export class AgentDefRegistry {
   private readonly clients = new Map<string, DefVaultClient>();
   /** def-vault name → its binding (for `ensureChannel`). */
   private readonly bindings = new Map<string, DefVaultBinding>();
-  /** `${vault} ${noteId}` → the live record. */
+  /** `${vault}\u0000${noteId}` → the live record. */
   private readonly live = new Map<string, LiveDef>();
   private readonly deps: InstantiateDeps;
 
@@ -520,7 +520,7 @@ export class AgentDefRegistry {
   }
 
   private keyOf(vault: string, noteId: string): string {
-    return `${vault} ${noteId}`;
+    return `${vault}\u0000${noteId}`;
   }
 
   /**
