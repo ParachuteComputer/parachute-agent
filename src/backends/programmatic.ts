@@ -394,15 +394,20 @@ export class ProgrammaticBackend implements AgentBackend {
     }
 
     // Mode-aware session handling (the architecture-synthesis chokepoint). A
-    // `one-shot` agent runs an EPHEMERAL turn: do NOT read a prior session id (no
-    // `--resume`) and do NOT persist the returned id below — each fire is a clean,
-    // independent invocation with no conversation continuity. `resident` (the default,
-    // = today) reads + persists exactly as before. Branch ONCE here on `spec.mode`.
-    const oneShot = spec.mode === "one-shot";
+    // `multi-threaded` agent is thread-keyed; TODAY (no inbound thread id yet) every
+    // fire mints a FRESH thread: do NOT read a prior session id (no `--resume`) and do
+    // NOT persist the returned id below — each fire is a clean, independent invocation
+    // with no conversation continuity. (The per-thread persist+resume — keying the
+    // session store by thread id so a specific prior thread can be resumed — is the
+    // DEFERRED increment of this mode; until then multi-threaded ships in its degenerate
+    // fresh-per-fire form.) `single-threaded` (the default, = today) reads + persists
+    // exactly as before. Branch ONCE here on `spec.mode`.
+    const multiThreaded = spec.mode === "multi-threaded";
 
     // Build the -p argv with --resume when a session id is stored for this channel —
-    // skipped entirely for one-shot (no continuity to restore).
-    const resumeSessionId = oneShot ? undefined : this.deps.sessionState.get(channel);
+    // skipped entirely for multi-threaded (no continuity to restore in its fresh-per-
+    // fire form).
+    const resumeSessionId = multiThreaded ? undefined : this.deps.sessionState.get(channel);
     const argv = buildProgrammaticClaudeArgs({
       message,
       mcpConfigPath,
@@ -498,9 +503,10 @@ export class ProgrammaticBackend implements AgentBackend {
     // Persist the captured session id so the NEXT turn resumes it — even on a
     // failed turn (a turn can fail AFTER establishing a session; the id is still
     // the continuation handle). A blank id is a no-op in the store. SKIPPED for
-    // one-shot: the turn is ephemeral, so its session id is never stored (the next
-    // fire must start fresh — no resume, no persist).
-    if (!oneShot && parsed.sessionId) this.deps.sessionState.set(channel, parsed.sessionId);
+    // multi-threaded: in its fresh-per-fire form the returned session id is never
+    // persisted to the channel store (the next fire must start fresh — no resume, no
+    // persist; recording the minted id per thread is the deferred continuation increment).
+    if (!multiThreaded && parsed.sessionId) this.deps.sessionState.set(channel, parsed.sessionId);
 
     const usage: DeliverUsage | undefined = parsed.usage
       ? {

@@ -90,6 +90,37 @@ save looks broken (the ch-verify confusion, in the operator's face). **Connector
 hard prerequisite for the def-authoring UI** (cheap → do first). Connector 2 (delete) is
 *not* a blocker (ship with a ≤60s delete-convergence note). Connector 3 optional.
 
+## Execution lifecycle: single-threaded vs multi-threaded
+
+A `#agent/definition`'s `metadata.mode` declares its EXECUTION-LIFECYCLE shape — how a
+turn relates to the agent's conversation thread + what record it leaves. An agent is one
+of exactly two kinds (the canonical model; defined by `claude -p` session-id semantics):
+
+- **`single-threaded`** (DEFAULT; = today's behavior) — ONE persistent session per
+  channel. Each turn `--resume`s the stored session id and persists the returned id; the
+  **channel transcript IS the record**, so NO separate run note is written. A scheduled
+  job for a single-threaded def is a synthetic inbound that resumes that one thread
+  (continuing the chat).
+- **`multi-threaded`** — turns are THREAD-KEYED. Every fire mints a fresh thread, runs an
+  independent turn, and writes ONE `#agent/run` note as its per-fire observability record
+  (input + reply + status + timing; the indexed `status`/`definition`/`mode` fields make
+  runs operator-queryable).
+
+**The retired term.** "one-shot" was never its own mode — it was only ever the
+**degenerate first turn of a multi-threaded agent**, so the name retires. The parser
+DUAL-ACCEPTS the legacy values (`resident`→`single-threaded`, `one-shot`→`multi-threaded`,
+`per-thread`→`multi-threaded`), mapping silently, so already-authored def notes keep
+working with no migration.
+
+**Ships now in its degenerate form.** TODAY no inbound carries a thread id, so a
+multi-threaded agent mints a FRESH thread on every fire (no `--resume` read; the returned
+session id is NOT persisted to the channel store). The **deferred increment** is
+thread-id routing: route inbound by a thread id, add a thread-keyed session store, and
+record the minted session/thread id into the run note so a specific prior thread becomes
+resumable. When that lands, the SAME mode gains continuation **with no operator-facing
+change and no migration** — the fresh-per-fire shape that ships now is simply its
+degenerate case.
+
 ## Phased build order
 - **Phase 0 — Connector 1** (def create+edit reactive): manifest `definition.reload`
   action + `created`+`updated` template; provision; verify a def edit reflects live.

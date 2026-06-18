@@ -33,18 +33,19 @@ export interface ReplyArgs {
 }
 
 /**
- * The durable record of ONE `one-shot` agent turn (the execution-lifecycle taxonomy).
- * A one-shot turn has no resumed transcript to be its record, so the daemon writes a
- * run note instead. (A `resident` turn writes NONE — the channel transcript is its
- * record.) The transport that backs the channel persists this; only the VaultTransport
- * implements it (a `#agent/run` note) — other transports omit the optional method.
+ * The durable record of ONE `multi-threaded` agent turn (the execution-lifecycle
+ * taxonomy). A multi-threaded turn has no resumed transcript to be its record, so the
+ * daemon writes a run note instead. (A `single-threaded` turn writes NONE — the channel
+ * transcript is its record.) The transport that backs the channel persists this; only the
+ * VaultTransport implements it (a `#agent/run` note) — other transports omit the optional
+ * method.
  */
 export interface RunRecord {
   /** The channel the turn ran on. */
   channel: string;
   /** The `#agent/definition` note id this run came from (provenance; plain id string). */
   definition?: string;
-  /** The mode the turn ran under (always `one-shot` for a run note today). */
+  /** The mode the turn ran under (always `multi-threaded` for a run note today). */
   mode: AgentMode;
   /** Outcome — `ok` (success) or `error` (the turn failed). */
   status: "ok" | "error";
@@ -126,11 +127,11 @@ export interface Transport {
   /** Optional: fetch an attachment, returning a local path. */
   download?(args: DownloadArgs): Promise<{ path: string }>;
   /**
-   * Optional: write the durable record of a completed `one-shot` turn (an
+   * Optional: write the durable record of a completed `multi-threaded` turn (an
    * `#agent/run` note for the VaultTransport). Only meaningful for a vault-backed
    * channel; transports without a durable store omit it. The daemon calls it ONLY for
-   * one-shot turns (a resident turn's record is its channel transcript). Returns the
-   * written record's id(s).
+   * multi-threaded turns (a single-threaded turn's record is its channel transcript).
+   * Returns the written record's id(s).
    */
   writeRun?(run: RunRecord): Promise<{ sent: string[] }>;
   /**

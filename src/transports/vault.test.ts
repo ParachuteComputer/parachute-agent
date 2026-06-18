@@ -150,7 +150,7 @@ describe("VaultTransport — reply (outbound note write)", () => {
   });
 });
 
-describe("VaultTransport — writeRun (#agent/run record for a one-shot turn)", () => {
+describe("VaultTransport — writeRun (#agent/run record for a multi-threaded turn)", () => {
   test("writeRun() POSTs an #agent/run note with indexed status/definition/mode + timing + Bearer", async () => {
     const calls: { url: string; init: RequestInit }[] = [];
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
@@ -166,7 +166,7 @@ describe("VaultTransport — writeRun (#agent/run record for a one-shot turn)", 
     const result = await t.writeRun({
       channel: "eng",
       definition: "Agents/digest",
-      mode: "one-shot",
+      mode: "multi-threaded",
       status: "ok",
       input: "run the daily digest",
       output: "digest complete: 3 items",
@@ -198,7 +198,7 @@ describe("VaultTransport — writeRun (#agent/run record for a one-shot turn)", 
     // Indexed/queryable fields.
     expect(sent.metadata.status).toBe("ok");
     expect(sent.metadata.definition).toBe("Agents/digest");
-    expect(sent.metadata.mode).toBe("one-shot");
+    expect(sent.metadata.mode).toBe("multi-threaded");
     // Timing + channel + usage (stringified for the vault).
     expect(sent.metadata.channel).toBe("eng");
     expect(sent.metadata.started_at).toBe("2026-06-18T07:00:00.000Z");
@@ -225,7 +225,7 @@ describe("VaultTransport — writeRun (#agent/run record for a one-shot turn)", 
     await t.start(fakeCtx("eng"));
     await t.writeRun({
       channel: "eng",
-      mode: "one-shot",
+      mode: "multi-threaded",
       status: "error",
       input: "do the thing",
       output: "claude -p exited 1: boom",
@@ -247,7 +247,7 @@ describe("VaultTransport — writeRun (#agent/run record for a one-shot turn)", 
     await expect(
       t.writeRun({
         channel: "eng",
-        mode: "one-shot",
+        mode: "multi-threaded",
         status: "ok",
         input: "x",
         output: "y",
@@ -771,7 +771,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     expect(byName("#channel-message/inbound").parent_names).toEqual(["#channel-message"]);
     expect(byName("#channel-message/outbound").parent_names).toEqual(["#channel-message"]);
     // `#agent/run` declares INDEXED string fields so runs are operator-queryable —
-    // "all failed runs" (status), "all runs of agent X" (definition), "all one-shot
+    // "all failed runs" (status), "all runs of agent X" (definition), "all multi-threaded
     // runs" (mode).
     expect(byName("#agent/run").fields).toEqual({
       status: { type: "string", indexed: true },

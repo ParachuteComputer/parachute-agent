@@ -725,11 +725,11 @@ export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutboun
 }
 
 /**
- * Build the {@link WriteRun} the programmatic registry posts a one-shot turn's run
+ * Build the {@link WriteRun} the programmatic registry posts a multi-threaded turn's run
  * record through — resolve the channel's transport from the live `channels` map and
  * call its `writeRun()` (a VaultTransport writes an `#agent/run` note). A transport
- * without a durable store (telegram) has no `writeRun`; we no-op there (a one-shot on a
- * non-vault channel still runs — it just leaves no run note). A missing transport
+ * without a durable store (telegram) has no `writeRun`; we no-op there (a multi-threaded
+ * turn on a non-vault channel still runs — it just leaves no run note). A missing transport
  * (channel deregistered between the turn + its run record) throws; the registry logs it
  * and moves on (it never re-runs the turn).
  */

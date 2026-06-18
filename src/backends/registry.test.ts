@@ -104,11 +104,11 @@ function runRecorder(): { runs: RunNote[]; fn: WriteRun } {
   return { runs, fn };
 }
 
-/** A one-shot spec (writes an `#agent/run` note per fire). */
-const specOneShot = (name: string, channel = name, definition?: string): AgentSpec => ({
+/** A multi-threaded spec (writes an `#agent/run` note per fire). */
+const specMultiThreaded = (name: string, channel = name, definition?: string): AgentSpec => ({
   name,
   channels: [channel],
-  mode: "one-shot",
+  mode: "multi-threaded",
   ...(definition ? { definition } : {}),
 });
 
@@ -241,13 +241,13 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
   });
 });
 
-describe("ProgrammaticAgentRegistry — #agent/run notes (one-shot lifecycle)", () => {
-  test("a completed ONE-SHOT turn writes an #agent/run note (status ok) carrying input/output/definition/mode", async () => {
+describe("ProgrammaticAgentRegistry — #agent/run notes (multi-threaded lifecycle)", () => {
+  test("a completed MULTI-THREADED turn writes an #agent/run note (status ok) carrying input/output/definition/mode", async () => {
     const backend = new FakeBackend();
     const rec = recorder();
     const runs = runRecorder();
     const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeRun: runs.fn });
-    await reg.register(specOneShot("digest", "digest", "Agents/digest"));
+    await reg.register(specMultiThreaded("digest", "digest", "Agents/digest"));
 
     reg.enqueue("digest", { content: "run the digest" });
     await until(() => runs.runs.length === 1);
@@ -256,20 +256,25 @@ describe("ProgrammaticAgentRegistry — #agent/run notes (one-shot lifecycle)", 
     const run = runs.runs[0]!;
     expect(run.channel).toBe("digest");
     expect(run.status).toBe("ok");
-    expect(run.mode).toBe("one-shot");
+    expect(run.mode).toBe("multi-threaded");
     expect(run.definition).toBe("Agents/digest");
     expect(run.input).toBe("run the digest");
     expect(run.output).toBe("reply:run the digest");
     expect(typeof run.started_at).toBe("string");
     expect(typeof run.ended_at).toBe("string");
+    // The dual-write is ADDITIVE: a non-empty reply writes EXACTLY one outbound
+    // (the chat delivery) AND exactly one run note (the primary record).
+    await until(() => rec.calls.length === 1);
+    expect(rec.calls.length).toBe(1);
+    expect(runs.runs.length).toBe(1);
   });
 
-  test("a RESIDENT turn writes NO #agent/run note (the channel transcript is its record)", async () => {
+  test("a SINGLE-THREADED turn writes NO #agent/run note (the channel transcript is its record)", async () => {
     const backend = new FakeBackend();
     const rec = recorder();
     const runs = runRecorder();
     const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeRun: runs.fn });
-    // specFor → no mode → resident (the default).
+    // specFor → no mode → single-threaded (the default).
     await reg.register(specFor("eng"));
 
     reg.enqueue("eng", { content: "hello" });
@@ -277,17 +282,17 @@ describe("ProgrammaticAgentRegistry — #agent/run notes (one-shot lifecycle)", 
     // Let any erroneous run-note write land, then assert none did.
     await new Promise<void>((r) => setTimeout(r, 5));
     expect(runs.runs).toHaveLength(0);
-    // The resident outbound reply was still written (no regression).
+    // The single-threaded outbound reply was still written (no regression).
     expect(rec.calls).toHaveLength(1);
   });
 
-  test("a FAILED one-shot turn still writes an #agent/run note with status:error + the reason", async () => {
+  test("a FAILED multi-threaded turn still writes an #agent/run note with status:error + the reason", async () => {
     const backend = new FakeBackend();
     backend.resultFor = () => ({ ok: false, error: "mint refused" });
     const rec = recorder();
     const runs = runRecorder();
     const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeRun: runs.fn });
-    await reg.register(specOneShot("digest"));
+    await reg.register(specMultiThreaded("digest"));
 
     reg.enqueue("digest", { content: "do it" });
     await until(() => runs.runs.length === 1);
@@ -299,13 +304,13 @@ describe("ProgrammaticAgentRegistry — #agent/run notes (one-shot lifecycle)", 
     expect(rec.calls).toHaveLength(0);
   });
 
-  test("a one-shot turn with an empty reply STILL writes a run note (status ok, empty output)", async () => {
+  test("a multi-threaded turn with an empty reply STILL writes a run note (status ok, empty output)", async () => {
     const backend = new FakeBackend();
     backend.resultFor = () => ({ ok: true, reply: "" });
     const rec = recorder();
     const runs = runRecorder();
     const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn, writeRun: runs.fn });
-    await reg.register(specOneShot("digest"));
+    await reg.register(specMultiThreaded("digest"));
 
     reg.enqueue("digest", { content: "tool-only run" });
     await until(() => runs.runs.length === 1);
@@ -313,6 +318,37 @@ describe("ProgrammaticAgentRegistry — #agent/run notes (one-shot lifecycle)", 
     expect(runs.runs[0]!.output).toBe("");
     // Empty reply → no outbound message note (the run note IS the record).
     expect(rec.calls).toHaveLength(0);
+  });
+
+  test("REGRESSION (c34db03): a multi-threaded turn whose outbound write THROWS still leaves exactly one #agent/run note", async () => {
+    const backend = new FakeBackend();
+    const runs = runRecorder();
+    // A THROWING WriteOutbound — the run note is written BEFORE the additive outbound
+    // (c34db03), so the failed transcript write must NOT cost us the primary record.
+    // (`recorder()` can't throw; a small inline throwing variant.)
+    let outboundAttempts = 0;
+    const throwingWriteOutbound: WriteOutbound = async () => {
+      outboundAttempts++;
+      throw new Error("vault write boom");
+    };
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: throwingWriteOutbound,
+      writeRun: runs.fn,
+    });
+    await reg.register(specMultiThreaded("digest", "digest", "Agents/digest"));
+
+    reg.enqueue("digest", { content: "fire it" });
+    await until(() => runs.runs.length === 1);
+    // Let the (throwing) outbound attempt settle.
+    await new Promise<void>((r) => setTimeout(r, 5));
+
+    // The run note survived the outbound failure: exactly ONE, status ok, output = the reply.
+    expect(runs.runs).toHaveLength(1);
+    expect(runs.runs[0]!.status).toBe("ok");
+    expect(runs.runs[0]!.output).toBe("reply:fire it");
+    // The outbound WAS attempted (and threw) — proving the run note was written first.
+    expect(outboundAttempts).toBe(1);
   });
 });
 

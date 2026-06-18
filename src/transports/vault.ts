@@ -295,14 +295,14 @@ const AGENT_JOB_TAG = "#agent/job";
 const JOB_PATH_PREFIX = "Channels";
 
 /**
- * Run-record tag — a `#agent/run` note is the durable record of ONE `one-shot`
+ * Run-record tag — a `#agent/run` note is the durable record of ONE `multi-threaded`
  * agent turn (the execution-lifecycle taxonomy; the Phase-3 prerequisite). A
- * `resident` turn leaves no run note — the channel transcript IS its record — so this
- * is written ONLY for one-shot fires. Body = the input + reply; metadata =
+ * `single-threaded` turn leaves no run note — the channel transcript IS its record — so
+ * this is written ONLY for multi-threaded fires. Body = the input + reply; metadata =
  * `{ definition, mode, status, started_at, ended_at, usage? }`. The INDEXED string
  * fields (`status`, `definition`, `mode`) make "all failed runs" / "all runs of agent
- * X" / "all one-shot runs" operator-queryable. `definition` is a plain note-id string
- * for now (interim — typed link fields are a future vault feature).
+ * X" / "all multi-threaded runs" operator-queryable. `definition` is a plain note-id
+ * string for now (interim — typed link fields are a future vault feature).
  */
 export const AGENT_RUN_TAG = "#agent/run";
 /** Default path prefix under which run notes are written: `Runs/<ch>/<id>`. */
@@ -349,7 +349,7 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
    * `{ <field>: { type, indexed } }`. Declared so the field gets a generated column +
    * index, making it queryable via metadata operator objects. Used by `#agent/run`
    * (status/definition/mode) so an operator can query "all failed runs" / "all runs of
-   * agent X" / "all one-shot runs".
+   * agent X" / "all multi-threaded runs".
    */
   fields?: Record<string, { type: "string" | "boolean" | "integer"; indexed?: boolean }>;
 }> = [
@@ -386,11 +386,11 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     name: AGENT_RUN_TAG,
     parent_names: [AGENT_ROOT_TAG],
     description:
-      "A run record for ONE one-shot agent turn — body is the input + reply, metadata is the run outcome.",
+      "A run record for ONE multi-threaded agent turn — body is the input + reply, metadata is the run outcome.",
     // Indexed so an operator can query runs by outcome / agent / mode:
     //  - status     → "all failed runs" (status:error)
     //  - definition → "all runs of agent X" (the def note id)
-    //  - mode       → "all one-shot runs"
+    //  - mode       → "all multi-threaded runs"
     fields: {
       status: { type: "string", indexed: true },
       definition: { type: "string", indexed: true },
@@ -669,7 +669,7 @@ export class VaultTransport implements Transport {
   }
 
   /**
-   * Write the durable record of ONE completed `one-shot` turn — an `#agent/run` note
+   * Write the durable record of ONE completed `multi-threaded` turn — an `#agent/run` note
    * (the execution-lifecycle taxonomy; the Phase-3 prerequisite). The body is the
    * input + reply; the metadata is the run outcome. The INDEXED fields
    * (`status`/`definition`/`mode`) make runs operator-queryable. This note is NOT a

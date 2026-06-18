@@ -197,12 +197,12 @@ function specWithSystemPrompt(
   };
 }
 
-/** A one-shot spec — the ephemeral execution-lifecycle mode (no resume, no persist). */
-function specOneShot(name = "eng"): AgentSpec {
+/** A multi-threaded spec — fresh-per-fire today (no resume, no persist). */
+function specMultiThreaded(name = "eng"): AgentSpec {
   return {
     name,
     channels: [name],
-    mode: "one-shot",
+    mode: "multi-threaded",
     vault: { name: "default", access: "read", tags: ["#agent/message"] },
   };
 }
@@ -344,19 +344,19 @@ describe("ProgrammaticBackend.deliver — second turn (sid stored)", () => {
   });
 });
 
-describe("ProgrammaticBackend.deliver — mode: one-shot (ephemeral, no resume/persist)", () => {
-  test("one-shot turn does NOT --resume even with a stored sid, and does NOT persist the returned id", async () => {
-    mkDirs("oneshot");
+describe("ProgrammaticBackend.deliver — mode: multi-threaded (fresh-per-fire, no resume/persist)", () => {
+  test("multi-threaded turn does NOT --resume even with a stored sid, and does NOT persist the returned id", async () => {
+    mkDirs("multithreaded");
     const state = new AgentSessionState({ stateDir });
-    // Plant a prior session id for the channel — a resident turn WOULD resume it; a
-    // one-shot turn must IGNORE it (no --resume) and must NOT overwrite it.
+    // Plant a prior session id for the channel — a single-threaded turn WOULD resume it; a
+    // multi-threaded turn must IGNORE it (no --resume) and must NOT overwrite it.
     state.set("eng", "sess-PRIOR");
 
     const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-NEW", "ephemeral reply") });
     const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
-    const handle = await backend.start(specOneShot("eng"));
+    const handle = await backend.start(specMultiThreaded("eng"));
 
-    const result = await backend.deliver(handle, "fire the one-shot");
+    const result = await backend.deliver(handle, "fire the turn");
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.reply).toBe("ephemeral reply");
 
@@ -366,37 +366,37 @@ describe("ProgrammaticBackend.deliver — mode: one-shot (ephemeral, no resume/p
     expect(cmd).not.toContain("--resume");
 
     // The returned id is NOT persisted: the store still holds the PRIOR id, untouched
-    // (a one-shot fire leaves no continuity handle behind).
+    // (a multi-threaded fire leaves no continuity handle behind in its fresh-per-fire form).
     expect(state.get("eng")).toBe("sess-PRIOR");
     // …and a fresh store instance ("restart") confirms it was never written.
     expect(new AgentSessionState({ stateDir }).get("eng")).toBe("sess-PRIOR");
   });
 
-  test("a one-shot turn with NO prior id still omits --resume and persists nothing", async () => {
-    mkDirs("oneshot-fresh");
+  test("a multi-threaded turn with NO prior id still omits --resume and persists nothing", async () => {
+    mkDirs("multithreaded-fresh");
     const state = new AgentSessionState({ stateDir });
     const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-X", "reply") });
     const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
-    const handle = await backend.start(specOneShot("eng"));
+    const handle = await backend.start(specMultiThreaded("eng"));
 
     await backend.deliver(handle, "go");
     expect(calls[0]!.argv[2]!).not.toContain("--resume");
-    // Nothing persisted — the channel has no stored id after a one-shot fire.
+    // Nothing persisted — the channel has no stored id after a multi-threaded fire.
     expect(state.get("eng")).toBeUndefined();
   });
 
-  test("REGRESSION: resident (default mode) still resumes + persists exactly as before", async () => {
-    mkDirs("resident-regress");
+  test("REGRESSION: single-threaded (default mode) still resumes + persists exactly as before", async () => {
+    mkDirs("single-threaded-regress");
     const state = new AgentSessionState({ stateDir });
     state.set("eng", "sess-PRIOR");
     const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-PRIOR", "continued") });
-    // specWithVault has NO mode → resident (the default).
+    // specWithVault has NO mode → single-threaded (the default).
     const backend = new ProgrammaticBackend(baseDeps(fn, { sessionState: state }));
     const handle = await backend.start(specWithVault("eng"));
 
     const result = await backend.deliver(handle, "continue the thread");
     expect(result.ok).toBe(true);
-    // A resident turn DOES resume the stored id…
+    // A single-threaded turn DOES resume the stored id…
     expect(calls[0]!.argv[2]!).toContain("--resume sess-PRIOR");
     // …and persists the (same, stable) id.
     expect(state.get("eng")).toBe("sess-PRIOR");

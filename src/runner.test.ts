@@ -368,8 +368,8 @@ describe("Runner — driver wiring (start/stop)", () => {
 // The runner is mode-AGNOSTIC: `fire(job)` just authors a synthetic inbound onto the
 // job's channel. The def's `mode` governs downstream at the deliver chokepoint. This
 // is what fixes "a scheduled job silently resumes the chat thread" — the operator
-// expresses ephemerality via `mode: one-shot` on the DEF, and the runner's fire then
-// runs an ephemeral turn + leaves a run note (a resident def's fire resumes the
+// expresses ephemerality via `mode: multi-threaded` on the DEF, and the runner's fire
+// then runs a fresh turn + leaves a run note (a single-threaded def's fire resumes the
 // thread as today). We wire the runner's `fire` to the REAL registry enqueue path
 // (fire → enqueue → mode-aware deliver) so the end-to-end behavior is asserted, not
 // just the runner-in-isolation contract.
@@ -386,10 +386,10 @@ class ModeFakeBackend implements AgentBackend {
   }
   async deliver(handle: AgentHandle, message: string, _onInterim?: InterimSink): Promise<DeliverResult> {
     // Mirror the real backend's mode semantics so the runner-path assertion is faithful.
-    const oneShot = handle.spec?.mode === "one-shot";
-    const prior = oneShot ? undefined : this.sessionId.get(handle.channel);
+    const multiThreaded = handle.spec?.mode === "multi-threaded";
+    const prior = multiThreaded ? undefined : this.sessionId.get(handle.channel);
     this.resumed.set(handle.channel, prior !== undefined);
-    if (!oneShot) this.sessionId.set(handle.channel, "sess-" + handle.channel);
+    if (!multiThreaded) this.sessionId.set(handle.channel, "sess-" + handle.channel);
     return { ok: true, reply: "did: " + message };
   }
   async stop(_handle: AgentHandle): Promise<void> {}
@@ -425,12 +425,12 @@ function wireRunner(reg: ProgrammaticAgentRegistry, clock = fakeClock("2026-06-1
 }
 
 describe("Runner — a scheduled fire honors the def's mode", () => {
-  test("a ONE-SHOT def's scheduled fire is ephemeral (no resume) + writes a run note", async () => {
+  test("a MULTI-THREADED def's scheduled fire is fresh (no resume) + writes a run note", async () => {
     const backend = new ModeFakeBackend();
     const runs = runRec();
     const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopOutbound, writeRun: runs.fn });
-    await reg.register({ name: "digest", channels: ["digest"], mode: "one-shot", definition: "Agents/digest" });
-    // Even with a prior session id seeded, a one-shot fire must NOT resume.
+    await reg.register({ name: "digest", channels: ["digest"], mode: "multi-threaded", definition: "Agents/digest" });
+    // Even with a prior session id seeded, a multi-threaded fire must NOT resume.
     backend.seed("digest", "sess-OLD");
 
     const r = wireRunner(reg);
@@ -439,20 +439,20 @@ describe("Runner — a scheduled fire honors the def's mode", () => {
     await r["fire"](job({ id: "digest-job", channel: "digest", message: "run the digest" }));
     await flushTurns(() => runs.runs.length === 1);
 
-    // Ephemeral: the scheduled fire did NOT resume the chat thread.
+    // Fresh-per-fire: the scheduled fire did NOT resume the chat thread.
     expect(backend.resumed.get("digest")).toBe(false);
-    // …and it left a run record (the one-shot's record, since there's no resumed transcript).
+    // …and it left a run record (the multi-threaded record, since there's no resumed transcript).
     expect(runs.runs).toHaveLength(1);
-    expect(runs.runs[0]!.mode).toBe("one-shot");
+    expect(runs.runs[0]!.mode).toBe("multi-threaded");
     expect(runs.runs[0]!.status).toBe("ok");
     expect(runs.runs[0]!.input).toBe("run the digest");
   });
 
-  test("REGRESSION: a RESIDENT def's scheduled fire RESUMES the thread + writes NO run note", async () => {
+  test("REGRESSION: a SINGLE-THREADED def's scheduled fire RESUMES the thread + writes NO run note", async () => {
     const backend = new ModeFakeBackend();
     const runs = runRec();
     const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopOutbound, writeRun: runs.fn });
-    // No mode → resident (the default = today's behavior).
+    // No mode → single-threaded (the default = today's behavior).
     await reg.register({ name: "uni-dev", channels: ["uni-dev"] });
     backend.seed("uni-dev", "sess-EXISTING"); // a prior turn established the thread.
 
@@ -462,7 +462,7 @@ describe("Runner — a scheduled fire honors the def's mode", () => {
     // Let any erroneous run-note write land, then assert none did.
     await new Promise<void>((r2) => setTimeout(r2, 5));
 
-    // A resident def's scheduled fire RESUMES the existing chat thread (today's behavior).
+    // A single-threaded def's scheduled fire RESUMES the existing chat thread (today's behavior).
     expect(backend.resumed.get("uni-dev")).toBe(true);
     // …and writes NO run note — the channel transcript is its record.
     expect(runs.runs).toHaveLength(0);

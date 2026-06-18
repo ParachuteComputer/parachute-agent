@@ -79,7 +79,7 @@ export interface OtherMcpSpec {
  */
 /**
  * A channel binding for an arm. A bare string is shorthand for `{ name, access:
- * "write" }` (back-compat — the common read+write resident session); the object
+ * "write" }` (back-compat — the common read+write single-threaded session); the object
  * form scopes a channel read-only so an arm that only *watches* a channel mints
  * `agent:read` and never `agent:write` (the "scope an arm to channel X
  * read-only" use case).
@@ -157,27 +157,34 @@ export type SystemPromptMode = "append" | "replace";
 /**
  * The agent's EXECUTION-LIFECYCLE mode — how a turn relates to the agent's
  * conversation thread + what run record it leaves (the architecture synthesis,
- * Phase 3 prerequisite). Defined entirely by `claude -p` session-id semantics:
+ * Phase 3 prerequisite). An agent is either SINGLE-THREADED or MULTI-THREADED;
+ * the distinction is defined entirely by `claude -p` session-id semantics:
  *
- *  - `"resident"` (DEFAULT; = today's behavior): ONE persistent session id per
- *    channel. Each turn `--resume`s the stored id and persists the returned id after
- *    — the channel transcript IS the thread, so there is NO separate run record. A
- *    scheduled runner job for a resident def is a synthetic inbound that RESUMES that
- *    one thread (continuing the chat). This is exactly what every agent does today.
+ *  - `"single-threaded"` (DEFAULT; = today's behavior): ONE persistent session id
+ *    per channel. Each turn `--resume`s the stored id and persists the returned id
+ *    after — the channel transcript IS the thread, so there is NO separate run
+ *    record. A scheduled runner job for a single-threaded def is a synthetic inbound
+ *    that RESUMES that one thread (continuing the chat). This is exactly what every
+ *    agent does today.
  *
- *  - `"one-shot"`: an EPHEMERAL turn. Do NOT read the prior session id (no
- *    `--resume`) and do NOT persist the returned id — each fire is a clean,
- *    independent invocation with no conversation continuity. Because there's no
- *    resumed transcript to be the record, a completed one-shot turn writes ONE
- *    `#agent/run` note (the run record: input + reply + status + timing). This is
+ *  - `"multi-threaded"`: turns are THREAD-KEYED. TODAY — because no inbound carries
+ *    a thread id yet — every fire mints a FRESH thread: do NOT read the prior session
+ *    id (no `--resume`) and do NOT persist the returned id to the channel store, so
+ *    each fire is a clean, independent invocation with no conversation continuity.
+ *    Because there's no resumed transcript to be the record, a completed turn writes
+ *    ONE `#agent/run` note (the run record: input + reply + status + timing). This is
  *    what an operator reaches for when a scheduled job should be a clean task run,
  *    NOT a silent continuation of the chat thread.
  *
- *  - `"per-thread"` (DEFERRED — not yet supported): one session id per inbound
- *    THREAD. Needs inbound thread-routing that doesn't exist yet; {@link
- *    parseAgentDef} REJECTS it with a clear error rather than silently demoting.
+ *    ("one-shot" was the prior name for this mode — it was only ever the DEGENERATE
+ *    FIRST-TURN of a multi-threaded agent, so the term retires. Continuation-by-
+ *    thread-id — resuming a SPECIFIC prior thread — is a DEFERRED increment: it needs
+ *    thread-id routing on the inbound, a thread-keyed session store, and recording the
+ *    minted session/thread id into the run note so a thread becomes resumable. When it
+ *    lands, the SAME mode simply gains continuation with NO operator-facing change and
+ *    NO migration; the fresh-per-fire shape that ships now is its degenerate case.)
  */
-export type AgentMode = "resident" | "one-shot" | "per-thread";
+export type AgentMode = "single-threaded" | "multi-threaded";
 
 export interface AgentSpec {
   /** Human-readable arm name; used as the tmux session + workspace slug. */
@@ -303,22 +310,23 @@ export interface AgentSpec {
    */
   systemPromptMode?: SystemPromptMode;
   /**
-   * The execution-lifecycle mode (the Phase-3 prerequisite). `"resident"`
+   * The execution-lifecycle mode (the Phase-3 prerequisite). `"single-threaded"`
    * (DEFAULT, = today): one persistent session per channel, `--resume`d + persisted
-   * each turn, the channel transcript is the thread (no run note). `"one-shot"`: an
-   * ephemeral turn — no `--resume`, the returned session id is NOT persisted, and a
-   * completed turn writes one `#agent/run` note. `"per-thread"` is deferred (parse
-   * rejects it). Read at the session-handling chokepoint (the programmatic backend's
-   * `deliver` resume block) + governs whether the registry writes a run note.
-   * Persisted in spec.json (set from the def's `metadata.mode`). See {@link AgentMode}.
+   * each turn, the channel transcript is the thread (no run note). `"multi-threaded"`:
+   * thread-keyed — today (no inbound thread id yet) every fire mints a fresh thread
+   * (no `--resume`, the returned session id is NOT persisted to the channel store) and
+   * a completed turn writes one `#agent/run` note. Read at the session-handling
+   * chokepoint (the programmatic backend's `deliver` resume block) + governs whether
+   * the registry writes a run note. Persisted in spec.json (set from the def's
+   * `metadata.mode`). See {@link AgentMode}.
    */
   mode?: AgentMode;
   /**
    * The `#agent/definition` note id this agent was instantiated from — the
-   * provenance carried into the `#agent/run` note a one-shot turn writes (so a run
-   * record links back to its def). A plain id STRING for now (interim — typed link
+   * provenance carried into the `#agent/run` note a multi-threaded turn writes (so a
+   * run record links back to its def). A plain id STRING for now (interim — typed link
    * fields are a future vault feature). Set by {@link parseAgentDef} from the note
-   * id; unset for a spec not sourced from a def note (then a one-shot run note
+   * id; unset for a spec not sourced from a def note (then a multi-threaded run note
    * carries no definition link).
    */
   definition?: string;

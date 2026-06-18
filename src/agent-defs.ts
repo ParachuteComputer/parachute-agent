@@ -181,8 +181,9 @@ function nameOfDefNote(note: { metadata?: Record<string, unknown> }): string | u
  *   - note BODY (`content`)  → `spec.systemPrompt` (the agent's role, in prose).
  *   - `metadata.name`        → `spec.name` (REQUIRED, slug) = the wake channel.
  *   - `metadata.backend`     → `spec.backend` (default `programmatic`).
- *   - `metadata.mode`        → `spec.mode` (default `resident`; `one-shot` ok;
- *     `per-thread` REJECTED — deferred). The note id → `spec.definition` (provenance).
+ *   - `metadata.mode`        → `spec.mode` (default `single-threaded`; `multi-threaded`
+ *     ok; the legacy aliases `resident`/`one-shot`/`per-thread` are DUAL-ACCEPTED and
+ *     mapped silently). The note id → `spec.definition` (provenance).
  *   - `metadata.systemPromptMode` → `spec.systemPromptMode` (default `append`).
  *   - `metadata.workspace`   → `spec.workspace` (optional absolute host cwd).
  *   - `metadata.filesystem`  → `spec.filesystem` (`workspace` | `full`).
@@ -248,27 +249,40 @@ export function parseAgentDef(note: {
     backend = rawBackend;
   }
 
-  // Execution-lifecycle mode (the Phase-3 prerequisite). Default `resident` (= today:
-  // one persistent session per channel, resumed + persisted each turn). `one-shot` is
-  // an ephemeral turn (no resume, no persist, writes an `#agent/run` note). `per-thread`
-  // is DEFERRED — it needs inbound thread-routing that doesn't exist yet, so REJECT it
-  // with a clear, actionable error (→ status:error on the note) rather than silently
-  // demoting to resident (which would hide the operator's intent).
-  let mode: AgentMode = "resident";
+  // Execution-lifecycle mode (the Phase-3 prerequisite). An agent is SINGLE-THREADED
+  // or MULTI-THREADED. Default `single-threaded` (= today: one persistent session per
+  // channel, resumed + persisted each turn). `multi-threaded` is thread-keyed — today
+  // (no inbound thread id yet) every fire mints a fresh thread (no resume, no persist,
+  // writes an `#agent/run` note).
+  //
+  // DUAL-ACCEPT the legacy aliases, mapping silently (no operator-facing break, no
+  // migration of already-authored notes):
+  //   legacy value   → canonical value
+  //   ─────────────────────────────────
+  //   resident       → single-threaded
+  //   one-shot       → multi-threaded   (one-shot was just multi-threaded's degenerate
+  //                                       first turn — the term retires)
+  //   per-thread     → multi-threaded   (per-thread continuation is the DEFERRED
+  //                                       increment of multi-threaded, not its own mode)
+  //
+  // Any OTHER value is rejected with a clear, actionable error (→ status:error on the
+  // note) rather than silently demoting (which would hide the operator's intent).
+  let mode: AgentMode = "single-threaded";
   const rawMode = metaStr(meta.mode);
   if (rawMode !== undefined) {
-    if (rawMode === "per-thread") {
+    if (rawMode === "single-threaded" || rawMode === "resident") {
+      mode = "single-threaded";
+    } else if (
+      rawMode === "multi-threaded" ||
+      rawMode === "one-shot" ||
+      rawMode === "per-thread"
+    ) {
+      mode = "multi-threaded";
+    } else {
       throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: per-thread mode is not yet supported — ` +
-          `needs thread routing; use resident or one-shot.`,
+        `#agent/definition note ${noteId}: mode must be "single-threaded" or "multi-threaded"`,
       );
     }
-    if (rawMode !== "resident" && rawMode !== "one-shot") {
-      throw new AgentDefParseError(
-        `#agent/definition note ${noteId}: mode must be "resident" or "one-shot"`,
-      );
-    }
-    mode = rawMode;
   }
 
   const spec: AgentSpec = {
@@ -276,8 +290,8 @@ export function parseAgentDef(note: {
     channels: [name], // wake channel = the agent name (agent ≡ channel)
     backend,
     mode,
-    // The def note id — provenance carried into a one-shot run note (interim plain id
-    // string; typed link fields are a future vault feature).
+    // The def note id — provenance carried into a multi-threaded run note (interim plain
+    // id string; typed link fields are a future vault feature).
     definition: noteId,
     // Own-vault binding (4a): the def-vault, write-scoped. NOT sourced from the note
     // — it's the vault the note LIVES in (passed in by the caller).
