@@ -10,6 +10,8 @@
  * so a non-Telegram transport never has to invent Telegram fields.
  */
 
+import type { AgentMode } from "./sandbox/types.ts";
+
 /** An inbound message, routed by the daemon to the bridges subscribed to `channel`. */
 export interface InboundMessage {
   /** The named channel this message arrived on. */
@@ -43,7 +45,7 @@ export interface RunRecord {
   /** The `#agent/definition` note id this run came from (provenance; plain id string). */
   definition?: string;
   /** The mode the turn ran under (always `one-shot` for a run note today). */
-  mode: string;
+  mode: AgentMode;
   /** Outcome — `ok` (success) or `error` (the turn failed). */
   status: "ok" | "error";
   /** The inbound text the turn was handed (the `-p` prompt). */

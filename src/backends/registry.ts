@@ -32,7 +32,7 @@
  * webhook (no loop).
  */
 
-import type { AgentSpec } from "../sandbox/types.ts";
+import type { AgentSpec, AgentMode } from "../sandbox/types.ts";
 import { normalizeChannel } from "../sandbox/types.ts";
 import type { AgentBackend, AgentHandle, InterimTurnEvent } from "./types.ts";
 
@@ -83,8 +83,8 @@ export interface RunNote {
   channel: string;
   /** The `#agent/definition` note id (provenance; plain id string). */
   definition?: string;
-  /** The mode the turn ran under (always `one-shot` for a run note). */
-  mode: string;
+  /** The mode the turn ran under (always `one-shot` for a run note today). */
+  mode: AgentMode;
   /** Outcome — `ok` (success) or `error` (the turn failed). */
   status: "ok" | "error";
   /** The inbound text handed to the turn (the `-p` prompt). */
@@ -418,8 +418,22 @@ export class ProgrammaticAgentRegistry {
         continue;
       }
 
-      // Empty reply → NO note (reviewer contract — `reply` can be ""). A turn that
-      // legitimately produced no text (e.g. tool-only work) leaves the chat clean.
+      // A one-shot turn's RUN RECORD comes FIRST — it is the PRIMARY record of the turn
+      // (status:ok now that the turn succeeded), so it must survive even if the ADDITIVE
+      // outbound transcript write below fails (that path `continue`s past here). Writing
+      // it before the outbound is what guarantees the invariant "a completed one-shot
+      // turn always leaves exactly one run note." `resident` writes NONE here — its
+      // record IS the channel transcript, written via the outbound below. Best-effort: a
+      // run-note failure is logged + the turn still resolves (we never re-run a
+      // `claude -p` turn — that would burn quota for a duplicate).
+      if (oneShot) {
+        await this.recordRun(handle, msg, "ok", result.reply ?? "", startedAt, result.usage);
+      }
+
+      // The outbound reply — the channel-transcript record for `resident`, and an
+      // ADDITIVE delivery for `one-shot` (whose primary record, the run note, is already
+      // written above). Empty reply → NO note (reviewer contract — `reply` can be ""): a
+      // turn that produced no text (e.g. tool-only work) leaves the chat clean.
       if (result.reply && result.reply.length > 0) {
         try {
           await this.writeOutbound(channel, result.reply, msg.inReplyTo);
@@ -428,23 +442,14 @@ export class ProgrammaticAgentRegistry {
           console.error(
             `parachute-agent: programmatic outbound write for channel "${channel}" failed: ${reason}`,
           );
-          // The reply was produced but NOT persisted. Resolve the live view to ERROR,
-          // not `done` — a `done` would drop the in-progress bubble and trigger a poll
-          // that finds no note, leaving the user with a silently vanished reply.
-          // (reviewer nit, PR #83)
+          // The reply was produced but NOT persisted to the transcript. Resolve the live
+          // view to ERROR, not `done` — a `done` would drop the in-progress bubble and
+          // trigger a poll that finds no note, leaving the user with a silently vanished
+          // reply. (reviewer nit, PR #83.) For one-shot the run note above already
+          // captured the reply durably, so the run record is not lost.
           this.emitTurnEvent(channel, { kind: "error", error: `reply produced but not saved: ${reason}` });
           continue;
         }
-      }
-
-      // A one-shot turn's RUN RECORD: write the `#agent/run` note (status:ok) now that
-      // the turn succeeded. The run note is the one-shot's record — `resident` writes
-      // NONE (its record is the channel transcript, written via `reply()` above). The
-      // outbound reply (above) is unchanged for both modes; this is ADDITIVE for
-      // one-shot. Best-effort: a run-note failure is logged + the turn still resolves
-      // (we never re-run a `claude -p` turn — that would burn quota for a duplicate).
-      if (oneShot) {
-        await this.recordRun(handle, msg, "ok", result.reply ?? "", startedAt, result.usage);
       }
 
       // Resolve the live view: `done` carries the final reply text (empty when the
