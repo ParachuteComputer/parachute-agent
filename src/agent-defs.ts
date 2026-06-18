@@ -867,14 +867,27 @@ export class AgentDefRegistry {
   }
 
   /** Find a live def by note id across ALL configured vaults (PATCH/DELETE address
-   *  a note by id; the vault is resolved here). Returns the {vault, detail} or null. */
+   *  a note by id; the vault is resolved here). Returns the {vault, detail} or null.
+   *  AMBIGUITY GUARD (#106 review): if two configured def-vaults each vend a note at
+   *  the SAME id, picking the first match is non-deterministic — so throw a 409-class
+   *  {@link AgentDefWriteError} ("specify vault") rather than silently mutating one of
+   *  them. The single-match happy path is unchanged. */
   findLiveByNote(noteId: string): { vault: string; detail: AgentDefDetail } | null {
+    const matches: string[] = [];
     for (const d of this.live.values()) {
-      if (d.noteId === noteId) {
-        return { vault: d.vault, detail: this.liveDef(d.vault, noteId)! };
-      }
+      if (d.noteId === noteId) matches.push(d.vault);
     }
-    return null;
+    if (matches.length === 0) return null;
+    if (matches.length > 1) {
+      throw new AgentDefWriteError(
+        `note ${noteId} is a live agent definition in multiple def-vaults (${matches
+          .sort()
+          .join(", ")}); ambiguous note id across vaults — specify vault`,
+        409,
+      );
+    }
+    const vault = matches[0]!;
+    return { vault, detail: this.liveDef(vault, noteId)! };
   }
 
   private keyOf(vault: string, noteId: string): string {

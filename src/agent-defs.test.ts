@@ -18,6 +18,7 @@ import {
   DefVaultClient,
   AgentDefRegistry,
   AgentDefParseError,
+  AgentDefWriteError,
   type DefVaultBinding,
   type InstantiateDeps,
 } from "./agent-defs.ts";
@@ -588,6 +589,46 @@ describe("AgentDefRegistry — lifecycle", () => {
     const n = await reg.loadAll();
     expect(n).toBe(1);
     expect(calls.registered.map((s) => s.name)).toEqual(["r"]);
+  });
+
+  test("findLiveByNote returns the single match (vault + detail)", async () => {
+    const { deps } = recorderDeps();
+    const fetchFn = vaultFetch({
+      defs: [{ id: "Agents/uni-dev", content: "role", metadata: { name: "uni-dev" } }],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn });
+    await reg.loadAll();
+    const found = reg.findLiveByNote("Agents/uni-dev");
+    expect(found).not.toBeNull();
+    expect(found!.vault).toBe("default");
+    expect(found!.detail.name).toBe("uni-dev");
+    expect(reg.findLiveByNote("Agents/ghost")).toBeNull();
+  });
+
+  test("findLiveByNote throws 409 when the SAME noteId is live in two def-vaults (#106 ambiguity)", async () => {
+    const { deps } = recorderDeps();
+    const b2: DefVaultBinding = { vault: "research", vaultUrl: "http://127.0.0.1:1940", token: "t2" };
+    // The vaultFetch helper serves the same def list for ANY vault → both `default` and
+    // `research` vend a def at the SAME note path, so two live entries share the noteId.
+    const fetchFn = vaultFetch({
+      defs: [{ id: "Agents/shared", content: "role", metadata: { name: "shared" } }],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding, b2], fetchFn });
+    await reg.loadAll();
+    // The note id is live in BOTH vaults — picking one is non-deterministic, so it throws
+    // a 409-class AgentDefWriteError rather than silently mutating an arbitrary one.
+    let caught: unknown;
+    try {
+      reg.findLiveByNote("Agents/shared");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(AgentDefWriteError);
+    expect((caught as AgentDefWriteError).status).toBe(409);
+    expect((caught as AgentDefWriteError).message).toContain("ambiguous");
+    // The PATCH/DELETE write paths surface the same 409 (they resolve via findLiveByNote).
+    await expect(reg.editDef("Agents/shared", { systemPrompt: "x" })).rejects.toMatchObject({ status: 409 });
+    await expect(reg.deleteDef("Agents/shared")).rejects.toMatchObject({ status: 409 });
   });
 
   test("soleVaultName resolves the single binding (the reload-webhook default)", () => {

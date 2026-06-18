@@ -20,7 +20,7 @@
  */
 import { describe, test, expect, mock, beforeAll, afterAll } from "bun:test";
 import { HubJwtError, looksLikeJwt } from "@openparachute/scope-guard";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -62,6 +62,7 @@ mock.module("./hub-jwt.ts", () => ({
 }));
 
 import { createFetchHandler } from "./daemon.ts";
+import { MintError } from "./mint-token.ts";
 import { ClientRegistry } from "./routing.ts";
 import { AgentDefRegistry, type InstantiateDeps } from "./agent-defs.ts";
 import { ChannelQueueRegistry, type ChannelQueueStore } from "./backends/channel-queue.ts";
@@ -454,6 +455,34 @@ describe("POST /api/agent-defs", () => {
     expect(res.status).toBe(400);
     srv.stop();
   });
+
+  test("duplicate name → 409 (collision with a live def)", async () => {
+    // #106 review: seed + load a live def, then POST a second with the SAME name —
+    // createDef rejects the collision up front (AgentDefWriteError 409) before any write.
+    const fake = new FakeDefVault();
+    fake.seed({
+      id: "Agents/uni-dev",
+      content: "p",
+      tags: ["#agent/definition"],
+      metadata: { name: "uni-dev", backend: "programmatic" },
+    });
+    const { reg } = registryWithFakeVault({ fake });
+    await reg.loadAll(); // make "uni-dev" a LIVE def.
+    const { srv, base } = serverWith(emptyChannels(), { agentDefs: reg });
+    const before = fake.notes.size;
+    const res = await fetch(`${base}/api/agent-defs`, {
+      method: "POST",
+      headers: adminAuth,
+      body: JSON.stringify({ vault: "default", name: "uni-dev", backend: "channel" }),
+    });
+    expect(res.status).toBe(409);
+    expect((await res.json()) as { error: string }).toMatchObject({
+      error: expect.stringContaining("already exists"),
+    });
+    // No second note was written — the collision is rejected BEFORE the vault write.
+    expect(fake.notes.size).toBe(before);
+    srv.stop();
+  });
 });
 
 // ===========================================================================
@@ -598,11 +627,17 @@ describe("GET /api/agent-vaults", () => {
     srv.stop();
   });
 
-  test("read scope insufficient → 403", async () => {
+  test("read scope is enough (mirrors GET /api/agent-defs — listing is non-sensitive)", async () => {
+    // #106 review: the listing is {vault,url,tokenPresent} — no secrets — so it's lowered
+    // from admin to read scope, matching the sibling GET /api/agent-defs.
     const { reg } = registryWithFakeVault();
     const { srv, base } = serverWith(emptyChannels(), { agentDefs: reg });
     const res = await fetch(`${base}/api/agent-vaults`, { headers: readAuth });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { vaults: Array<{ vault: string; tokenPresent: boolean }> };
+    expect(body.vaults.find((x) => x.vault === "default")).toBeDefined();
+    // Still no token value leaked on the read-scoped path.
+    expect(JSON.stringify(body)).not.toContain("vtok");
     srv.stop();
   });
 
@@ -706,6 +741,26 @@ describe("POST /api/agent-vaults", () => {
     expect((await res.json()) as { error: string }).toMatchObject({ error: expect.stringContaining("already configured") });
     srv.stop();
   });
+
+  test("a MintError propagates the hub status (not a generic 500)", async () => {
+    // #106 review: the route maps a MintError to err.status (a hub mint failure carries
+    // its own HTTP status). Inject a hook that throws MintError(429) → assert 429, not 500.
+    const { reg } = registryWithFakeVault();
+    const addDefVault = async () => {
+      throw new MintError("hub rate-limited the mint", 429, "rate_limited");
+    };
+    const { srv, base } = serverWith(emptyChannels(), { agentDefs: reg, addDefVault });
+    const res = await fetch(`${base}/api/agent-vaults`, {
+      method: "POST",
+      headers: adminAuth,
+      body: JSON.stringify({ vault: "research" }),
+    });
+    expect(res.status).toBe(429);
+    expect((await res.json()) as { error: string }).toMatchObject({
+      error: expect.stringContaining("token mint failed"),
+    });
+    srv.stop();
+  });
 });
 
 describe("DELETE /api/agent-vaults/:name", () => {
@@ -759,4 +814,48 @@ describe("DELETE /api/agent-vaults/:name", () => {
     expect((await res.json()) as { removed: boolean }).toMatchObject({ removed: false });
     srv.stop();
   });
+
+  test(
+    "a writeDefVaultsFile failure leaves in-memory state COHERENT (vault still bound, agents NOT torn down)",
+    async () => {
+      // #106 review: the route persists the file FIRST, then deregisters + removes. So a
+      // write failure must leave EVERYTHING untouched. We force the write to fail by making
+      // the sandboxed agent-vaults.json read-only (writeDefVaultsFile → EACCES). The
+      // read-only file lets readDefVaultsFile succeed (read) but the write throws.
+      // Root bypasses file perms (memory: feedback_negative_scans_need_positive_controls),
+      // so skip under uid 0 where the write wouldn't fail.
+      if (typeof process.getuid === "function" && process.getuid() === 0) return;
+
+      const filePath = join(stateDir, "agent-vaults.json");
+      writeFileSync(
+        filePath,
+        JSON.stringify({ vaults: [{ vault: "default" }, { vault: "research" }] }, null, 2),
+        { mode: 0o600 },
+      );
+      chmodSync(filePath, 0o400); // read-only → write throws, read still works.
+      try {
+        const { reg, calls } = twoVaultRegistry();
+        const { srv, base } = serverWith(emptyChannels(), { agentDefs: reg });
+        const res = await fetch(`${base}/api/agent-vaults/research`, {
+          method: "DELETE",
+          headers: adminAuth,
+        });
+        // The durable write failed → 500, BEFORE any in-memory teardown.
+        expect(res.status).toBe(500);
+        expect((await res.json()) as { error: string }).toMatchObject({
+          error: expect.stringContaining("agent-vaults.json"),
+        });
+        // COHERENT: the vault is still bound and its agents were NOT deregistered (the
+        // write-first ordering means a write failure rolls back to a no-op).
+        expect(reg.vaultNames()).toContain("research");
+        expect(reg.vaultNames()).toContain("default");
+        expect(calls.deregister).toHaveLength(0);
+        srv.stop();
+      } finally {
+        // Restore writability so afterAll's rmSync can clean up the file.
+        if (existsSync(filePath)) chmodSync(filePath, 0o600);
+        if (existsSync(filePath)) rmSync(filePath, { force: true });
+      }
+    },
+  );
 });

@@ -652,6 +652,8 @@ function defaultAddDefVault(
     const merged = [...existing.filter((v) => v.vault !== vault), binding];
     writeDefVaultsFile({ vaults: merged }, stateDir);
     // Bring the vault up LIVE: register it + load its defs now (the immediate path).
+    // NOTE: loadAll() reloads ALL configured def-vaults, not just the one just added —
+    // a slight over-read, acceptable at the current handful-of-vaults scale.
     agentDefs.addVault(binding);
     await agentDefs.loadAll();
     return { vault, url: vaultUrl, tokenPresent: true };
@@ -2793,12 +2795,16 @@ export function createFetchHandler(
     // uneditable; the v2 API surfaces + manages it. NO token VALUE surfaced (only
     // present/absent). Externally `<hub>/agent/api/agent-vaults`. Admin-scoped.
     //
-    //   GET    /api/agent-vaults         → list { vault, url, tokenPresent } (no value)
-    //   POST   /api/agent-vaults         { vault, url? } → mint token + persist + live
-    //   DELETE /api/agent-vaults/<name>  → drop from file + deregister its agents
+    //   GET    /api/agent-vaults         → list { vault, url, tokenPresent } (read)
+    //   POST   /api/agent-vaults         { vault, url? } → mint token + persist + live (admin)
+    //   DELETE /api/agent-vaults/<name>  → drop from file + deregister its agents (admin)
     // ---------------------------------------------------------------------
     if (url.pathname === "/api/agent-vaults" && (req.method === "GET" || req.method === "POST")) {
-      const denied = await requireScope(req, url, SCOPE_ADMIN);
+      // GET is READ-scoped to mirror GET /api/agent-defs — the listing is non-sensitive
+      // ({vault,url,tokenPresent}); `tokenPresent` is a boolean, NEVER the token value.
+      // POST is admin (it mints a token + writes config).
+      const scope = req.method === "GET" ? SCOPE_READ : SCOPE_ADMIN;
+      const denied = await requireScope(req, url, scope);
       if (denied) return denied;
 
       if (req.method === "GET") {
@@ -2877,13 +2883,13 @@ export function createFetchHandler(
           400,
         );
       }
-      // Tear down its live agents, then drop it from the live registry + the file.
-      try {
-        await agentDefs.deregisterAllForVault(name);
-      } catch (err) {
-        return json({ error: `failed to deregister agents for "${name}": ${(err as Error).message}` }, 502);
-      }
-      // Rewrite agent-vaults.json without this vault (idempotent).
+      // ORDERING (#106 review): persist the file FIRST, then tear down in-memory state.
+      // The prior order (deregister → write → remove) left an INCOHERENT state on a write
+      // failure: agents already torn down but the vault still in the live registry, while
+      // the on-disk file was unchanged — so a restart re-instantiated agents the operator
+      // had just deleted. Writing first means a write failure leaves EVERYTHING untouched
+      // (vault + agents still live, file unchanged); only after the durable write commits
+      // do we deregister the agents and drop the vault from the live registry.
       try {
         const stateDir = defaultStateDir();
         const file = readDefVaultsFile(stateDir);
@@ -2892,6 +2898,14 @@ export function createFetchHandler(
         }
       } catch (err) {
         return json({ error: `failed to update agent-vaults.json: ${(err as Error).message}` }, 500);
+      }
+      // File is durable without this vault → tear down its live agents + drop it from the
+      // live registry. A deregister failure now leaves the file already-correct, so a
+      // restart converges to the intended (removed) state rather than resurrecting it.
+      try {
+        await agentDefs.deregisterAllForVault(name);
+      } catch (err) {
+        return json({ error: `failed to deregister agents for "${name}": ${(err as Error).message}` }, 502);
       }
       agentDefs.removeVault(name);
       return json({ ok: true, vault: name, removed: true });
