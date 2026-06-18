@@ -280,6 +280,59 @@ describe("GrantsClient.getMaterial (GET /admin/grants/<id>/material)", () => {
   });
 });
 
+describe("GrantsClient.reconcileGrants (POST /admin/grants/reconcile) — #96 grant-GC", () => {
+  test("POSTs { agent, liveKeys } with the manager bearer; returns { pruned, prunedIds }", async () => {
+    let captured: { url: string; method?: string; auth?: string; body?: unknown } = { url: "" };
+    const client = clientWith((async (url: string | URL | Request, init?: RequestInit) => {
+      captured = {
+        url: String(url),
+        method: init?.method,
+        auth: (init?.headers as Record<string, string>)?.authorization,
+        body: JSON.parse(String(init?.body)),
+      };
+      return new Response(JSON.stringify({ pruned: 2, prunedIds: ["g1", "g2"] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch);
+
+    const out = await client.reconcileGrants("researcher", ["vault:research:read", "env+mcp:github"]);
+    expect(captured.url).toBe(`${HUB}/admin/grants/reconcile`);
+    expect(captured.method).toBe("POST");
+    expect(captured.auth).toBe(`Bearer ${BEARER}`);
+    // The field name MUST stay "agent" (deferred rename B1 is NOT in scope).
+    expect(captured.body).toEqual({ agent: "researcher", liveKeys: ["vault:research:read", "env+mcp:github"] });
+    expect(out).toEqual({ pruned: 2, prunedIds: ["g1", "g2"] });
+  });
+
+  test("an empty liveKeys array (the def is gone → prune ALL) is sent verbatim", async () => {
+    let body: unknown;
+    const client = clientWith((async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({ pruned: 3, prunedIds: ["a", "b", "c"] }), { status: 200 });
+    }) as typeof fetch);
+    const out = await client.reconcileGrants("gone", []);
+    expect(body).toEqual({ agent: "gone", liveKeys: [] });
+    expect(out.pruned).toBe(3);
+  });
+
+  test("a response with no prunedIds → { pruned } only (defensive)", async () => {
+    const client = clientWith((async () => new Response(JSON.stringify({ pruned: 0 }), { status: 200 })) as unknown as typeof fetch);
+    expect(await client.reconcileGrants("a", [])).toEqual({ pruned: 0 });
+  });
+
+  test("a non-JSON / empty 200 body → pruned defaults to 0 (never throws)", async () => {
+    const client = clientWith((async () => new Response("", { status: 200 })) as unknown as typeof fetch);
+    expect(await client.reconcileGrants("a", [])).toEqual({ pruned: 0 });
+  });
+
+  test("throws GrantsApiError carrying the status on a non-ok response", async () => {
+    const client = clientWith((async () => new Response("nope", { status: 403 })) as unknown as typeof fetch);
+    await expect(client.reconcileGrants("a", [])).rejects.toMatchObject({ status: 403 });
+    await expect(client.reconcileGrants("a", [])).rejects.toThrow(GrantsApiError);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // resolveConnectionStatus
 // ---------------------------------------------------------------------------

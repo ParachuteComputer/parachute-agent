@@ -146,6 +146,18 @@ function metaList(v: unknown): string[] {
 }
 
 /**
+ * Best-effort, NON-throwing extraction of a def note's agent name (`metadata.name`),
+ * for tracking the seen set + the removed-def grant-GC diff (#96) — distinct from
+ * {@link parseAgentDef}, which validates + throws. Returns undefined when the note has
+ * no usable name (we then carry the prior last-known name forward). Does NOT slug-
+ * validate: a note that once instantiated already passed parse; tracking the raw name
+ * is enough to address its grants for the prune.
+ */
+function nameOfDefNote(note: { metadata?: Record<string, unknown> }): string | undefined {
+  return metaStr(note.metadata?.name);
+}
+
+/**
  * Parse one `#agent/definition` note into a {@link ParsedAgentDef}. PURE — no I/O.
  *
  * Mapping (the design's "note shape"):
@@ -534,6 +546,12 @@ interface LiveDef {
  *     `vault + noteId → LiveDef` map.
  *   - {@link deregisterAllForVault} — drop a whole vault's agents (config change).
  *
+ * Grant-GC (#96): the registry also keeps the hub's grant rows in sync with the live
+ * def set so a removed connection / a deleted def doesn't orphan an approved grant. On
+ * a CONFIDENT signal only — a clean successful instantiate (prune to the def's current
+ * `wants:` keys) or a CONFIRMED removal (deleted/404 → prune ALL) — it POSTs the hub's
+ * reconcile endpoint; a transient parse/list/fetch failure NEVER prunes (safety guard).
+ *
  * Idempotent: re-instantiating the same name swaps the registration in place
  * (`programmatic.register` + `addChannelLive` both replace-by-name), so an update is
  * a clean re-instantiate, not a duplicate. A name collision ACROSS def-vaults (two
@@ -547,6 +565,17 @@ export class AgentDefRegistry {
   private readonly bindings = new Map<string, DefVaultBinding>();
   /** `${vault}\u0000${noteId}` → the live record. */
   private readonly live = new Map<string, LiveDef>();
+  /**
+   * Per-vault set of `#agent/definition` notes seen on the LAST CONFIDENT read —
+   * `noteId → agentName` — the prior-known set the removed-def diff (grant-GC, #96)
+   * compares against. ONLY mutated from a confident signal: a successful vault LIST
+   * (loadAll) or a confirmed single-note removal/instantiate (reload). A note's name is
+   * its parsed `metadata.name`; a present-but-parse-failing note KEEPS its last-known
+   * name (carry-forward) so a transient parse error never drops it from the tracked set
+   * — which would wrongly flag it as removed (safety guard, design "only prune from a
+   * confident live set"). Keyed `vault → (noteId → agentName)`.
+   */
+  private readonly seenDefs = new Map<string, Map<string, string>>();
   private readonly deps: InstantiateDeps;
   /**
    * The hub grants client (4b) — used to REGISTER each def's `wants:` connections as
@@ -606,6 +635,13 @@ export class AgentDefRegistry {
    * vault AND per note: a single vault's list failure (or one note's parse/instantiate
    * failure) is logged and never aborts the others, so one bad def can't sink the set.
    * Returns the count successfully instantiated.
+   *
+   * Grant-GC (#96): after a SUCCESSFUL list (a confident read of the vault's whole def
+   * set), diff the prior-known def set against it — any note that was present and is now
+   * GONE has had its `#agent/definition` note deleted, so its grants are pruned ALL
+   * (`reconcileGrants(agent, [])`). A list FAILURE deliberately skips the diff (we
+   * `continue` BEFORE touching the prior set) so a transient vault outage never presents
+   * an empty current set that would nuke every agent's grants (safety guard).
    */
   async loadAll(): Promise<number> {
     let count = 0;
@@ -615,13 +651,75 @@ export class AgentDefRegistry {
         notes = await client.listDefNotes();
       } catch (err) {
         console.error(`agent-defs: listing defs from vault "${vault}" failed (continuing): ${(err as Error).message}`);
+        // CONFIDENT-SET GUARD: a failed list is NOT a confident read — leave the prior
+        // seen set untouched (no removed-def diff) so a hub/vault blip can't prune grants.
         continue;
       }
+      // The list succeeded → this IS a confident read. Detect removed defs by diffing
+      // the prior seen set (noteId→name) against the ids present now, BEFORE we mutate it.
+      const presentIds = new Set(notes.map((n) => n.id));
+      await this.pruneRemovedDefs(vault, presentIds);
+      // Rebuild the seen set from this confident read (carry-forward last-known names for
+      // notes that fail to parse, so a transient parse error doesn't drop them).
+      this.rebuildSeenDefs(vault, notes);
       for (const note of notes) {
         if (await this.instantiate(vault, note)) count++;
       }
     }
     return count;
+  }
+
+  /**
+   * Reconcile every def that was in the prior seen set for `vault` but is NOT in
+   * `presentIds` (its note was deleted) — `reconcileGrants(agent, [])` prunes ALL its
+   * grants so a deleted def doesn't orphan live approved rows. Best-effort + no-op
+   * without a grants client. Called ONLY with a confident current id set (a successful
+   * list); never on a list failure (see {@link loadAll}).
+   */
+  private async pruneRemovedDefs(vault: string, presentIds: Set<string>): Promise<void> {
+    const prior = this.seenDefs.get(vault);
+    if (!prior) return; // first confident read of this vault — nothing to compare against.
+    for (const [noteId, name] of prior) {
+      if (presentIds.has(noteId)) continue; // still present — not a removal.
+      // Confirmed removal: the def note is gone from a confident vault read.
+      await this.reconcileForRemovedAgent(name);
+    }
+  }
+
+  /**
+   * Rebuild the per-vault seen set from a confident list. Each present note maps
+   * noteId→its parsed `metadata.name`; a note that fails to parse keeps its prior
+   * last-known name (so a transient parse error doesn't drop it from the tracked set
+   * and wrongly flag it removed next pass). A note that never had a name (parse-failed
+   * on first sight) is tracked id-only (empty name) so it isn't re-detected as removed.
+   */
+  private rebuildSeenDefs(
+    vault: string,
+    notes: Array<{ id: string; content?: string; metadata?: Record<string, unknown> }>,
+  ): void {
+    const prior = this.seenDefs.get(vault);
+    const next = new Map<string, string>();
+    for (const note of notes) {
+      const name = nameOfDefNote(note) ?? prior?.get(note.id) ?? "";
+      next.set(note.id, name);
+    }
+    this.seenDefs.set(vault, next);
+  }
+
+  /** Reconcile a CONFIRMED-removed agent's grants away (prune ALL). Best-effort + no-op
+   *  without a grants client / without a known name. */
+  private async reconcileForRemovedAgent(name: string): Promise<void> {
+    if (!this.grants || !name) return;
+    try {
+      const { pruned } = await this.grants.reconcileGrants(name, []);
+      if (pruned > 0) {
+        console.log(`agent-defs: pruned ${pruned} stale grant(s) for removed agent "${name}".`);
+      }
+    } catch (err) {
+      console.warn(
+        `agent-defs: pruning grants for removed agent "${name}" failed (continuing): ${(err as Error).message}`,
+      );
+    }
   }
 
   /**
@@ -644,9 +742,10 @@ export class AgentDefRegistry {
       return "skipped";
     }
     // A delete event: the note is gone — tear down without a fetch (the GET would 404
-    // anyway; skipping it is faster + avoids a confusing 404 log).
+    // anyway; skipping it is faster + avoids a confusing 404 log). A delete is a
+    // CONFIRMED removal → prune the agent's grants (#96).
     if (event === "deleted") {
-      await this.deregisterByNote(vault, noteId);
+      await this.confirmedRemoval(vault, noteId);
       return "deregistered";
     }
     let note: Awaited<ReturnType<DefVaultClient["getNote"]>>;
@@ -654,14 +753,33 @@ export class AgentDefRegistry {
       note = await client.getNote(noteId);
     } catch (err) {
       console.error(`agent-defs: reload fetch of ${noteId} from "${vault}" failed: ${(err as Error).message}`);
+      // A fetch FAILURE is NOT a confirmed removal — skip without pruning grants (safety
+      // guard: never prune from an inconclusive read). The agent + grants stay intact.
       return "skipped";
     }
     if (!note) {
-      // Re-read says it's gone (deleted, or no longer carries the def tag we can see).
-      await this.deregisterByNote(vault, noteId);
+      // Re-read 404 says it's gone (deleted, or no longer carries the def tag we can
+      // see) — a CONFIRMED removal → prune the agent's grants (#96).
+      await this.confirmedRemoval(vault, noteId);
       return "deregistered";
     }
     return (await this.instantiate(vault, note)) ? "instantiated" : "skipped";
+  }
+
+  /**
+   * A CONFIRMED removed def (a `deleted` trigger, or a re-read 404): tear the agent
+   * down AND prune ALL its grants (#96 grant-GC) so a deleted `#agent/definition` note
+   * doesn't orphan live approved rows. The seen-set entry is cleared so a later loadAll
+   * doesn't re-detect (and re-prune) the same removal. Reconcile is best-effort.
+   */
+  private async confirmedRemoval(vault: string, noteId: string): Promise<void> {
+    // The grant holder name comes from the live record if present, else the last-known
+    // name we tracked for this note (a def removed before it ever instantiated).
+    const name =
+      this.live.get(this.keyOf(vault, noteId))?.name ?? this.seenDefs.get(vault)?.get(noteId);
+    await this.deregisterByNote(vault, noteId);
+    this.seenDefs.get(vault)?.delete(noteId);
+    if (name) await this.reconcileForRemovedAgent(name);
   }
 
   /**
@@ -706,14 +824,59 @@ export class AgentDefRegistry {
     // setup above — an unapproved connection is absent at spawn, never a failure here.
     const { status, pending } = await this.resolveStatusWithGrants(def);
     this.live.set(this.keyOf(vault, note.id), { vault, noteId: note.id, name: def.name, status });
+    // Track this note in the per-vault seen set (a confident, freshly-parsed read) so the
+    // removed-def diff (loadAll) and the reload-delete path both address it by name. This
+    // covers the reload single-note path where loadAll's rebuild didn't run.
+    this.recordSeen(vault, note.id, def.name);
     // Stamp status — best-effort: a failed stamp doesn't unmake the running agent.
     try {
       await client.patchStatus(note.id, status, pending);
     } catch (err) {
       console.warn(`agent-defs: status stamp for "${def.name}" failed (continuing): ${(err as Error).message}`);
     }
+    // Grant-GC (#96): a CLEAN successful load is a confident live set, so prune any grant
+    // the agent no longer declares — e.g. a `wants:` entry removed from the def. liveKeys
+    // = the connectionKey() of each CURRENTLY-declared connection (matching exactly how
+    // the hub keyed them at register). SAFETY: only reached AFTER a successful parse +
+    // instantiate; a parse/instantiate failure returns above WITHOUT reconciling, so a
+    // transient error never presents a stale/empty liveKeys that nukes approved grants.
+    await this.reconcileLiveKeys(def);
     console.log(`agent-defs: instantiated "${def.name}" from ${note.id} in "${vault}" (status=${status}).`);
     return true;
+  }
+
+  /** Record a note in the per-vault seen set (noteId → agent name) — a confident read. */
+  private recordSeen(vault: string, noteId: string, name: string): void {
+    let m = this.seenDefs.get(vault);
+    if (!m) {
+      m = new Map<string, string>();
+      this.seenDefs.set(vault, m);
+    }
+    m.set(noteId, name);
+  }
+
+  /**
+   * Prune the agent's grants down to its CURRENTLY-declared connections (#96 grant-GC,
+   * the clean-load case). Computes `liveKeys` = {@link connectionKey} of each `wants:`
+   * connection (the SAME derivation the hub keyed grants on) and POSTs reconcile — the
+   * hub tears down + removes every grant NOT in that set (e.g. a removed want). A def
+   * with no `wants:` sends an empty liveKeys, which prunes any leftover grant from a
+   * prior `wants:` it no longer declares. Best-effort: no grants client → no-op; a
+   * reconcile failure logs a warning and never throws out of the load path.
+   */
+  private async reconcileLiveKeys(def: ParsedAgentDef): Promise<void> {
+    if (!this.grants) return;
+    const liveKeys = def.wants.map((c) => connectionKey(c));
+    try {
+      const { pruned } = await this.grants.reconcileGrants(def.name, liveKeys);
+      if (pruned > 0) {
+        console.log(`agent-defs: pruned ${pruned} stale grant(s) for "${def.name}".`);
+      }
+    } catch (err) {
+      console.warn(
+        `agent-defs: reconciling grants for "${def.name}" failed (continuing): ${(err as Error).message}`,
+      );
+    }
   }
 
   /**
@@ -782,6 +945,11 @@ export class AgentDefRegistry {
 
   /** Tear down every agent from a def-vault (e.g. the vault binding is removed). */
   async deregisterAllForVault(vault: string): Promise<void> {
+    // Drop the seen-defs entry for this vault FIRST (reviewer nit): otherwise the
+    // next confident loadAll would diff the now-unbound vault's stale entries as
+    // "removed" and issue spurious reconcile(agent, []) prunes — but the binding
+    // was dropped, the defs weren't deleted, so their grants must NOT be GC'd.
+    this.seenDefs.delete(vault);
     for (const rec of [...this.live.values()]) {
       if (rec.vault === vault) await this.deregisterByNote(vault, rec.noteId);
     }
