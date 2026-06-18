@@ -344,6 +344,11 @@ export class ProgrammaticBackend implements AgentBackend {
     let grantMcpEntries: { name: string; url: string; token: string }[] = [];
     let grantEnv: Record<string, string> = {};
     if (this.deps.grants) {
+      // The grants are keyed on the hub by the AGENT name, which for vault-native defs
+      // is `spec.name`. `grantsAgentName` is an explicit override reserved for a future
+      // channel-name≠agent-name split; today no caller sets it, so it falls through to
+      // `spec.name` — do NOT set it unless that split lands (else you'd fetch the wrong
+      // agent's grants).
       const agentName = this.deps.grantsAgentName ?? spec.name;
       try {
         const injected = await resolveInjectedGrants(this.deps.grants, agentName);

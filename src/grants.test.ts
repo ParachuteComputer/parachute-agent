@@ -138,6 +138,10 @@ describe("parseWants — malformed → WantsParseError", () => {
     // "ftp://x" doesn't match http(s) → treated as a service name → not a slug.
     expect(() => parseWants("mcp:ftp://x")).toThrow(/slug/);
   });
+  test("a service whose env-var collides with the Claude-auth denylist is rejected at parse", () => {
+    // `claude-code-oauth` → CLAUDE_CODE_OAUTH_TOKEN (denylisted). Caught at define-time.
+    expect(() => parseWants("env:claude-code-oauth")).toThrow(/protected env var/);
+  });
   test("one malformed entry in a list throws (no half-parse)", () => {
     expect(() => parseWants("vault:a:read, garbage")).toThrow(WantsParseError);
   });

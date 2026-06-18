@@ -35,6 +35,8 @@
  * deliberately do NOT cache it.
  */
 
+import { DENYLISTED_ENV } from "./credentials.ts";
+
 // ---------------------------------------------------------------------------
 // Connection spec — the structured form of one `wants:` entry
 // ---------------------------------------------------------------------------
@@ -248,6 +250,16 @@ function parseServiceWant(entry: string, service: string, mode: "env" | "mcp"): 
   if (!SERVICE_NAME_SLUG.test(target)) {
     throw new WantsParseError(
       `wants: "${entry}" — service name "${target}" must be a slug (alphanumeric, dash, underscore).`,
+    );
+  }
+  // Reject a service whose env-var would collide with the Claude-auth denylist
+  // (e.g. a service named `claude-code-oauth` → CLAUDE_CODE_OAUTH_TOKEN). The
+  // spawn-time denylist already drops it (security intact), but surface it HERE at
+  // define-time so the operator sees the problem rather than a silent spawn-warn.
+  if (DENYLISTED_ENV.has(serviceEnvVar(target))) {
+    throw new WantsParseError(
+      `wants: "${entry}" — service "${target}" maps to the protected env var ${serviceEnvVar(target)}, ` +
+        `which a grant can never set (it's the session's managed Claude auth).`,
     );
   }
   return { kind: "service", target, inject: [mode] };
