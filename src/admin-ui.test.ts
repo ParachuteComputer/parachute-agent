@@ -508,6 +508,64 @@ describe("module.json — modular-UI (P4) declaration", () => {
     expect(channelParam?.target).toBe("sink.params.channel");
   });
 
+  test("declares the definition.reload action with a vault-trigger provision (Connector 1)", async () => {
+    // Make a vault #agent/definition change flow LIVE into the registry: the
+    // hub provisions a vault trigger that webhooks /api/vault/agent-def with an
+    // agent:send bearer, and the daemon re-reads + re-instantiates that one def.
+    const m = JSON.parse(await Bun.file(manifestPath).text()) as {
+      actions?: Array<{ key: string; provision?: { type?: string }; endpoint?: string; scope?: string }>;
+    };
+    const reload = (m.actions ?? []).find((a) => a.key === "definition.reload");
+    expect(reload).toBeDefined();
+    expect(reload?.provision?.type).toBe("vault-trigger");
+    // Wiring mirrors message.deliver: the webhook endpoint the daemon already
+    // serves, and the agent:send scope that endpoint gates on (daemon.ts).
+    expect(reload?.endpoint).toBe("/api/vault/agent-def");
+    expect(reload?.scope).toBe("agent:send");
+  });
+
+  test("declares TWO def-reload templates (created + updated) — the hub binds one event per connection", async () => {
+    // A connection carries a single `source.event` (admin-connections.ts:
+    // eventsForSourceEvent maps one note.<verb> → one trigger verb), so create
+    // and edit reactivity are two connections / two templates. note.deleted is
+    // deliberately ABSENT — the hub rejects it (Connector 2, platform-blocked).
+    const m = JSON.parse(await Bun.file(manifestPath).text()) as {
+      connectionTemplates?: Array<{
+        key: string;
+        requestedBy?: string;
+        source?: { module?: string; event?: string; filter?: { tags?: string[] } };
+        sink?: { module?: string; action?: string };
+        parameters?: Array<{ key: string; target: string }>;
+      }>;
+    };
+    const templates = m.connectionTemplates ?? [];
+    const onCreate = templates.find((t) => t.key === "reload-defs-on-create");
+    const onEdit = templates.find((t) => t.key === "reload-defs-on-edit");
+    expect(onCreate).toBeDefined();
+    expect(onEdit).toBeDefined();
+
+    for (const tmpl of [onCreate, onEdit]) {
+      expect(tmpl?.requestedBy).toBe("agent");
+      expect(tmpl?.source?.module).toBe("vault");
+      // Filters on the def tag — and ONLY that tag (no inbound-message keys).
+      expect(tmpl?.source?.filter?.tags).toEqual(["#agent/definition"]);
+      expect(tmpl?.sink?.module).toBe("agent");
+      expect(tmpl?.sink?.action).toBe("definition.reload");
+      // Parameterized: the operator picks which def-vault. No channel param
+      // (a def-vault connection has no reply path — it's read-driven reload).
+      const paramKeys = (tmpl?.parameters ?? []).map((p) => p.key);
+      expect(paramKeys).toEqual(["vault"]);
+      const vaultParam = (tmpl?.parameters ?? []).find((p) => p.key === "vault");
+      expect(vaultParam?.target).toBe("source.vault");
+    }
+
+    // The two halves differ ONLY in the source event.
+    expect(onCreate?.source?.event).toBe("note.created");
+    expect(onEdit?.source?.event).toBe("note.updated");
+    // No template subscribes deleted (would 400 at the hub).
+    expect(templates.some((t) => t.source?.event === "note.deleted")).toBe(false);
+  });
+
   test("preserves the existing manifest contract (name, port, scopes)", async () => {
     const m = JSON.parse(await Bun.file(manifestPath).text()) as Record<string, unknown>;
     expect(m.name).toBe("agent");

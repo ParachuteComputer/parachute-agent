@@ -30,6 +30,16 @@
         "type": "vault-trigger",
         "note": "hub registers a vault runtime trigger that webhooks the agent inbound endpoint with an agent:send bearer"
       }
+    },
+    {
+      "key": "definition.reload",
+      "title": "Reload a changed agent definition (re-instantiate the agent)",
+      "endpoint": "/api/vault/agent-def",
+      "scope": "agent:send",
+      "provision": {
+        "type": "vault-trigger",
+        "note": "hub registers a vault runtime trigger that webhooks the agent-def reload endpoint with an agent:send bearer; the daemon re-reads the one changed #agent/definition note and (re)instantiates that agent"
+      }
     }
   ],
   "connectionTemplates": [
@@ -63,6 +73,56 @@
           "target": "sink.params.channel",
           "title": "Channel name",
           "description": "A unique slug naming the channel the session connects to."
+        }
+      ]
+    },
+    {
+      "key": "reload-defs-on-create",
+      "title": "Reload agent definitions on create",
+      "description": "Make a new #agent/definition note instantiate its agent live, instead of converging only via the 60s loadAll poll. The operator picks WHICH def-vault (the parameter); the connection's creation in the hub Connections view is the operator's approval. Pair with reload-defs-on-edit to cover edits too — the hub binds one event per connection, so create and edit are two connections.",
+      "requestedBy": "agent",
+      "source": {
+        "module": "vault",
+        "event": "note.created",
+        "filter": {
+          "tags": ["#agent/definition"]
+        }
+      },
+      "sink": {
+        "module": "agent",
+        "action": "definition.reload"
+      },
+      "parameters": [
+        {
+          "key": "vault",
+          "target": "source.vault",
+          "title": "Def-vault",
+          "description": "Which vault holds the #agent/definition notes — the operator chooses from the hub's installed vaults."
+        }
+      ]
+    },
+    {
+      "key": "reload-defs-on-edit",
+      "title": "Reload agent definitions on edit",
+      "description": "Make an edited #agent/definition note re-instantiate its agent live, instead of converging only via the 60s loadAll poll. The operator picks WHICH def-vault (the parameter); the connection's creation in the hub Connections view is the operator's approval. Pair with reload-defs-on-create to cover creates too — the hub binds one event per connection, so create and edit are two connections.",
+      "requestedBy": "agent",
+      "source": {
+        "module": "vault",
+        "event": "note.updated",
+        "filter": {
+          "tags": ["#agent/definition"]
+        }
+      },
+      "sink": {
+        "module": "agent",
+        "action": "definition.reload"
+      },
+      "parameters": [
+        {
+          "key": "vault",
+          "target": "source.vault",
+          "title": "Def-vault",
+          "description": "Which vault holds the #agent/definition notes — the operator chooses from the hub's installed vaults."
         }
       ]
     }
