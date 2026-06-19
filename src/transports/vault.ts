@@ -827,16 +827,31 @@ export class VaultTransport implements Transport {
       output: thread.output,
     });
 
-    // Upsert by path (the vault upserts on POST-by-path) — mirrors `upsertJobNote`. The
-    // deterministic single-threaded path overwrites in place; the multi-threaded uuid path
-    // is fresh per fire.
-    const res = await fetch(`${this.vaultUrl}/vault/${this.vault}/api/notes`, {
-      method: "POST",
+    // Upsert by path via PATCH + `if_missing: "create"` (vault#309) — NOT POST. POST
+    // /api/notes 409s `path_conflict` on an existing path (it does not upsert), so a
+    // single-threaded thread note would create on turn 1 and 409 on every turn after.
+    // PATCH-by-path is the real upsert: the vault resolves the (decoded) path, UPDATES it
+    // when present (single-threaded turn 2+: content replaced, metadata merged) or CREATES
+    // it when missing (turn 1, and every multi-threaded fresh-uuid fire). `force: true`
+    // satisfies the vault's 428 mutation precondition (mirrors `setInboundStatus`). The
+    // path is one URL segment (percent-encoded `/`); the route `decodeURIComponent`s it.
+    // The `tags` array is consumed by the create branch and is a no-op on update (the
+    // update branch reads `tags.add`/`tags.remove`), so the tag is set once and preserved.
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(path)}`;
+    const res = await fetch(url, {
+      method: "PATCH",
       headers: {
         "content-type": "application/json",
         authorization: `Bearer ${this.token}`,
       },
-      body: JSON.stringify({ content: body, path, tags: [AGENT_THREAD_TAG], metadata }),
+      body: JSON.stringify({
+        content: body,
+        path,
+        tags: [AGENT_THREAD_TAG],
+        metadata,
+        if_missing: "create",
+        force: true,
+      }),
     });
 
     if (!res.ok) {

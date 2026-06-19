@@ -151,7 +151,7 @@ describe("VaultTransport — reply (outbound note write)", () => {
 });
 
 describe("VaultTransport — writeThread (#agent/thread note, the unified model)", () => {
-  test("MULTI-THREADED: writeThread() POSTs a fresh-per-fire #agent/thread note with indexed status/definition/mode + timing + Bearer (NO read-back)", async () => {
+  test("MULTI-THREADED: writeThread() PATCH-upserts (if_missing:create) a fresh-per-fire #agent/thread note with indexed status/definition/mode + timing + Bearer (NO read-back)", async () => {
     const calls: { url: string; init: RequestInit }[] = [];
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       calls.push({ url: String(url), init: init ?? {} });
@@ -177,15 +177,17 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     });
 
     expect(result.sent).toEqual(["thread-note-1"]);
-    // start() also fires ensureSchema() (PUT .../api/tags/*); isolate the thread-note POST.
-    const noteCalls = calls.filter((c) => c.url.endsWith("/api/notes") && c.init.method === "POST");
+    // start() also fires ensureSchema() (PUT .../api/tags/*); isolate the thread-note
+    // write. The write is a PATCH-by-path upsert (NOT POST — POST 409s on an existing
+    // path), so it targets /api/notes/<encoded-path>, discriminated by method.
+    const noteCalls = calls.filter((c) => c.url.includes("/api/notes/") && c.init.method === "PATCH");
     expect(noteCalls).toHaveLength(1);
     // Multi-threaded does NO read-back (no GET to /api/notes/<path>) — fresh per fire.
     const getCalls = calls.filter((c) => c.url.includes("/api/notes/") && (c.init.method ?? "GET") === "GET");
     expect(getCalls).toHaveLength(0);
     const call = noteCalls[0]!;
-    expect(call.url).toBe("http://127.0.0.1:1940/vault/default/api/notes");
-    expect(call.init.method).toBe("POST");
+    expect(decodeURIComponent(call.url)).toContain("/vault/default/api/notes/Threads/eng/");
+    expect(call.init.method).toBe("PATCH");
     expect((call.init.headers as Record<string, string>).authorization).toBe("Bearer write-token-xyz");
 
     const sent = JSON.parse(String(call.init.body)) as {
@@ -193,7 +195,13 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
       path: string;
       tags: string[];
       metadata: Record<string, string>;
+      if_missing: string;
+      force: boolean;
     };
+    // The upsert verb: PATCH + `if_missing: "create"` (creates when missing — every
+    // multi-threaded fire — updates when present) + `force: true` (the 428 precondition).
+    expect(sent.if_missing).toBe("create");
+    expect(sent.force).toBe(true);
     // LOOP SAFETY (HARD CONSTRAINT 4): the thread note carries the thread tag EXACTLY —
     // NOT a message tag + NOT the inbound child — so it can never wake a session.
     expect(sent.tags).toEqual([AGENT_THREAD_TAG]);
@@ -231,9 +239,10 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
         // First turn: the note doesn't exist yet (404 → turn_count starts at 0).
         return new Response("not found", { status: 404 });
       }
-      if (u.endsWith("/api/notes") && method === "POST") {
+      // The write is a PATCH-by-path upsert (if_missing:create), NOT POST.
+      if (u.includes("/api/notes/") && method === "PATCH") {
         posts.push({ url: u, init: init ?? {} });
-        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 201 });
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
       }
       return new Response("{}", { status: 200 }); // ensureSchema PUTs
     }) as typeof fetch;
@@ -255,14 +264,20 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     // It READ the existing note first (the upsert read-back), by the DETERMINISTIC path.
     expect(gets).toHaveLength(1);
     expect(decodeURIComponent(gets[0]!)).toContain("/api/notes/Threads/eng/eng");
-    // Then UPSERTED by POSTing to the same deterministic path (named after the def).
+    // Then UPSERTED via PATCH (if_missing:create) to the same deterministic path.
     expect(posts).toHaveLength(1);
+    expect(posts[0]!.init.method).toBe("PATCH");
+    expect(decodeURIComponent(posts[0]!.url)).toContain("/api/notes/Threads/eng/eng");
     const sent = JSON.parse(String(posts[0]!.init.body)) as {
       path: string;
       tags: string[];
       metadata: Record<string, string>;
       content: string;
+      if_missing: string;
+      force: boolean;
     };
+    expect(sent.if_missing).toBe("create"); // upsert verb (not POST — POST 409s).
+    expect(sent.force).toBe(true);
     expect(sent.tags).toEqual([AGENT_THREAD_TAG]); // loop safety.
     expect(sent.path).toBe("Threads/eng/eng"); // deterministic, named after the def.
     expect(sent.metadata.mode).toBe("single-threaded");
@@ -283,10 +298,11 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
         if (!stored) return new Response("not found", { status: 404 });
         return new Response(JSON.stringify(stored), { status: 200 });
       }
-      if (u.endsWith("/api/notes") && method === "POST") {
+      // PATCH-by-path with if_missing:create is the upsert (turn 1 creates, turn 2 updates).
+      if (u.includes("/api/notes/") && method === "PATCH") {
         const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
         stored = { metadata: body.metadata, content: body.content }; // the vault upserts it.
-        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 201 });
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
       }
       return new Response("{}", { status: 200 });
     }) as typeof fetch;
@@ -336,10 +352,10 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
   test("writeThread() on an error turn records status:error + the failure reason in the body", async () => {
     let captured: { tags: string[]; metadata: Record<string, string>; content: string } | undefined;
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      if (String(url).endsWith("/api/notes") && (init?.method ?? "GET") === "POST") {
+      if (String(url).includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
         captured = JSON.parse(String(init?.body));
       }
-      return new Response(JSON.stringify({ id: "thread-err-1" }), { status: 201 });
+      return new Response(JSON.stringify({ id: "thread-err-1" }), { status: 200 });
     }) as typeof fetch;
 
     const t = new VaultTransport(baseConfig());
@@ -362,10 +378,10 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(captured!.content).toContain("claude -p exited 1: boom");
   });
 
-  test("writeThread() throws on a non-ok vault response (POST)", async () => {
+  test("writeThread() throws on a non-ok vault response (PATCH)", async () => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
-      // multi-threaded → no GET; the POST fails.
-      if (String(url).endsWith("/api/notes") && (init?.method ?? "GET") === "POST") {
+      // multi-threaded → no GET; the PATCH upsert fails.
+      if (String(url).includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
         return new Response("boom", { status: 500 });
       }
       return new Response("{}", { status: 200 });
