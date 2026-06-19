@@ -20,13 +20,16 @@ import {
   getAgentDef,
   HttpError,
   listAgentDefs,
+  listAgentSecrets,
   listAgentVaults,
   listAgents,
   listChannels,
   listMessages,
   messageStreamUrl,
+  removeAgentSecret,
   removeAgentVault,
   sendMessage,
+  setAgentSecret,
   turnEventsUrl,
 } from "./api.ts";
 
@@ -418,5 +421,54 @@ describe("chat SSE URL builders (Phase 4d)", () => {
 
   it("turnEventsUrl omits the token when null", () => {
     expect(turnEventsUrl("eng", null)).toBe("/agent/api/channels/eng/turn-events");
+  });
+});
+
+describe("agent secrets / env (#36)", () => {
+  it("listAgentSecrets GETs /agent/api/credentials/env (names only)", async () => {
+    const fetchMock = fetchFn(async () =>
+      jsonResponse(200, { default: [], channels: { eng: ["GH_TOKEN"] } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await listAgentSecrets();
+    expect(res.channels.eng).toEqual(["GH_TOKEN"]);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/credentials/env");
+    expect(init?.method ?? "GET").toBe("GET");
+  });
+
+  it("setAgentSecret POSTs { channel, name, value } with the Bearer", async () => {
+    const fetchMock = fetchFn(async () => jsonResponse(200, { ok: true, scope: "channel", channel: "eng", name: "GH_TOKEN" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setAgentSecret({ channel: "eng", name: "GH_TOKEN", value: "ghp_x" });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/credentials/env");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ channel: "eng", name: "GH_TOKEN", value: "ghp_x" });
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer jwt-tok");
+  });
+
+  it("removeAgentSecret DELETEs WITH a JSON body { channel, name }", async () => {
+    const fetchMock = fetchFn(async () => jsonResponse(200, { ok: true, scope: "channel", channel: "eng", name: "GH_TOKEN", removed: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await removeAgentSecret({ channel: "eng", name: "GH_TOKEN" });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/credentials/env");
+    expect(init?.method).toBe("DELETE");
+    expect(init?.body).toBeTruthy(); // DELETE carries a body (not all clients support this)
+    expect(JSON.parse(String(init?.body))).toEqual({ channel: "eng", name: "GH_TOKEN" });
+  });
+
+  it("setAgentSecret surfaces a 400 (denylisted name) as an HttpError", async () => {
+    vi.stubGlobal(
+      "fetch",
+      fetchFn(async () => jsonResponse(400, { error: "ANTHROPIC_API_KEY is reserved" })),
+    );
+    await expect(setAgentSecret({ channel: "eng", name: "ANTHROPIC_API_KEY", value: "x" })).rejects.toMatchObject({
+      status: 400,
+    });
   });
 });

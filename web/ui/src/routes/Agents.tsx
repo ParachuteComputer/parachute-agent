@@ -47,6 +47,12 @@ import {
   listJobs,
   removeAgentVault,
   runJob,
+  type AgentSecretsResponse,
+  DENYLISTED_ENV_NAMES,
+  ENV_NAME_RE,
+  listAgentSecrets,
+  setAgentSecret,
+  removeAgentSecret,
 } from "../lib/api.ts";
 import {
   type ConnectionRow,
@@ -410,6 +416,12 @@ export function AgentDetail({
           the inject path only exists for a vault transport. Interactive /
           channel-less agents can't be scheduled, so the section is absent. */}
       {agent.channel ? <SchedulesSection channel={agent.channel} /> : null}
+
+      {/* Secrets / env vars — local 0600 env injected into this agent's sandboxed
+          (programmatic) turns. Scoped to the agent's channel. NEVER in the vault. */}
+      {agent.channel ? (
+        <SecretsSection channel={agent.channel} backend={agent.backend} />
+      ) : null}
 
       {/* Edit / delete — only for a vault-native def (a note we can mutate). */}
       {noteId ? (
@@ -1122,6 +1134,249 @@ function RadioRow(props: {
         <span className="radio-help">{props.help}</span>
       </span>
     </label>
+  );
+}
+
+/**
+ * The per-agent Secrets / env-vars section (#36). A thin UI over the daemon's
+ * `/api/credentials/env` endpoints: list (names only — values are NEVER returned),
+ * set, and remove an env var scoped to THIS agent's channel. The vars are stored
+ * locally (`~/.parachute/agent/credentials.json`, 0600) and injected into the
+ * agent's sandboxed `claude -p` turns — so e.g. a `GH_TOKEN` lets the agent's
+ * `git`/`gh` push & pull. They are NEVER written to a vault note. The Claude-auth
+ * trio is denylisted (the daemon 400s it; we guard client-side too). Only the
+ * PROGRAMMATIC backend consumes these (a channel-backend agent runs in the
+ * operator's own session, with the operator's own env) — surfaced with a note.
+ */
+export function SecretsSection({
+  channel,
+  backend,
+}: {
+  channel: string;
+  /** The agent's backend — only `"channel"` is special-cased (a note); kept as a
+   *  plain string so this section is decoupled from the merged-agent type. */
+  backend: string;
+}) {
+  type LoadState =
+    | { kind: "loading" }
+    | { kind: "error"; message: string }
+    | { kind: "ok"; names: string[] };
+  const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const [addOpen, setAddOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [value, setValue] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setState({ kind: "loading" });
+    try {
+      const res: AgentSecretsResponse = await listAgentSecrets();
+      // Only THIS agent's channel-scoped vars (the default layer is operator-wide,
+      // managed elsewhere — this section is per-agent).
+      setState({ kind: "ok", names: (res.channels[channel] ?? []).slice().sort() });
+    } catch (err) {
+      setState({ kind: "error", message: errMessage(err) });
+    }
+  }, [channel]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // Client-side guard mirroring the daemon (a friendlier pre-submit error than a 400).
+  const trimmedName = name.trim();
+  const nameDenylisted = DENYLISTED_ENV_NAMES.has(trimmedName.toUpperCase());
+  const nameShapeOk = trimmedName.length === 0 || ENV_NAME_RE.test(trimmedName);
+  const canSave =
+    trimmedName.length > 0 && nameShapeOk && !nameDenylisted && value.length > 0 && !saving;
+
+  async function onAdd(e: React.FormEvent) {
+    e.preventDefault();
+    if (!canSave) return;
+    setSaving(true);
+    setAddError(null);
+    try {
+      await setAgentSecret({ channel, name: trimmedName, value });
+      setName("");
+      setValue("");
+      setAddOpen(false);
+      await load();
+    } catch (err) {
+      setAddError(errMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function onRemove(varName: string) {
+    setRemoving(varName);
+    setRowError(null);
+    try {
+      await removeAgentSecret({ channel, name: varName });
+      setConfirmRemove(null);
+      await load();
+    } catch (err) {
+      setRowError(errMessage(err));
+    } finally {
+      setRemoving(null);
+    }
+  }
+
+  return (
+    <section className="detail-section" aria-label="Secrets" data-testid="secrets-section">
+      <div className="section-head">
+        <h3>Secrets (env vars)</h3>
+        <button
+          type="button"
+          className="secondary"
+          data-testid="add-secret-toggle"
+          onClick={() => {
+            setAddOpen((o) => !o);
+            setAddError(null);
+          }}
+        >
+          {addOpen ? "Cancel" : "Add secret"}
+        </button>
+      </div>
+      <p className="muted">
+        Local env vars (e.g. <code>GH_TOKEN</code>) injected into this agent's sandboxed turns —
+        stored 0600 on this machine, <strong>never in the vault</strong>. Values are write-only:
+        they're never shown again.
+        {backend === "channel" ? (
+          <>
+            {" "}
+            This agent uses the <strong>channel</strong> backend, so it runs in your own Claude
+            Code session with your own environment — these vars apply only to programmatic turns.
+          </>
+        ) : null}
+      </p>
+
+      {addOpen ? (
+        <form className="inline-form" onSubmit={onAdd} aria-label="Add secret" data-testid="add-secret-form">
+          {addError ? (
+            <div className="error-banner" role="alert" data-testid="add-secret-error">
+              {addError}
+            </div>
+          ) : null}
+          <div className="field">
+            <label htmlFor="secret-name">Name</label>
+            <input
+              id="secret-name"
+              type="text"
+              value={name}
+              placeholder="GH_TOKEN"
+              autoComplete="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              onChange={(e) => setName(e.target.value)}
+            />
+            {trimmedName.length > 0 && !nameShapeOk ? (
+              <p className="field-error" data-testid="secret-name-invalid">
+                A valid env var name — letters, numbers, underscore; not starting with a digit.
+              </p>
+            ) : null}
+            {nameDenylisted ? (
+              <p className="field-error" data-testid="secret-name-denylisted">
+                Reserved — {trimmedName.toUpperCase()} would hijack the agent's managed billing/auth.
+              </p>
+            ) : null}
+          </div>
+          <div className="field">
+            <label htmlFor="secret-value">Value</label>
+            <input
+              id="secret-value"
+              type="password"
+              value={value}
+              placeholder="ghp_…"
+              autoComplete="off"
+              spellCheck={false}
+              onChange={(e) => setValue(e.target.value)}
+            />
+            <p className="field-hint">Stored encrypted-at-rest-adjacent (0600). Write-only — never re-displayed.</p>
+          </div>
+          <div className="form-actions">
+            <button type="submit" disabled={!canSave}>
+              {saving ? "Saving…" : "Save secret"}
+            </button>
+          </div>
+        </form>
+      ) : null}
+
+      {rowError ? (
+        <div className="error-banner" role="alert" data-testid="secret-row-error">
+          {rowError}
+        </div>
+      ) : null}
+
+      {state.kind === "loading" ? <div className="loading">Loading secrets…</div> : null}
+      {state.kind === "error" ? (
+        <div className="error-banner" role="alert" data-testid="secrets-load-error">
+          {state.message}{" "}
+          <button type="button" className="secondary" onClick={() => void load()}>
+            Retry
+          </button>
+        </div>
+      ) : null}
+      {state.kind === "ok" ? (
+        state.names.length === 0 ? (
+          <div className="empty" data-testid="secrets-empty">
+            No secrets set for this agent.
+          </div>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Value</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.names.map((n) => (
+                <tr key={n} data-testid={`secret-${n}`}>
+                  <td className="cell-name">{n}</td>
+                  <td className="cell-dim">••••••••</td>
+                  <td>
+                    {confirmRemove === n ? (
+                      <span className="confirm-inline">
+                        <button
+                          type="button"
+                          className="button-danger"
+                          data-testid={`secret-remove-confirm-${n}`}
+                          disabled={removing === n}
+                          onClick={() => void onRemove(n)}
+                        >
+                          {removing === n ? "Removing…" : "Confirm remove"}
+                        </button>
+                        <button type="button" className="cancel-link" onClick={() => setConfirmRemove(null)}>
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="button-danger"
+                        data-testid={`secret-remove-${n}`}
+                        onClick={() => {
+                          setRowError(null);
+                          setConfirmRemove(n);
+                        }}
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )
+      ) : null}
+    </section>
   );
 }
 

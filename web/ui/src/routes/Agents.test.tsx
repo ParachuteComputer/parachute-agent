@@ -25,6 +25,9 @@ vi.mock("../lib/api.ts", async (orig) => {
     createJob: vi.fn(),
     runJob: vi.fn(),
     deleteJob: vi.fn(),
+    listAgentSecrets: vi.fn(),
+    setAgentSecret: vi.fn(),
+    removeAgentSecret: vi.fn(),
   };
 });
 
@@ -40,6 +43,9 @@ const listJobs = vi.mocked(api.listJobs);
 const createJob = vi.mocked(api.createJob);
 const runJob = vi.mocked(api.runJob);
 const deleteJob = vi.mocked(api.deleteJob);
+const listAgentSecrets = vi.mocked(api.listAgentSecrets);
+const setAgentSecret = vi.mocked(api.setAgentSecret);
+const removeAgentSecret = vi.mocked(api.removeAgentSecret);
 
 function agentRow(over: Partial<api.AgentRow> = {}): api.AgentRow {
   return {
@@ -102,6 +108,7 @@ beforeEach(() => {
   listAgentDefs.mockResolvedValue({ defs: [] });
   listAgentVaults.mockResolvedValue({ vaults: [] });
   listJobs.mockResolvedValue({ jobs: [] });
+  listAgentSecrets.mockResolvedValue({ default: [], channels: {} });
 });
 
 afterEach(() => {
@@ -490,5 +497,74 @@ describe("Schedules — per-agent jobs in the detail panel (Phase 4b)", () => {
     expect(deleteJob).not.toHaveBeenCalled();
     fireEvent.click(await screen.findByTestId("schedule-delete-confirm-mine"));
     await waitFor(() => expect(deleteJob).toHaveBeenCalledWith("mine"));
+  });
+});
+
+describe("Agents — per-agent secrets (#36)", () => {
+  function openAgentWithChannel() {
+    listAgents.mockResolvedValue({
+      agents: [agentRow({ name: "alpha", backend: "programmatic", channel: "alpha", vault: "default" })],
+    });
+    listAgentDefs.mockResolvedValue({ defs: [defRow({ name: "alpha", channel: "alpha" })] });
+  }
+
+  it("lists this agent's env-var names (channel-scoped, values masked)", async () => {
+    openAgentWithChannel();
+    listAgentSecrets.mockResolvedValue({ default: ["OPERATOR_WIDE"], channels: { alpha: ["GH_TOKEN"] } });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    // The agent's channel-scoped var shows; the operator-default var does NOT.
+    expect(await screen.findByTestId("secret-GH_TOKEN")).toBeInTheDocument();
+    expect(screen.queryByTestId("secret-OPERATOR_WIDE")).not.toBeInTheDocument();
+    // No raw value rendered.
+    expect(screen.queryByText("ghp_")).not.toBeInTheDocument();
+  });
+
+  it("adds a secret scoped to the agent's channel", async () => {
+    openAgentWithChannel();
+    setAgentSecret.mockResolvedValue({ ok: true, scope: "channel", channel: "alpha", name: "GH_TOKEN" });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    fireEvent.click(await screen.findByTestId("add-secret-toggle"));
+    const form = await screen.findByTestId("add-secret-form");
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "GH_TOKEN" } });
+    fireEvent.change(within(form).getByLabelText("Value"), { target: { value: "ghp_secret" } });
+    fireEvent.click(within(form).getByRole("button", { name: /save secret/i }));
+
+    await waitFor(() =>
+      expect(setAgentSecret).toHaveBeenCalledWith({ channel: "alpha", name: "GH_TOKEN", value: "ghp_secret" }),
+    );
+  });
+
+  it("blocks a denylisted name client-side (no API call)", async () => {
+    openAgentWithChannel();
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    fireEvent.click(await screen.findByTestId("add-secret-toggle"));
+    const form = await screen.findByTestId("add-secret-form");
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "ANTHROPIC_API_KEY" } });
+    fireEvent.change(within(form).getByLabelText("Value"), { target: { value: "x" } });
+
+    expect(await screen.findByTestId("secret-name-denylisted")).toBeInTheDocument();
+    expect(within(form).getByRole("button", { name: /save secret/i })).toBeDisabled();
+    expect(setAgentSecret).not.toHaveBeenCalled();
+  });
+
+  it("removes a secret after a confirm", async () => {
+    openAgentWithChannel();
+    listAgentSecrets.mockResolvedValue({ default: [], channels: { alpha: ["GH_TOKEN"] } });
+    removeAgentSecret.mockResolvedValue({ ok: true, scope: "channel", channel: "alpha", name: "GH_TOKEN", removed: true });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    fireEvent.click(await screen.findByTestId("secret-remove-GH_TOKEN"));
+    expect(removeAgentSecret).not.toHaveBeenCalled(); // confirm gate
+    fireEvent.click(await screen.findByTestId("secret-remove-confirm-GH_TOKEN"));
+    await waitFor(() =>
+      expect(removeAgentSecret).toHaveBeenCalledWith({ channel: "alpha", name: "GH_TOKEN" }),
+    );
   });
 });

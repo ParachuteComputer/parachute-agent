@@ -122,8 +122,12 @@ async function deleteJson<T>(suffix: string): Promise<T> {
   return (await res.json()) as T;
 }
 
-/** Shared body-bearing-method helper (POST/PATCH) — Bearer + 401 retry + HttpError. */
-async function bodyJson<T>(method: "POST" | "PATCH", suffix: string, body: unknown): Promise<T> {
+/** Shared body-bearing-method helper (POST/PATCH/DELETE) — Bearer + 401 retry + HttpError. */
+async function bodyJson<T>(
+  method: "POST" | "PATCH" | "DELETE",
+  suffix: string,
+  body: unknown,
+): Promise<T> {
   const res = await authedFetch(`${apiBase()}${suffix}`, {
     method,
     headers: { "content-type": "application/json" },
@@ -133,6 +137,11 @@ async function bodyJson<T>(method: "POST" | "PATCH", suffix: string, body: unkno
     throw new HttpError(res.status, (await errorDetail(res)) || `${suffix} failed: ${res.status}`);
   }
   return (await res.json()) as T;
+}
+
+/** DELETE with a JSON body (the env-credential remove endpoint takes `{ channel?, name }`). */
+function deleteJsonWithBody<T>(suffix: string, body: unknown): Promise<T> {
+  return bodyJson<T>("DELETE", suffix, body);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +411,62 @@ export function addAgentVault(body: AddAgentVaultBody): Promise<AddAgentVaultRes
  */
 export function removeAgentVault(name: string): Promise<RemoveAgentVaultResponse> {
   return deleteJson<RemoveAgentVaultResponse>(`/agent-vaults/${encodeURIComponent(name)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent secrets / env vars (#36). Thin client over the daemon's
+// `/api/credentials/env` endpoints (all `agent:admin`). A secret is a local,
+// 0600 env var (e.g. `GH_TOKEN`) injected into the agent's sandboxed `claude -p`
+// turns — NEVER written to a vault note, NEVER returned by value (the GET shape
+// is names-only). Scoped per channel (the agent's channel) or the operator
+// default. The Claude-auth trio is denylisted (the daemon rejects it with 400);
+// we mirror that client-side for a friendly pre-submit guard.
+// ---------------------------------------------------------------------------
+
+/** Env-var names the daemon refuses (they'd hijack the managed subscription billing). */
+export const DENYLISTED_ENV_NAMES: ReadonlySet<string> = new Set([
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_API_KEY",
+  "CLAUDE_CODE_OAUTH_TOKEN",
+]);
+
+/** A settable env-var name shape (mirrors the daemon's `ENV_NAME_RE`). */
+export const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * `GET /api/credentials/env` — env var NAMES only (never values), split into the
+ * operator-level `default` layer and per-`channels` overrides. Mirrors
+ * `describeChannelEnv` in `src/credentials.ts`.
+ */
+export interface AgentSecretsResponse {
+  default: string[];
+  channels: Record<string, string[]>;
+}
+
+/** List the env-var names set (default layer + per-channel). No values. */
+export function listAgentSecrets(): Promise<AgentSecretsResponse> {
+  return getJson<AgentSecretsResponse>("/credentials/env");
+}
+
+/**
+ * Set an env var for a channel (the agent's channel) or — with `channel`
+ * omitted — the operator default. Throws `HttpError` (400 on a denylisted/
+ * malformed name) so the form surfaces the daemon's message.
+ */
+export function setAgentSecret(body: {
+  channel?: string;
+  name: string;
+  value: string;
+}): Promise<{ ok: boolean; scope: string; channel?: string; name: string }> {
+  return postJson("/credentials/env", body);
+}
+
+/** Remove an env var (per-channel or default). DELETE carries a JSON body. */
+export function removeAgentSecret(body: {
+  channel?: string;
+  name: string;
+}): Promise<{ ok: boolean; scope: string; channel?: string; name: string; removed: boolean }> {
+  return deleteJsonWithBody("/credentials/env", body);
 }
 
 // ---------------------------------------------------------------------------
