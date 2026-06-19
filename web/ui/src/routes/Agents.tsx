@@ -1,36 +1,47 @@
 /**
- * `/agents` — the unified, READ-ONLY Agents view (Agent UI v2, Phase 2).
+ * `/agents` — the unified Agents view (Agent UI v2, Phases 2–4a).
  *
  * The one agent-centric surface the v2 design calls for: a single list of
  * EVERY agent across ALL backends (interactive / programmatic / channel) with a
- * detail panel, plus a read-only "Def-vaults" section showing which vaults the
- * module reads `#agent/definition` notes from.
- *
- * This phase is strictly read-only — no create flow (Phase 3) and no def-vault
- * editor (Phase 4). It composes the three Phase-1 list endpoints:
+ * detail panel, plus the "Def-vaults" section showing which vaults the module
+ * reads `#agent/definition` notes from. It composes the three Phase-1 list
+ * endpoints:
  *
  *   - `GET /agent/api/agents`       → the live agents (all backends merged)
  *   - `GET /agent/api/agent-defs`   → the vault-native defs (system-prompt
- *                                     preview, wants, status) the detail panel
- *                                     enriches a row with
- *   - `GET /agent/api/agent-vaults` → the def-vault list (read-only display)
+ *                                     preview, mode, wants, status) the detail
+ *                                     panel enriches a row with
+ *   - `GET /agent/api/agent-vaults` → the def-vault list
  *
  * The "all-backends merge" is the load-bearing v2 move (#102): the list shows
  * channel/programmatic/interactive agents in one table instead of separate
  * pages. We dedupe defs that have no corresponding live agent so a def authored
  * but not yet instantiated still appears (as a def-only row), giving the
  * operator the full picture.
+ *
+ * Phase 4a adds the WRITE paths: a vault-native def (a row with a `noteId`) can be
+ * EDITED (pre-filled from the FULL def via `getAgentDef`) or DELETED (with an
+ * explicit type-to-confirm), and the Def-vaults section can ADD / REMOVE a vault.
+ * Editing a def reactively re-instantiates it (Connector 1); the list refresh after
+ * the PATCH shows the new state (a slow reactive path may take ≤60s to fully
+ * converge, but the immediate per-note reload makes the change live at once).
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   type AgentDefRow,
+  type AgentMode,
   type AgentRow,
   type AgentVaultRow,
+  addAgentVault,
+  deleteAgentDef,
+  editAgentDef,
+  getAgentDef,
   HttpError,
   listAgentDefs,
   listAgentVaults,
   listAgents,
+  removeAgentVault,
 } from "../lib/api.ts";
 
 type LoadState =
@@ -50,6 +61,8 @@ export interface MergedAgent {
   channel?: string;
   vault?: string;
   status?: string;
+  /** The execution-lifecycle mode, when the agent is backed by a vault-native def. */
+  mode?: AgentMode;
   /** True when a live agent (interactive/programmatic/channel) exists. */
   live: boolean;
   /** The vault-native def, when one defines this agent. */
@@ -73,6 +86,7 @@ export function mergeAgents(agents: AgentRow[], defs: AgentDefRow[]): MergedAgen
     const existing = byName.get(d.name);
     if (existing) {
       existing.def = d;
+      existing.mode = d.mode;
       // Fill gaps the live row didn't carry from the durable def.
       if (!existing.channel && d.channel) existing.channel = d.channel;
       if (!existing.vault && d.vault) existing.vault = d.vault;
@@ -83,6 +97,7 @@ export function mergeAgents(agents: AgentRow[], defs: AgentDefRow[]): MergedAgen
         channel: d.channel,
         vault: d.vault,
         status: d.status,
+        mode: d.mode,
         live: false,
         def: d,
       });
@@ -173,7 +188,15 @@ export function Agents() {
       {state.kind === "ok" ? (
         <>
           {selectedAgent ? (
-            <AgentDetail agent={selectedAgent} onClose={() => setSelected(null)} />
+            <AgentDetail
+              agent={selectedAgent}
+              onClose={() => setSelected(null)}
+              onChanged={() => void load()}
+              onDeleted={() => {
+                setSelected(null);
+                void load();
+              }}
+            />
           ) : null}
 
           <section className="card" aria-label="Agents">
@@ -235,7 +258,7 @@ export function Agents() {
             )}
           </section>
 
-          <DefVaultsSection vaults={state.vaults} />
+          <DefVaultsSection vaults={state.vaults} onChanged={() => void load()} />
         </>
       ) : null}
     </div>
@@ -243,12 +266,47 @@ export function Agents() {
 }
 
 /**
- * The per-agent detail panel. Surfaces the def's system-prompt preview, wants,
- * vault, and status. For a channel-backend agent it notes that the queue / MCP
- * connect affordance arrives in a later phase (this view is read-only).
+ * The per-agent detail panel. Surfaces the def's system-prompt preview, mode,
+ * wants, vault, and status. For a vault-native def (a row carrying a `noteId`) it
+ * offers Edit + Delete; interactive / non-def agents have no def to edit, so those
+ * actions are absent. `onChanged` refreshes the list after an edit; `onDeleted`
+ * closes the panel + refreshes after a delete.
  */
-export function AgentDetail({ agent, onClose }: { agent: MergedAgent; onClose: () => void }) {
+export function AgentDetail({
+  agent,
+  onClose,
+  onChanged,
+  onDeleted,
+}: {
+  agent: MergedAgent;
+  onClose: () => void;
+  onChanged: () => void;
+  onDeleted: () => void;
+}) {
   const def = agent.def;
+  // Edit/delete are only meaningful for a vault-native def (it has a note to mutate).
+  const noteId = def?.noteId;
+  const [mode, setMode] = useState<"view" | "edit" | "delete">("view");
+
+  // Drop back to the read view whenever the selected agent changes.
+  useEffect(() => {
+    setMode("view");
+  }, [agent.name]);
+
+  if (mode === "edit" && noteId) {
+    return (
+      <EditAgentForm
+        noteId={noteId}
+        name={agent.name}
+        onCancel={() => setMode("view")}
+        onSaved={() => {
+          setMode("view");
+          onChanged();
+        }}
+      />
+    );
+  }
+
   return (
     <div className="detail" data-testid="agent-detail">
       <div className="detail-head">
@@ -265,6 +323,8 @@ export function AgentDetail({ agent, onClose }: { agent: MergedAgent; onClose: (
       <dl className="detail-grid">
         <dt>Backend</dt>
         <dd>{agent.backend}</dd>
+        <dt>Mode</dt>
+        <dd data-testid="detail-mode">{agent.mode ? modeLabel(agent.mode) : "—"}</dd>
         <dt>Channel</dt>
         <dd>{agent.channel ?? "—"}</dd>
         <dt>Vault</dt>
@@ -329,26 +389,457 @@ export function AgentDetail({ agent, onClose }: { agent: MergedAgent; onClose: (
           affordance arrive in a later phase.
         </p>
       ) : null}
+
+      {/* Edit / delete — only for a vault-native def (a note we can mutate). */}
+      {noteId ? (
+        mode === "delete" ? (
+          <DeleteAgentConfirm
+            noteId={noteId}
+            name={agent.name}
+            onCancel={() => setMode("view")}
+            onDeleted={onDeleted}
+          />
+        ) : (
+          <div className="detail-actions" data-testid="detail-actions">
+            <button type="button" className="secondary" data-testid="edit-agent" onClick={() => setMode("edit")}>
+              Edit
+            </button>
+            <button
+              type="button"
+              className="button-danger"
+              data-testid="delete-agent"
+              onClick={() => setMode("delete")}
+            >
+              Delete
+            </button>
+          </div>
+        )
+      ) : null}
+    </div>
+  );
+}
+
+/** Friendly label for the execution-lifecycle mode. */
+function modeLabel(mode: AgentMode): string {
+  return mode === "single-threaded" ? "Single-threaded" : "Multi-threaded";
+}
+
+/**
+ * The edit form for a vault-native def. Pre-fills from the FULL def
+ * (`getAgentDef` — the whole system-prompt body, not the list's ~200-char
+ * preview), then PATCHes the changed fields. The MODE rides in `metadata.mode`
+ * (mirroring the create flow). Reuses the create form's field / RadioRow styling.
+ */
+export function EditAgentForm({
+  noteId,
+  name,
+  onCancel,
+  onSaved,
+}: {
+  noteId: string;
+  name: string;
+  onCancel: () => void;
+  onSaved: () => void;
+}) {
+  type LoadState =
+    | { kind: "loading" }
+    | { kind: "error"; message: string }
+    | { kind: "ready"; systemPrompt: string; mode: AgentMode; wants: string };
+  const [load, setLoad] = useState<LoadState>({ kind: "loading" });
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [mode, setMode] = useState<AgentMode>("single-threaded");
+  const [wants, setWants] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const fetchFull = useCallback(async () => {
+    setLoad({ kind: "loading" });
+    try {
+      const res = await getAgentDef(noteId);
+      const d = res.def;
+      setSystemPrompt(d.systemPrompt);
+      setMode(d.mode);
+      setWants(d.wants.join(", "));
+      setLoad({ kind: "ready", systemPrompt: d.systemPrompt, mode: d.mode, wants: d.wants.join(", ") });
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? err.status === 401
+            ? "Not signed in to the hub — sign in to the portal, then reload."
+            : `Failed to load the def: ${err.message}`
+          : `Failed to load the def: ${(err as Error).message}`;
+      setLoad({ kind: "error", message });
+    }
+  }, [noteId]);
+
+  useEffect(() => {
+    void fetchFull();
+  }, [fetchFull]);
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (saving) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await editAgentDef(noteId, {
+        systemPrompt,
+        // `mode` rides in metadata.mode (same as create). `wants` is the comma-string;
+        // send "" to clear when the operator emptied it (the daemon merges metadata).
+        metadata: { mode },
+        wants: wants.trim(),
+      });
+      onSaved();
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? err.status === 401
+            ? "Not signed in to the hub — sign in to the portal, then reload."
+            : err.message
+          : (err as Error).message;
+      setSaveError(message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="detail" data-testid="edit-agent-form">
+      <div className="detail-head">
+        <h2>Edit {name}</h2>
+        <button type="button" className="detail-close" onClick={onCancel}>
+          Close
+        </button>
+      </div>
+
+      {load.kind === "loading" ? <div className="loading">Loading def…</div> : null}
+      {load.kind === "error" ? (
+        <div className="error-banner" role="alert" data-testid="edit-load-error">
+          {load.message}{" "}
+          <button type="button" className="secondary" onClick={() => void fetchFull()}>
+            Retry
+          </button>
+        </div>
+      ) : null}
+
+      {load.kind === "ready" ? (
+        <form className="card" onSubmit={onSubmit} aria-label="Edit agent">
+          {saveError ? (
+            <div className="error-banner" role="alert" data-testid="edit-error">
+              {saveError}
+            </div>
+          ) : null}
+
+          {/* Mode — the execution-lifecycle branch. → metadata.mode */}
+          <fieldset className="field">
+            <legend>Mode</legend>
+            <RadioRow
+              name="edit-mode"
+              value="single-threaded"
+              checked={mode === "single-threaded"}
+              onChange={() => setMode("single-threaded")}
+              label="Single-threaded"
+              help="One continuous conversation — remembers everything on this channel."
+              testid="edit-mode-single-threaded"
+            />
+            <RadioRow
+              name="edit-mode"
+              value="multi-threaded"
+              checked={mode === "multi-threaded"}
+              onChange={() => setMode("multi-threaded")}
+              label="Multi-threaded"
+              help="Each run is its own thread — good for scheduled or stateless tasks."
+              testid="edit-mode-multi-threaded"
+            />
+          </fieldset>
+
+          {/* System prompt → body (the FULL note body). */}
+          <div className="field">
+            <label htmlFor="edit-prompt">System prompt</label>
+            <textarea
+              id="edit-prompt"
+              rows={8}
+              value={systemPrompt}
+              placeholder="You are…"
+              onChange={(e) => setSystemPrompt(e.target.value)}
+            />
+            <p className="field-hint">
+              The agent's persona + instructions (the note body). Leave blank for Claude
+              Code's default.
+            </p>
+          </div>
+
+          {/* Wants → metadata.wants (comma-separated). */}
+          <div className="field">
+            <label htmlFor="edit-wants">Wants (connections)</label>
+            <input
+              id="edit-wants"
+              type="text"
+              value={wants}
+              placeholder="vault:other, service:github"
+              autoComplete="off"
+              onChange={(e) => setWants(e.target.value)}
+            />
+            <p className="field-hint">
+              Comma-separated connection keys the agent requests beyond its own vault. Each
+              needs approval before it's granted.
+            </p>
+          </div>
+
+          <div className="form-actions">
+            <button type="submit" disabled={saving}>
+              {saving ? "Saving…" : "Save changes"}
+            </button>
+            <button type="button" className="cancel-link" onClick={onCancel}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      ) : null}
     </div>
   );
 }
 
 /**
- * Read-only "Def-vaults" section: which vaults the module reads agent
- * definitions from (`agent-vaults.json`). `tokenPresent` shows binding health
- * without ever surfacing the token value. The add/remove editor is Phase 4.
+ * Delete confirmation for a vault-native def — an explicit TYPE-TO-CONFIRM (the
+ * operator types the agent name) so a destructive delete can't fire on a stray
+ * click. Removing the def deletes the note + deregisters the agent.
  */
-export function DefVaultsSection({ vaults }: { vaults: AgentVaultRow[] }) {
+export function DeleteAgentConfirm({
+  noteId,
+  name,
+  onCancel,
+  onDeleted,
+}: {
+  noteId: string;
+  name: string;
+  onCancel: () => void;
+  onDeleted: () => void;
+}) {
+  const [confirmText, setConfirmText] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const canDelete = confirmText === name && !deleting;
+
+  async function onConfirm() {
+    if (!canDelete) return;
+    setDeleting(true);
+    setError(null);
+    try {
+      await deleteAgentDef(noteId);
+      onDeleted();
+    } catch (err) {
+      const message =
+        err instanceof HttpError
+          ? err.status === 401
+            ? "Not signed in to the hub — sign in to the portal, then reload."
+            : err.message
+          : (err as Error).message;
+      setError(message);
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <div className="confirm-box" data-testid="delete-confirm">
+      <p className="confirm-prompt">
+        Delete <strong>{name}</strong>? This removes the definition note and deregisters
+        the agent. Type the agent name to confirm.
+      </p>
+      {error ? (
+        <div className="error-banner" role="alert" data-testid="delete-error">
+          {error}
+        </div>
+      ) : null}
+      <div className="field">
+        <input
+          type="text"
+          value={confirmText}
+          placeholder={name}
+          autoComplete="off"
+          aria-label="Type the agent name to confirm deletion"
+          data-testid="delete-confirm-input"
+          onChange={(e) => setConfirmText(e.target.value)}
+        />
+      </div>
+      <div className="form-actions">
+        <button
+          type="button"
+          className="button-danger"
+          data-testid="delete-confirm-button"
+          disabled={!canDelete}
+          onClick={() => void onConfirm()}
+        >
+          {deleting ? "Deleting…" : "Delete agent"}
+        </button>
+        <button type="button" className="cancel-link" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** A labelled radio with a help line — the edit form's mode rows (mirrors CreateAgent). */
+function RadioRow(props: {
+  name: string;
+  value: string;
+  checked: boolean;
+  onChange: () => void;
+  label: string;
+  help: string;
+  testid: string;
+}) {
+  return (
+    <label className={`radio-row${props.checked ? " selected" : ""}`} data-testid={props.testid}>
+      <input
+        type="radio"
+        name={props.name}
+        value={props.value}
+        checked={props.checked}
+        onChange={props.onChange}
+      />
+      <span className="radio-body">
+        <span className="radio-label">{props.label}</span>
+        <span className="radio-help">{props.help}</span>
+      </span>
+    </label>
+  );
+}
+
+/**
+ * "Def-vaults" section: which vaults the module reads agent definitions from
+ * (`agent-vaults.json`). `tokenPresent` shows binding health without ever
+ * surfacing the token value. Phase 4a adds ADD (vault name + optional url →
+ * `addAgentVault`) and REMOVE (per vault → `removeAgentVault`, with confirm —
+ * removing a def-vault deregisters its agents). `onChanged` refreshes the page
+ * after either mutation.
+ */
+export function DefVaultsSection({
+  vaults,
+  onChanged,
+}: {
+  vaults: AgentVaultRow[];
+  onChanged: () => void;
+}) {
+  const [addOpen, setAddOpen] = useState(false);
+  const [vaultName, setVaultName] = useState("");
+  const [url, setUrl] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState<string | null>(null);
+  // The vault currently in the remove-confirm state (its name), or null.
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+
+  const nameValid = /^[a-zA-Z0-9_-]+$/.test(vaultName);
+  const canAdd = nameValid && !adding;
+
+  async function onAdd(e: React.FormEvent) {
+    e.preventDefault();
+    if (!canAdd) return;
+    setAdding(true);
+    setAddError(null);
+    try {
+      await addAgentVault({
+        vault: vaultName,
+        ...(url.trim().length > 0 ? { url: url.trim() } : {}),
+      });
+      setVaultName("");
+      setUrl("");
+      setAddOpen(false);
+      onChanged();
+    } catch (err) {
+      setAddError(errMessage(err));
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  async function onRemove(name: string) {
+    setRemoving(name);
+    setRemoveError(null);
+    try {
+      await removeAgentVault(name);
+      setConfirmRemove(null);
+      onChanged();
+    } catch (err) {
+      setRemoveError(errMessage(err));
+    } finally {
+      setRemoving(null);
+    }
+  }
+
   return (
     <section className="card" aria-label="Def-vaults">
       <div className="section-head">
         <h2>Def-vaults</h2>
-        <span className="count">{vaults.length}</span>
+        <span className="section-head-actions">
+          <span className="count">{vaults.length}</span>
+          <button
+            type="button"
+            className="secondary"
+            data-testid="add-def-vault-toggle"
+            onClick={() => setAddOpen((o) => !o)}
+          >
+            {addOpen ? "Cancel" : "Add def-vault"}
+          </button>
+        </span>
       </div>
       <p className="muted">
-        Vaults this module reads <code>#agent/definition</code> notes from. Editing the
-        list (add / remove) comes in a later phase.
+        Vaults this module reads <code>#agent/definition</code> notes from. Removing one
+        deregisters every agent defined in it.
       </p>
+
+      {addOpen ? (
+        <form className="inline-form" onSubmit={onAdd} aria-label="Add def-vault" data-testid="add-def-vault-form">
+          {addError ? (
+            <div className="error-banner" role="alert" data-testid="add-def-vault-error">
+              {addError}
+            </div>
+          ) : null}
+          <div className="field">
+            <label htmlFor="new-vault-name">Vault name</label>
+            <input
+              id="new-vault-name"
+              type="text"
+              value={vaultName}
+              placeholder="research"
+              autoComplete="off"
+              onChange={(e) => setVaultName(e.target.value)}
+            />
+            {vaultName.length > 0 && !nameValid ? (
+              <p className="field-error" data-testid="new-vault-invalid">
+                Must be a slug — letters, numbers, dash, underscore only.
+              </p>
+            ) : null}
+          </div>
+          <div className="field">
+            <label htmlFor="new-vault-url">Vault URL (optional)</label>
+            <input
+              id="new-vault-url"
+              type="text"
+              value={url}
+              placeholder="http://127.0.0.1:1940"
+              autoComplete="off"
+              onChange={(e) => setUrl(e.target.value)}
+            />
+            <p className="field-hint">The vault REST origin. Defaults to the loopback vault.</p>
+          </div>
+          <div className="form-actions">
+            <button type="submit" disabled={!canAdd}>
+              {adding ? "Adding…" : "Add def-vault"}
+            </button>
+          </div>
+        </form>
+      ) : null}
+
+      {removeError ? (
+        <div className="error-banner" role="alert" data-testid="remove-def-vault-error">
+          {removeError}
+        </div>
+      ) : null}
+
       {vaults.length === 0 ? (
         <div className="empty" data-testid="def-vaults-empty">
           No def-vaults configured yet.
@@ -360,6 +851,7 @@ export function DefVaultsSection({ vaults }: { vaults: AgentVaultRow[] }) {
               <th>Vault</th>
               <th>URL</th>
               <th>Token</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
@@ -374,6 +866,40 @@ export function DefVaultsSection({ vaults }: { vaults: AgentVaultRow[] }) {
                     <span className="pill status-error">missing</span>
                   )}
                 </td>
+                <td>
+                  {confirmRemove === v.vault ? (
+                    <span className="confirm-inline">
+                      <button
+                        type="button"
+                        className="button-danger"
+                        data-testid={`remove-def-vault-confirm-${v.vault}`}
+                        disabled={removing === v.vault}
+                        onClick={() => void onRemove(v.vault)}
+                      >
+                        {removing === v.vault ? "Removing…" : "Confirm remove"}
+                      </button>
+                      <button
+                        type="button"
+                        className="cancel-link"
+                        onClick={() => setConfirmRemove(null)}
+                      >
+                        Cancel
+                      </button>
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="button-danger"
+                      data-testid={`remove-def-vault-${v.vault}`}
+                      onClick={() => {
+                        setRemoveError(null);
+                        setConfirmRemove(v.vault);
+                      }}
+                    >
+                      Remove
+                    </button>
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>
@@ -381,4 +907,14 @@ export function DefVaultsSection({ vaults }: { vaults: AgentVaultRow[] }) {
       )}
     </section>
   );
+}
+
+/** Pull a user-facing message off an unknown error (HttpError carries the daemon's). */
+function errMessage(err: unknown): string {
+  if (err instanceof HttpError) {
+    return err.status === 401
+      ? "Not signed in to the hub — sign in to the portal, then reload."
+      : err.message;
+  }
+  return (err as Error).message;
 }

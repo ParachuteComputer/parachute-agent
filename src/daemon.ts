@@ -2728,8 +2728,11 @@ export function createFetchHandler(
     // poll). NO secrets surfaced (no tokens). Externally `<hub>/agent/api/agent-defs`.
     //
     //   GET    /api/agent-defs           → list (read-scoped) — per def: noteId, name,
-    //                                       backend, vault, status, pending,
+    //                                       backend, mode, vault, status, pending,
     //                                       systemPromptPreview, wants, channel
+    //   GET    /api/agent-defs/<noteId>  → one def, FULL (read-scoped) — noteId, name,
+    //                                       backend, vault, mode, wants, systemPrompt
+    //                                       (FULL body), status. Pre-fills the edit form.
     //   POST   /api/agent-defs           { vault, name, backend, systemPrompt, wants?,
     //                                       metadata? } → write note + reload live (admin)
     //   PATCH  /api/agent-defs/<noteId>  { systemPrompt?, wants?, metadata? } → edit +
@@ -2790,6 +2793,28 @@ export function createFetchHandler(
       } catch (err) {
         if (err instanceof AgentDefWriteError) return json({ error: err.message }, err.status);
         return json({ error: `failed to create agent def: ${(err as Error).message}` }, 502);
+      }
+    }
+
+    // GET /api/agent-defs/<noteId> — the FULL editable def (the whole system-prompt
+    // body, not the list's ~200-char preview) so the edit form pre-fills correctly.
+    // READ-scoped, mirroring GET /api/agent-defs (a listing, no secrets — the body is
+    // the prompt, never a token). 404 for an unknown id / a note that isn't a live def.
+    const defGetMatch = url.pathname.match(/^\/api\/agent-defs\/(.+)$/);
+    if (defGetMatch && req.method === "GET") {
+      const denied = await requireScope(req, url, SCOPE_READ);
+      if (denied) return denied;
+      const noteId = decodeURIComponent(defGetMatch[1]!);
+      if (!agentDefs) {
+        return json({ error: "no def-vaults configured" }, 400);
+      }
+      try {
+        const full = await agentDefs.getFullDef(noteId);
+        if (!full) return json({ error: `note ${noteId} is not a live agent definition` }, 404);
+        return json({ def: full });
+      } catch (err) {
+        if (err instanceof AgentDefWriteError) return json({ error: err.message }, err.status);
+        return json({ error: `failed to fetch agent def: ${(err as Error).message}` }, 502);
       }
     }
 

@@ -16,12 +16,22 @@ vi.mock("../lib/api.ts", async (orig) => {
     listAgents: vi.fn(),
     listAgentDefs: vi.fn(),
     listAgentVaults: vi.fn(),
+    getAgentDef: vi.fn(),
+    editAgentDef: vi.fn(),
+    deleteAgentDef: vi.fn(),
+    addAgentVault: vi.fn(),
+    removeAgentVault: vi.fn(),
   };
 });
 
 const listAgents = vi.mocked(api.listAgents);
 const listAgentDefs = vi.mocked(api.listAgentDefs);
 const listAgentVaults = vi.mocked(api.listAgentVaults);
+const getAgentDef = vi.mocked(api.getAgentDef);
+const editAgentDef = vi.mocked(api.editAgentDef);
+const deleteAgentDef = vi.mocked(api.deleteAgentDef);
+const addAgentVault = vi.mocked(api.addAgentVault);
+const removeAgentVault = vi.mocked(api.removeAgentVault);
 
 function agentRow(over: Partial<api.AgentRow> = {}): api.AgentRow {
   return {
@@ -40,12 +50,27 @@ function defRow(over: Partial<api.AgentDefRow> = {}): api.AgentDefRow {
     noteId: "note-1",
     name: "alpha",
     backend: "programmatic",
+    mode: "single-threaded",
     vault: "default",
     status: "enabled",
     pending: [],
     systemPromptPreview: "You are a helpful agent.",
     wants: [],
     channel: "alpha",
+    ...over,
+  };
+}
+
+function fullDef(over: Partial<api.AgentDefFull> = {}): api.AgentDefFull {
+  return {
+    noteId: "note-1",
+    name: "alpha",
+    backend: "programmatic",
+    vault: "default",
+    mode: "single-threaded",
+    wants: [],
+    systemPrompt: "The FULL system prompt body, longer than any preview.",
+    status: "enabled",
     ...over,
   };
 }
@@ -200,5 +225,128 @@ describe("Agents view states", () => {
   it("shows the def-vaults empty state when none configured", async () => {
     renderRoute();
     expect(await screen.findByTestId("def-vaults-empty")).toBeInTheDocument();
+  });
+
+  it("shows the def's mode in the detail panel", async () => {
+    listAgents.mockResolvedValue({ agents: [agentRow({ name: "alpha" })] });
+    listAgentDefs.mockResolvedValue({ defs: [defRow({ name: "alpha", mode: "multi-threaded" })] });
+    renderRoute();
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    const detail = await screen.findByTestId("agent-detail");
+    expect(within(detail).getByTestId("detail-mode")).toHaveTextContent("Multi-threaded");
+  });
+
+  it("does NOT show edit/delete for an agent with no backing def", async () => {
+    listAgents.mockResolvedValue({ agents: [agentRow({ name: "tmux", backend: "interactive" })] });
+    listAgentDefs.mockResolvedValue({ defs: [] });
+    renderRoute();
+    fireEvent.click(await screen.findByTestId("agent-row-tmux"));
+    await screen.findByTestId("agent-detail");
+    expect(screen.queryByTestId("detail-actions")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("edit-agent")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("delete-agent")).not.toBeInTheDocument();
+  });
+});
+
+describe("Agents — edit a def (Phase 4a)", () => {
+  function openEdit() {
+    listAgents.mockResolvedValue({ agents: [agentRow({ name: "alpha", backend: "channel" })] });
+    listAgentDefs.mockResolvedValue({ defs: [defRow({ name: "alpha", mode: "single-threaded" })] });
+  }
+
+  it("edit pre-fills from getAgentDef (the FULL prompt) and PATCHes mode in metadata.mode", async () => {
+    openEdit();
+    getAgentDef.mockResolvedValue({
+      def: fullDef({ name: "alpha", mode: "single-threaded", systemPrompt: "Original full body", wants: ["vault:x:read"] }),
+    });
+    editAgentDef.mockResolvedValue({ ok: true, def: defRow({ name: "alpha", mode: "multi-threaded" }) });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    fireEvent.click(await screen.findByTestId("edit-agent"));
+
+    // Loaded the FULL def for the pre-fill.
+    await waitFor(() => expect(getAgentDef).toHaveBeenCalledWith("note-1"));
+    const form = await screen.findByTestId("edit-agent-form");
+    const textarea = within(form).getByLabelText(/system prompt/i) as HTMLTextAreaElement;
+    expect(textarea.value).toBe("Original full body");
+
+    // Flip the mode + edit the prompt, then save.
+    fireEvent.click(within(form).getByTestId("edit-mode-multi-threaded"));
+    fireEvent.change(textarea, { target: { value: "New body" } });
+    fireEvent.click(within(form).getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(editAgentDef).toHaveBeenCalledTimes(1));
+    expect(editAgentDef).toHaveBeenCalledWith("note-1", {
+      systemPrompt: "New body",
+      metadata: { mode: "multi-threaded" },
+      wants: "vault:x:read",
+    });
+  });
+
+  it("surfaces a load error with a retry", async () => {
+    openEdit();
+    getAgentDef.mockRejectedValueOnce(new api.HttpError(500, "boom"));
+    renderRoute();
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    fireEvent.click(await screen.findByTestId("edit-agent"));
+    expect(await screen.findByTestId("edit-load-error")).toHaveTextContent(/boom/i);
+  });
+});
+
+describe("Agents — delete a def (Phase 4a)", () => {
+  it("delete requires typing the name to confirm, then calls deleteAgentDef", async () => {
+    listAgents.mockResolvedValue({ agents: [agentRow({ name: "alpha" })] });
+    listAgentDefs.mockResolvedValue({ defs: [defRow({ name: "alpha" })] });
+    deleteAgentDef.mockResolvedValue({ ok: true, vault: "default", name: "alpha", removed: true });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    fireEvent.click(await screen.findByTestId("delete-agent"));
+
+    const confirmBtn = (await screen.findByTestId("delete-confirm-button")) as HTMLButtonElement;
+    // Disabled until the typed name matches.
+    expect(confirmBtn.disabled).toBe(true);
+    fireEvent.change(screen.getByTestId("delete-confirm-input"), { target: { value: "wrong" } });
+    expect(confirmBtn.disabled).toBe(true);
+    fireEvent.change(screen.getByTestId("delete-confirm-input"), { target: { value: "alpha" } });
+    expect(confirmBtn.disabled).toBe(false);
+
+    fireEvent.click(confirmBtn);
+    await waitFor(() => expect(deleteAgentDef).toHaveBeenCalledWith("note-1"));
+  });
+});
+
+describe("Def-vaults — add / remove (Phase 4a)", () => {
+  it("add calls addAgentVault with the vault name + url", async () => {
+    listAgentVaults.mockResolvedValue({ vaults: [{ vault: "default", url: "http://127.0.0.1:1940", tokenPresent: true }] });
+    addAgentVault.mockResolvedValue({ ok: true, vault: { vault: "research", url: "http://x", tokenPresent: true } });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("add-def-vault-toggle"));
+    const form = await screen.findByTestId("add-def-vault-form");
+    fireEvent.change(within(form).getByLabelText(/vault name/i), { target: { value: "research" } });
+    fireEvent.change(within(form).getByLabelText(/vault url/i), { target: { value: "http://x" } });
+    fireEvent.click(within(form).getByRole("button", { name: /add def-vault/i }));
+
+    await waitFor(() => expect(addAgentVault).toHaveBeenCalledWith({ vault: "research", url: "http://x" }));
+  });
+
+  it("remove requires a confirm, then calls removeAgentVault", async () => {
+    listAgentVaults.mockResolvedValue({
+      vaults: [
+        { vault: "default", url: "http://127.0.0.1:1940", tokenPresent: true },
+        { vault: "research", url: "http://x", tokenPresent: true },
+      ],
+    });
+    removeAgentVault.mockResolvedValue({ ok: true, vault: "research", removed: true });
+    renderRoute();
+
+    await screen.findByTestId("def-vault-research");
+    // First click arms the confirm; the actual remove only fires on the confirm button.
+    fireEvent.click(screen.getByTestId("remove-def-vault-research"));
+    expect(removeAgentVault).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByTestId("remove-def-vault-confirm-research"));
+    await waitFor(() => expect(removeAgentVault).toHaveBeenCalledWith("research"));
   });
 });

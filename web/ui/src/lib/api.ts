@@ -2,9 +2,9 @@
  * HTTP client for the agent SPA. All calls hit the daemon's JSON API, gated by
  * the hub-minted `agent:admin` Bearer (`lib/auth.ts:getAgentToken`).
  *
- * This phase (Agent UI v2 — Phase 2) is READ-ONLY: it surfaces the three
- * Phase-1 list endpoints and merges them into one agent-centric view. No create
- * / edit / delete (those are Phases 3–4).
+ * The list endpoints (Phase 2) surface the three Phase-1 reads and merge them
+ * into one agent-centric view; the write paths layer on top: create (Phase 3) and
+ * — Phase 4a — edit/delete a def + add/remove a def-vault.
  *
  *   - `GET /agent/api/agents`        — every agent across ALL backends
  *     (interactive / programmatic / channel), with live status.
@@ -98,8 +98,34 @@ async function getJson<T>(suffix: string): Promise<T> {
  * Phase-3 create flow (the first write path the SPA carries).
  */
 async function postJson<T>(suffix: string, body: unknown): Promise<T> {
+  return bodyJson<T>("POST", suffix, body);
+}
+
+/**
+ * PATCH a JSON body to an endpoint with the Bearer + the same single 401
+ * re-mint-and-retry, throwing HttpError on a non-2xx. The Phase-4a def-edit path.
+ */
+async function patchJson<T>(suffix: string, body: unknown): Promise<T> {
+  return bodyJson<T>("PATCH", suffix, body);
+}
+
+/**
+ * DELETE an endpoint with the Bearer + the same single 401 re-mint-and-retry,
+ * throwing HttpError on a non-2xx. No body. The Phase-4a def-delete + def-vault
+ * remove paths.
+ */
+async function deleteJson<T>(suffix: string): Promise<T> {
+  const res = await authedFetch(`${apiBase()}${suffix}`, { method: "DELETE" });
+  if (!res.ok) {
+    throw new HttpError(res.status, (await errorDetail(res)) || `${suffix} failed: ${res.status}`);
+  }
+  return (await res.json()) as T;
+}
+
+/** Shared body-bearing-method helper (POST/PATCH) — Bearer + 401 retry + HttpError. */
+async function bodyJson<T>(method: "POST" | "PATCH", suffix: string, body: unknown): Promise<T> {
   const res = await authedFetch(`${apiBase()}${suffix}`, {
-    method: "POST",
+    method,
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
@@ -116,6 +142,9 @@ async function postJson<T>(suffix: string, body: unknown): Promise<T> {
 
 /** The backend that drives an agent. The primary axis of the v2 view. */
 export type AgentBackend = "interactive" | "programmatic" | "channel";
+
+/** Execution-lifecycle mode — the top-level branch. Rides in `metadata.mode`. */
+export type AgentMode = "single-threaded" | "multi-threaded";
 
 /**
  * One entry from `GET /agent/api/agents` — the merged all-backends list.
@@ -152,10 +181,12 @@ export type AgentDefStatus = "enabled" | "pending" | "error" | string;
  * `#agent/definition` record. Mirrors `AgentDefDetail` in `src/agent-defs.ts`.
  */
 export interface AgentDefRow {
-  /** The vault note id (the create/edit/delete key — not used read-only). */
+  /** The vault note id (the create/edit/delete key). */
   noteId: string;
   name: string;
   backend: "programmatic" | "channel";
+  /** The execution-lifecycle mode the def declared. */
+  mode: AgentMode;
   vault: string;
   status: AgentDefStatus;
   /** Declared connections still pending approval (empty when none). */
@@ -208,9 +239,6 @@ export function listAgentVaults(): Promise<AgentVaultsResponse> {
 // this one call; there is NO separate channel-provisioning step.
 // ---------------------------------------------------------------------------
 
-/** Execution-lifecycle mode — the top-level branch. Rides in `metadata.mode`. */
-export type AgentMode = "single-threaded" | "multi-threaded";
-
 /** The backend selectable in the create flow. `interactive` is RETIRED — not offered. */
 export type CreatableBackend = "programmatic" | "channel";
 
@@ -243,6 +271,133 @@ export interface CreateAgentDefResponse {
  */
 export function createAgentDef(body: CreateAgentDefBody): Promise<CreateAgentDefResponse> {
   return postJson<CreateAgentDefResponse>("/agent-defs", body);
+}
+
+// ---------------------------------------------------------------------------
+// Edit / delete a def (Agent UI v2 — Phase 4a). The list endpoint returns only a
+// ~200-char `systemPromptPreview`, which can't pre-fill an edit; `getAgentDef`
+// fetches the FULL editable def from `GET /api/agent-defs/<noteId>`. `editAgentDef`
+// PATCHes the changed fields (the MODE rides in `metadata.mode`, mirroring create);
+// `deleteAgentDef` DELETEs the note (+ deregisters the agent daemon-side).
+// ---------------------------------------------------------------------------
+
+/**
+ * The FULL editable def `GET /api/agent-defs/<noteId>` returns — mirrors
+ * `AgentDefFull` in `src/agent-defs.ts`. Carries the FULL `systemPrompt` (the whole
+ * note body, NOT the list's truncated preview) so the edit form pre-fills correctly.
+ */
+export interface AgentDefFull {
+  noteId: string;
+  name: string;
+  backend: "programmatic" | "channel";
+  vault: string;
+  mode: AgentMode;
+  /** Structured `wants:` connection keys (empty when own-vault only). */
+  wants: string[];
+  /** The FULL system prompt — the whole note body (NOT truncated). */
+  systemPrompt: string;
+  status: AgentDefStatus;
+}
+
+/** `GET /api/agent-defs/<noteId>` response — the full def under `def`. */
+export interface AgentDefFullResponse {
+  def: AgentDefFull;
+}
+
+/**
+ * The `PATCH /api/agent-defs/<noteId>` request body. Mirrors the daemon handler
+ * (`src/daemon.ts` PATCH branch): `systemPrompt?` (note body), `wants?` (the
+ * comma-separated `wants:` string), `metadata?` (an object of strings — the MODE
+ * rides in `metadata.mode`, same as create). Only the provided fields are sent.
+ */
+export interface EditAgentDefBody {
+  systemPrompt?: string;
+  wants?: string;
+  metadata?: Record<string, string>;
+}
+
+/** `PATCH /api/agent-defs/<noteId>` 200 response — the updated def in the detail shape. */
+export interface EditAgentDefResponse {
+  ok: boolean;
+  def: AgentDefRow;
+}
+
+/** `DELETE /api/agent-defs/<noteId>` 200 response. */
+export interface DeleteAgentDefResponse {
+  ok: boolean;
+  vault: string;
+  name: string;
+  removed: boolean;
+}
+
+/**
+ * Fetch ONE def's FULL editable view (the whole system-prompt body + mode + wants)
+ * for the edit form's pre-fill. The noteId is URL-encoded (it may be a path like
+ * `Agents/uni-dev`). Throws `HttpError` (404 when the note isn't a live def).
+ */
+export function getAgentDef(noteId: string): Promise<AgentDefFullResponse> {
+  return getJson<AgentDefFullResponse>(`/agent-defs/${encodeURIComponent(noteId)}`);
+}
+
+/**
+ * Edit a vault-native agent definition: PATCH the changed fields + re-instantiate
+ * live. The MODE rides in `metadata.mode` (mirroring create). The noteId is
+ * URL-encoded. Throws `HttpError` on a non-2xx (404 unknown, 502 re-instantiate fail).
+ */
+export function editAgentDef(noteId: string, body: EditAgentDefBody): Promise<EditAgentDefResponse> {
+  return patchJson<EditAgentDefResponse>(`/agent-defs/${encodeURIComponent(noteId)}`, body);
+}
+
+/**
+ * Delete a vault-native agent definition: removes the note + deregisters the agent.
+ * The noteId is URL-encoded. Throws `HttpError` on a non-2xx (404 when not a live def).
+ */
+export function deleteAgentDef(noteId: string): Promise<DeleteAgentDefResponse> {
+  return deleteJson<DeleteAgentDefResponse>(`/agent-defs/${encodeURIComponent(noteId)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Add / remove a def-vault (Agent UI v2 — Phase 4a). `POST /api/agent-vaults`
+// mints the vault's write token + persists + loads its defs live; `DELETE
+// /api/agent-vaults/<name>` drops it + deregisters its agents. Removing a def-vault
+// deregisters every agent defined in it.
+// ---------------------------------------------------------------------------
+
+/** The `POST /api/agent-vaults` request body. `url` is optional (defaults to loopback). */
+export interface AddAgentVaultBody {
+  vault: string;
+  url?: string;
+}
+
+/** `POST /api/agent-vaults` 201 response — the added vault (no token value). */
+export interface AddAgentVaultResponse {
+  ok: boolean;
+  vault: AgentVaultRow;
+}
+
+/** `DELETE /api/agent-vaults/<name>` 200 response. */
+export interface RemoveAgentVaultResponse {
+  ok: boolean;
+  vault: string;
+  removed: boolean;
+}
+
+/**
+ * Add a def-vault the module reads `#agent/definition` notes from. Mints the vault's
+ * write token + persists `agent-vaults.json` + loads its defs live. Throws `HttpError`
+ * on a non-2xx (400 duplicate / bad slug, 502 mint failure) so the form surfaces it.
+ */
+export function addAgentVault(body: AddAgentVaultBody): Promise<AddAgentVaultResponse> {
+  return postJson<AddAgentVaultResponse>("/agent-vaults", body);
+}
+
+/**
+ * Remove a def-vault — deregisters every agent defined in it. The name is a path
+ * segment (URL-encoded). Throws `HttpError` on a non-2xx (400 when it's the only
+ * def-vault, which would orphan the module's vault-native path).
+ */
+export function removeAgentVault(name: string): Promise<RemoveAgentVaultResponse> {
+  return deleteJson<RemoveAgentVaultResponse>(`/agent-vaults/${encodeURIComponent(name)}`);
 }
 
 /**

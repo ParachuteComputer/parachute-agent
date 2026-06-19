@@ -559,3 +559,52 @@ tr.agent-row.selected {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* ---- Write actions (Phase 4a): edit / delete a def, add / remove a def-vault ---- */
+.detail-actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-light);
+}
+
+/* A destructive (delete / remove) button — error-toned outline. */
+button.button-danger {
+  background: white;
+  color: var(--error);
+  border: 1px solid var(--error);
+}
+button.button-danger:hover {
+  background: var(--error-soft);
+}
+button.button-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* The type-to-confirm delete box (inside the detail panel). */
+.confirm-box {
+  margin-top: 1.25rem;
+  padding: 1rem;
+  border: 1px solid var(--error);
+  border-radius: 8px;
+  background: var(--error-soft);
+}
+.confirm-prompt {
+  margin: 0 0 0.75rem;
+  font-size: 0.9rem;
+  color: var(--fg);
+}
+
+/* The inline def-vault remove confirm (in the table row). */
+.confirm-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+/* An inline add form (the def-vault add panel). */
+.inline-form {
+  margin: 0.75rem 0 1rem;
+}

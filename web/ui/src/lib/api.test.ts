@@ -11,13 +11,18 @@ vi.mock("./auth.ts", () => ({
 
 import * as auth from "./auth.ts";
 import {
+  addAgentVault,
   apiBase,
   connectSessionCommand,
   createAgentDef,
+  deleteAgentDef,
+  editAgentDef,
+  getAgentDef,
   HttpError,
   listAgentDefs,
   listAgentVaults,
   listAgents,
+  removeAgentVault,
 } from "./api.ts";
 
 const getAgentToken = vi.mocked(auth.getAgentToken);
@@ -224,6 +229,87 @@ describe("createAgentDef (POST)", () => {
         metadata: { mode: "single-threaded" },
       }),
     ).rejects.toMatchObject({ name: "HttpError", status: 400, message: "no def-vaults configured" });
+  });
+});
+
+describe("getAgentDef / editAgentDef / deleteAgentDef (Phase 4a def write paths)", () => {
+  it("getAgentDef GETs /agent/api/agent-defs/<encoded id> and parses the full def", async () => {
+    const full = {
+      noteId: "Agents/uni-dev",
+      name: "uni-dev",
+      backend: "channel",
+      vault: "default",
+      mode: "multi-threaded",
+      wants: ["vault:x:read"],
+      systemPrompt: "The FULL body",
+      status: "enabled",
+    };
+    const fetchMock = fetchFn(async () => jsonResponse(200, { def: full }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await getAgentDef("Agents/uni-dev");
+    expect(res.def.systemPrompt).toBe("The FULL body");
+    expect(res.def.mode).toBe("multi-threaded");
+    const [url, init] = fetchMock.mock.calls[0]!;
+    // The slash in the note id is URL-encoded into one path segment.
+    expect(url).toBe("/agent/api/agent-defs/Agents%2Funi-dev");
+    expect(init?.method ?? "GET").toBe("GET");
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer jwt-tok");
+  });
+
+  it("editAgentDef PATCHes the encoded id with the body (mode in metadata.mode)", async () => {
+    const fetchMock = fetchFn(async () => jsonResponse(200, { ok: true, def: { name: "uni-dev" } }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const body = { systemPrompt: "New body", metadata: { mode: "multi-threaded" }, wants: "vault:x:read" };
+    const res = await editAgentDef("Agents/uni-dev", body);
+    expect(res.ok).toBe(true);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/agent-defs/Agents%2Funi-dev");
+    expect(init?.method).toBe("PATCH");
+    expect(new Headers(init?.headers).get("content-type")).toBe("application/json");
+    expect(JSON.parse(String(init?.body))).toEqual(body);
+  });
+
+  it("deleteAgentDef DELETEs the encoded id (no body)", async () => {
+    const fetchMock = fetchFn(async () =>
+      jsonResponse(200, { ok: true, vault: "default", name: "uni-dev", removed: true }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await deleteAgentDef("Agents/uni-dev");
+    expect(res.removed).toBe(true);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/agent-defs/Agents%2Funi-dev");
+    expect(init?.method).toBe("DELETE");
+    expect(init?.body).toBeUndefined();
+  });
+});
+
+describe("addAgentVault / removeAgentVault (Phase 4a def-vault write paths)", () => {
+  it("addAgentVault POSTs the body to /agent/api/agent-vaults", async () => {
+    const fetchMock = fetchFn(async () =>
+      jsonResponse(201, { ok: true, vault: { vault: "research", url: "http://x", tokenPresent: true } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await addAgentVault({ vault: "research", url: "http://x" });
+    expect(res.ok).toBe(true);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/agent-vaults");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ vault: "research", url: "http://x" });
+  });
+
+  it("removeAgentVault DELETEs /agent/api/agent-vaults/<encoded name>", async () => {
+    const fetchMock = fetchFn(async () => jsonResponse(200, { ok: true, vault: "research", removed: true }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await removeAgentVault("research");
+    expect(res.removed).toBe(true);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/agent-vaults/research");
+    expect(init?.method).toBe("DELETE");
   });
 });
 
