@@ -22,7 +22,12 @@ import {
   listAgentDefs,
   listAgentVaults,
   listAgents,
+  listChannels,
+  listMessages,
+  messageStreamUrl,
   removeAgentVault,
+  sendMessage,
+  turnEventsUrl,
 } from "./api.ts";
 
 const getAgentToken = vi.mocked(auth.getAgentToken);
@@ -319,5 +324,99 @@ describe("connectSessionCommand", () => {
     expect(connectSessionCommand("eng", "https://my.parachute.computer")).toBe(
       "claude mcp add --transport http --scope user agent-eng https://my.parachute.computer/agent/mcp/eng",
     );
+  });
+});
+
+describe("chat — listChannels / listMessages / sendMessage (Phase 4d)", () => {
+  it("listChannels GETs /agent/api/channels with the Bearer", async () => {
+    const fetchMock = fetchFn(async () =>
+      jsonResponse(200, { channels: [{ name: "eng", transport: "vault", vault: "default" }] }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await listChannels();
+    expect(res.channels[0]!.name).toBe("eng");
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/channels");
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer jwt-tok");
+  });
+
+  it("listMessages GETs /agent/api/channels/<encoded>/messages and parses messages", async () => {
+    const messages = [
+      { id: "n1", text: "hi", direction: "inbound", sender: "operator", ts: "2026-06-18T00:00:00Z" },
+    ];
+    const fetchMock = fetchFn(async () => jsonResponse(200, { messages }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await listMessages("eng team");
+    expect(res.messages).toHaveLength(1);
+    expect(res.messages[0]!.direction).toBe("inbound");
+    const [url] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/channels/eng%20team/messages");
+  });
+
+  it("sendMessage POSTs { text } to /agent/api/channels/<encoded>/send", async () => {
+    const fetchMock = fetchFn(async () => jsonResponse(200, { ok: true, id: "note-9" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await sendMessage("eng", "hello there");
+    expect(res.id).toBe("note-9");
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/agent/api/channels/eng/send");
+    expect(init?.method).toBe("POST");
+    expect(new Headers(init?.headers).get("content-type")).toBe("application/json");
+    expect(JSON.parse(String(init?.body))).toEqual({ text: "hello there" });
+  });
+
+  it("sendMessage re-mints + retries once on a 401, then succeeds", async () => {
+    getAgentToken.mockResolvedValueOnce("stale").mockResolvedValueOnce("fresh");
+    const fetchMock = fetchFn(async () => jsonResponse(200, { ok: true, id: "n" }));
+    fetchMock
+      .mockResolvedValueOnce(new Response("", { status: 401 }))
+      .mockResolvedValueOnce(jsonResponse(200, { ok: true, id: "n" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await sendMessage("eng", "x");
+    expect(clearCachedToken).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(new Headers(fetchMock.mock.calls[1]![1]?.headers).get("authorization")).toBe(
+      "Bearer fresh",
+    );
+    expect(res.ok).toBe(true);
+  });
+});
+
+describe("chat SSE URL builders (Phase 4d)", () => {
+  it("messageStreamUrl appends &token= under the agent mount (origin-relative)", () => {
+    // apiBase() is "/agent/api" in vitest → MOUNT "/agent".
+    expect(messageStreamUrl("eng", "jwt-abc")).toBe(
+      "/agent/ui/events?channel=eng&token=jwt-abc",
+    );
+  });
+
+  it("messageStreamUrl encodes the channel + token", () => {
+    expect(messageStreamUrl("eng team", "a/b c")).toBe(
+      "/agent/ui/events?channel=eng%20team&token=a%2Fb%20c",
+    );
+  });
+
+  it("messageStreamUrl omits the token when null (unguarded dev daemon)", () => {
+    expect(messageStreamUrl("eng", null)).toBe("/agent/ui/events?channel=eng");
+  });
+
+  it("turnEventsUrl appends ?token= under the agent mount (origin-relative)", () => {
+    expect(turnEventsUrl("eng", "jwt-abc")).toBe(
+      "/agent/api/channels/eng/turn-events?token=jwt-abc",
+    );
+  });
+
+  it("turnEventsUrl encodes the channel + token", () => {
+    expect(turnEventsUrl("eng team", "a/b")).toBe(
+      "/agent/api/channels/eng%20team/turn-events?token=a%2Fb",
+    );
+  });
+
+  it("turnEventsUrl omits the token when null", () => {
+    expect(turnEventsUrl("eng", null)).toBe("/agent/api/channels/eng/turn-events");
   });
 });

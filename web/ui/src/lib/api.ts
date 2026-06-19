@@ -519,3 +519,139 @@ export function connectSessionCommand(name: string, origin: string): string {
   // The URL path is the bare channel name (`/mcp/<name>`).
   return `claude mcp add --transport http --scope user agent-${name} ${origin}${mount}/mcp/${name}`;
 }
+
+// ---------------------------------------------------------------------------
+// Chat (Agent UI v2 — Phase 4d). Port the per-channel chat (the server-rendered
+// `/ui` HTML page) into the SPA as a Chat view. The endpoints below are the chat
+// surface the daemon already serves for the HTML page (verified against the
+// daemon handlers):
+//
+//   - GET  /api/channels                       — the channel picker (admin read).
+//   - GET  /api/channels/<ch>/messages         — the durable transcript
+//     (`agent:read`; daemon.ts ~3397, returns `{ messages: ChannelMessage[] }`,
+//     sorted ascending by ts — vault.ts:1072).
+//   - POST /api/channels/<ch>/send             — write the inbound + wake the turn
+//     (`agent:send`; daemon.ts ~3437, body `{ text }`, returns `{ ok, id }`).
+//   - GET  /ui/events?channel=<ch>&token=<jwt> — the message SSE (inbound/outbound
+//     deltas; `agent:read`, query-param token — http-ui.ts:168). Events:
+//     `reply` `{ id, text, files }`, `edit` `{ id, text }`, `permission` {...}.
+//   - GET  /api/channels/<ch>/turn-events?token=<jwt> — the PROGRAMMATIC turn
+//     streaming view (`agent:read`, query-param token — daemon.ts:3353). Event
+//     name `"turn"`; payload is the TurnLifecycleEvent union below.
+//
+// EventSource can't set an Authorization header, so the agent JWT rides as the
+// `token` QUERY PARAM (the `?token=` fallback the daemon opts these two SSE routes
+// into). The URLs are built ORIGIN-RELATIVE under the agent module mount
+// (`apiBase()` → `/agent/api`; MOUNT = drop the trailing `/api` → `/agent`) so
+// they resolve correctly BOTH daemon-direct and hub-proxied — mirroring how the
+// inline chat derives MOUNT from the page path (src/daemon.ts ~1194).
+// ---------------------------------------------------------------------------
+
+/**
+ * One channel from `GET /api/channels` (daemon.ts:2150-2160). NO secrets: only
+ * the name, the transport kind, and (for a vault transport) the vault name. The
+ * chat shows all channels but only a `vault` transport has a durable transcript +
+ * the daemon-level send/turn-events routes; non-vault channels use the ephemeral
+ * `/ui/events` message stream.
+ */
+export interface ChannelRow {
+  name: string;
+  transport: string;
+  vault?: string;
+}
+
+export interface ChannelsResponse {
+  channels: ChannelRow[];
+}
+
+/**
+ * One transcript message from `GET /api/channels/<ch>/messages`. Mirrors
+ * `ChannelMessage` in `src/transports/vault.ts:161-174` exactly. `direction`
+ * drives bubble placement: `inbound` (human→session) is "you" (right); `outbound`
+ * (session→human) is "them" (left) — the transport's meaning, not the chat's POV.
+ */
+export interface ChatMessage {
+  /** The vault note id — the chat dedups its render by this. */
+  id: string;
+  /** The message body (the note content). */
+  text: string;
+  /** `inbound` = human→session ("you"); `outbound` = session→human ("them"). */
+  direction: "inbound" | "outbound";
+  /** Who authored it (metadata.sender), e.g. "operator" / "session". */
+  sender: string;
+  /** ISO timestamp (metadata.ts) — the transcript is sorted ascending by this. */
+  ts: string;
+  /** The inbound note id this reply threads to (outbound only). */
+  inReplyTo?: string;
+}
+
+export interface MessagesResponse {
+  messages: ChatMessage[];
+}
+
+/** `POST /api/channels/<ch>/send` 200 response — `{ ok, id }` (the created note id). */
+export interface SendMessageResponse {
+  ok: boolean;
+  /** The created inbound note id — reconcile the optimistic echo against it. */
+  id: string;
+}
+
+/**
+ * The PROGRAMMATIC turn streaming event the daemon fans out on the `turn` SSE
+ * channel. Mirrors `TurnLifecycleEvent` in `src/backends/registry.ts:68-71` (the
+ * backend's `InterimTurnEvent` — init/text/tool — plus the registry-synthesized
+ * `done`/`error` lifecycle frames that bracket every turn so the live view never
+ * gets stuck "working").
+ */
+export type TurnEvent =
+  | { kind: "init"; sessionId: string }
+  | { kind: "text"; text: string }
+  | { kind: "tool"; tool: string }
+  | { kind: "done"; reply: string }
+  | { kind: "error"; error: string };
+
+/** List the configured channels (the chat's picker). */
+export function listChannels(): Promise<ChannelsResponse> {
+  return getJson<ChannelsResponse>("/channels");
+}
+
+/** Load a channel's durable transcript (sorted ascending by ts). `ch` is URL-encoded. */
+export function listMessages(ch: string): Promise<MessagesResponse> {
+  return getJson<MessagesResponse>(`/channels/${encodeURIComponent(ch)}/messages`);
+}
+
+/**
+ * Send a message to a vault channel — writes the inbound note + wakes the turn.
+ * `ch` is URL-encoded. Throws `HttpError` on a non-2xx (400 empty text, 401, 404
+ * unknown channel) so the chat surfaces the daemon's message inline.
+ */
+export function sendMessage(ch: string, text: string): Promise<SendMessageResponse> {
+  return postJson<SendMessageResponse>(`/channels/${encodeURIComponent(ch)}/send`, { text });
+}
+
+/**
+ * Build the message-stream SSE URL: `<MOUNT>/ui/events?channel=<ch>&token=<jwt>`.
+ * Origin-relative (under the agent mount) so it resolves daemon-direct AND
+ * hub-proxied. The token rides as `&token=` (the URL already has `?channel=`),
+ * matching the inline chat (src/daemon.ts:1496-1497). A falsy token is omitted —
+ * an unguarded dev daemon may accept the stream without one.
+ */
+export function messageStreamUrl(ch: string, token: string | null): string {
+  const mount = apiBase().replace(/\/api$/, "");
+  let url = `${mount}/ui/events?channel=${encodeURIComponent(ch)}`;
+  if (token) url += `&token=${encodeURIComponent(token)}`;
+  return url;
+}
+
+/**
+ * Build the turn-event SSE URL: `<MOUNT>/api/channels/<ch>/turn-events?token=<jwt>`.
+ * Origin-relative (under the agent mount) so it resolves daemon-direct AND
+ * hub-proxied. The token rides as `?token=` (the first param), matching the inline
+ * chat (src/daemon.ts:1356-1357). A falsy token is omitted.
+ */
+export function turnEventsUrl(ch: string, token: string | null): string {
+  const mount = apiBase().replace(/\/api$/, "");
+  let url = `${mount}/api/channels/${encodeURIComponent(ch)}/turn-events`;
+  if (token) url += `?token=${encodeURIComponent(token)}`;
+  return url;
+}
