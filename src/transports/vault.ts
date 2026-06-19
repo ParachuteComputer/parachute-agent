@@ -809,7 +809,11 @@ export class VaultTransport implements Transport {
     // registry enforces ONE agent per channel (byChannel index), so the collision can't
     // arise in practice.
     const safeName = (thread.name ?? thread.channel).replace(/[^a-zA-Z0-9_-]/g, "-");
-    const leaf = singleThreaded ? safeName : crypto.randomUUID();
+    // Multi-threaded leaf: a per-FIRE id. Reuse the caller's `threadId` when given (a
+    // re-record of the same turn — e.g. the outbound-failure status flip — targets the
+    // SAME per-fire note instead of minting a duplicate); else mint a fresh one. Single-
+    // threaded ignores it (deterministic name leaf so the one-per-channel note upserts).
+    const leaf = singleThreaded ? safeName : (thread.threadId ?? crypto.randomUUID());
     const path = `${THREAD_PATH_PREFIX}/${safeChannel}/${leaf}`;
 
     // For single-threaded UPSERT, read the existing thread note (by its deterministic
@@ -837,7 +841,10 @@ export class VaultTransport implements Transport {
       }
     }
 
-    const turnCount = singleThreaded ? priorTurnCount + 1 : 1;
+    // A re-record of the SAME turn (`sameTurn`) keeps the existing count — the first record
+    // already counted this turn; a status flip (ok→error on outbound-delivery failure) must
+    // not double-count it. A normal turn increments. Multi-threaded is always 1.
+    const turnCount = singleThreaded ? (thread.sameTurn ? priorTurnCount : priorTurnCount + 1) : 1;
     // `started_at` is set ONCE on create (preserve the prior on upsert); `last_turn_at`
     // advances every turn.
     const startedAt = priorStartedAt ?? thread.started_at;

@@ -349,6 +349,71 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(stored!.content).toContain("reply two");
   });
 
+  test("SINGLE-THREADED re-record of the SAME turn (sameTurn) flips status WITHOUT double-counting turn_count (PR #3 FIX 1)", async () => {
+    // The outbound-failure path: the turn was recorded `ok`, then the additive transcript
+    // write failed, so the same turn is re-recorded `error`. `sameTurn` must keep the count
+    // (the turn was already counted) — the reviewer caught the original re-record bumping it.
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    await t.writeThread({
+      channel: "eng", name: "eng", mode: "single-threaded", status: "ok",
+      input: "q", output: "a", started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:05.000Z", threadId: "t1",
+    });
+    expect(stored!.metadata.turn_count).toBe("1");
+    // Re-record the SAME turn as error (outbound delivery failed). sameTurn → no increment.
+    await t.writeThread({
+      channel: "eng", name: "eng", mode: "single-threaded", status: "error",
+      input: "q", output: "reply produced but NOT delivered", started_at: "2026-06-18T07:00:00.000Z",
+      ended_at: "2026-06-18T07:00:06.000Z", threadId: "t1", sameTurn: true,
+    });
+    expect(stored!.metadata.turn_count).toBe("1"); // NOT 2 — the same turn, not a new one.
+    expect(stored!.metadata.status).toBe("error");
+    expect(stored!.content).toContain("NOT delivered");
+  });
+
+  test("MULTI-THREADED re-record reuses the passed threadId leaf — ONE note, not a duplicate (PR #3 FIX 1)", async () => {
+    const patchPaths: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/api/notes/") && (init?.method ?? "GET") === "PATCH") {
+        patchPaths.push(decodeURIComponent(u));
+        return new Response(JSON.stringify({ id: "x" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const base = {
+      channel: "eng", name: "d", mode: "multi-threaded" as const,
+      input: "q", started_at: "2026-06-18T07:00:00.000Z", ended_at: "2026-06-18T07:00:05.000Z",
+      threadId: "fixed-uuid",
+    };
+    await t.writeThread({ ...base, status: "ok", output: "a" });
+    await t.writeThread({ ...base, status: "error", output: "undelivered", sameTurn: true });
+    // Both writes hit the SAME per-fire path (the reused threadId) — without the fix the
+    // second would mint a fresh uuid → a DIFFERENT path → a duplicate note for one turn.
+    const threadPatches = patchPaths.filter((p) => p.includes("/Threads/eng/"));
+    expect(threadPatches).toHaveLength(2);
+    expect(threadPatches[0]).toContain("/Threads/eng/fixed-uuid");
+    expect(threadPatches[1]).toContain("/Threads/eng/fixed-uuid");
+  });
+
   test("SINGLE-THREADED error on turn 2: turn_count==2, status:error, started_at preserved, last_turn_at advanced", async () => {
     // Same stored-note simulation as the two-turn test: turn 2 reads back turn 1's note.
     let stored: { metadata: Record<string, string>; content: string } | undefined;

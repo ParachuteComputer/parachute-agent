@@ -113,6 +113,17 @@ export interface ThreadNote {
   ended_at: string;
   /** Optional token/cost usage for observability. */
   usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
+  /**
+   * MULTI-threaded only: a stable per-TURN thread id (the per-fire note's leaf). The same
+   * id on a re-record (the outbound-failure status flip) reuses the SAME note instead of
+   * minting a duplicate. Single-threaded ignores it (deterministic name leaf).
+   */
+  threadId?: string;
+  /**
+   * Re-record of the SAME turn — single-threaded keeps `turn_count` (the turn was already
+   * counted by the first record); no effect on multi-threaded.
+   */
+  sameTurn?: boolean;
 }
 
 /**
@@ -430,6 +441,11 @@ export class ProgrammaticAgentRegistry {
       // multi-threaded writes one note per fire. Read the mode off the spec so the
       // thread note carries it (it's the indexed query axis + governs the upsert).
       const startedAt = new Date().toISOString();
+      // A stable per-TURN thread id, passed to every recordThread for this turn. For
+      // multi-threaded it's the per-fire note's leaf, so a re-record (the outbound-failure
+      // status flip below) updates the SAME note instead of minting a duplicate; single-
+      // threaded ignores it (deterministic name leaf). One uuid per turn.
+      const turnThreadId = crypto.randomUUID();
 
       let result;
       try {
@@ -452,7 +468,7 @@ export class ProgrammaticAgentRegistry {
         // thread note captures the turn outcome, so a failed turn is still a queryable
         // `status:error` (single-threaded upserts the rolling thread; multi-threaded writes
         // a per-fire note).
-        await this.recordThread(handle, msg, "error", reason, startedAt, undefined);
+        await this.recordThread(handle, msg, "error", reason, startedAt, undefined, { threadId: turnThreadId });
         this.emitTurnEvent(channel, { kind: "error", error: reason });
         continue;
       }
@@ -467,7 +483,7 @@ export class ProgrammaticAgentRegistry {
         // BOTH modes record the failed turn (status:error) on the thread note so a failure
         // always leaves a queryable trace (single-threaded upserts the rolling thread,
         // marking it errored; multi-threaded writes a per-fire status:error note).
-        await this.recordThread(handle, msg, "error", result.error, startedAt, undefined);
+        await this.recordThread(handle, msg, "error", result.error, startedAt, undefined, { threadId: turnThreadId });
         this.emitTurnEvent(channel, { kind: "error", error: result.error });
         continue;
       }
@@ -480,7 +496,7 @@ export class ProgrammaticAgentRegistry {
       // multi-threaded writes the per-fire note. Best-effort: a thread-note failure is
       // logged + the turn still resolves (we never re-run a `claude -p` turn — that would
       // burn quota for a duplicate).
-      await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage);
+      await this.recordThread(handle, msg, "ok", result.reply ?? "", startedAt, result.usage, { threadId: turnThreadId });
 
       // The outbound reply — the channel-transcript delivery (the chat bubble). It is
       // ADDITIVE to the primary thread-note record already written above (for BOTH modes).
@@ -504,6 +520,10 @@ export class ProgrammaticAgentRegistry {
             `parachute-agent: programmatic outbound write for channel "${channel}" failed ` +
               `after ${OUTBOUND_MAX_RETRIES} retries: ${delivered.error}`,
           );
+          // RE-RECORD the SAME turn as status:error — reuse the per-turn thread id +
+          // `sameTurn` so this updates the note the `ok` record above just wrote (one
+          // note, no turn_count double-count) rather than minting a duplicate / advancing
+          // the count (the FIX-1 re-record bug the reviewer caught).
           await this.recordThread(
             handle,
             msg,
@@ -512,6 +532,7 @@ export class ProgrammaticAgentRegistry {
               `Undelivered reply text: ${result.reply}`,
             startedAt,
             result.usage,
+            { threadId: turnThreadId, sameTurn: true },
           );
           this.emitTurnEvent(channel, {
             kind: "error",
@@ -548,6 +569,7 @@ export class ProgrammaticAgentRegistry {
     output: string,
     startedAt: string,
     usage: ThreadNote["usage"],
+    opts: { threadId?: string; sameTurn?: boolean } = {},
   ): Promise<void> {
     if (!this.writeThread) return;
     const thread: ThreadNote = {
@@ -561,6 +583,11 @@ export class ProgrammaticAgentRegistry {
       started_at: startedAt,
       ended_at: new Date().toISOString(),
       ...(usage ? { usage } : {}),
+      // The per-turn thread id (stable across an ok→error re-record) + the same-turn flag,
+      // so a re-record updates the SAME note without minting a duplicate (multi) or
+      // double-counting turn_count (single).
+      ...(opts.threadId ? { threadId: opts.threadId } : {}),
+      ...(opts.sameTurn ? { sameTurn: true } : {}),
     };
     try {
       await this.writeThread(thread);
