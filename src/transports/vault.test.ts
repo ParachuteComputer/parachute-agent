@@ -26,7 +26,7 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
-import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG } from "./vault.ts";
+import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, InboundClaimConflictError } from "./vault.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
 
@@ -1299,5 +1299,147 @@ describe("VaultTransport — scheduled-job notes (vault-native store)", () => {
     globalThis.fetch = (async () => new Response("no", { status: 404 })) as unknown as typeof fetch;
     const t = new VaultTransport(baseConfig());
     await expect(t.deleteJobNote("job-1")).rejects.toThrow(/delete job failed \(404\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Channel-queue inbound notes — FIX 3 (CAS claim) + FIX 6 (handled exclusion).
+// ---------------------------------------------------------------------------
+
+describe("VaultTransport — listInboundQueue", () => {
+  test("FIX 6: EXCLUDES handled notes so pending is never crowded out past the cap", async () => {
+    // The vault returns many `handled` notes plus one still-`pending` note. The handled
+    // ones must be dropped client-side so the pending one is always in the returned queue.
+    const handled = Array.from({ length: 50 }, (_, i) => ({
+      id: `h${i}`,
+      content: `handled ${i}`,
+      metadata: { channel: "eng", direction: "inbound", sender: "operator", ts: `2026-01-01T00:${String(i).padStart(2, "0")}:00Z`, status: "handled" },
+      updated_at: `2026-01-01T01:00:00Z`,
+    }));
+    const pending = {
+      id: "p1",
+      content: "still pending",
+      metadata: { channel: "eng", direction: "inbound", sender: "operator", ts: "2026-01-02T00:00:00Z", status: "pending" },
+      updated_at: "2026-01-02T00:00:00Z",
+    };
+    let listUrl = "";
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const u = String(url);
+      // start() fires ensureSchema PUTs (.../api/tags/*); only capture the list GET.
+      if (u.includes("/api/notes?")) {
+        listUrl = u;
+        return new Response(JSON.stringify([...handled, pending]), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const queue = await t.listInboundQueue();
+    // No handled notes survive; the pending one IS present.
+    expect(queue.every((n) => n.status !== "handled")).toBe(true);
+    expect(queue.map((n) => n.id)).toEqual(["p1"]);
+    expect(queue[0]!.status).toBe("pending");
+    // The list request asks the vault NEWEST-first (so a hard cap drops the oldest
+    // handled notes, never a recent pending).
+    expect(listUrl).toContain("sort=desc");
+  });
+
+  test("FIX 6: in-flight notes are KEPT (only handled is excluded)", async () => {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify([
+          { id: "a", content: "p", metadata: { channel: "eng", ts: "t1", status: "pending" }, updated_at: "u1" },
+          { id: "b", content: "f", metadata: { channel: "eng", ts: "t2", status: "in-flight", claimedAt: "c2" }, updated_at: "u2" },
+          { id: "c", content: "h", metadata: { channel: "eng", ts: "t3", status: "handled" }, updated_at: "u3" },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const queue = await t.listInboundQueue();
+    expect(queue.map((n) => n.id)).toEqual(["a", "b"]);
+    expect(queue.find((n) => n.id === "b")!.status).toBe("in-flight");
+  });
+
+  test("FIX 3: threads the note's updated_at through as updatedAt (the CAS precondition)", async () => {
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify([
+          { id: "n1", content: "hi", metadata: { channel: "eng", ts: "t1", status: "pending" }, updated_at: "2026-06-01T00:00:00Z" },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const queue = await t.listInboundQueue();
+    expect(queue[0]!.updatedAt).toBe("2026-06-01T00:00:00Z");
+  });
+});
+
+describe("VaultTransport — setInboundStatus (FIX 3 compare-and-swap claim)", () => {
+  test("with ifUpdatedAt: sends if_updated_at (NOT force) as the precondition", async () => {
+    let body: any;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.setInboundStatus("n1", "in-flight", "2026-06-01T00:00:01Z", "2026-06-01T00:00:00Z");
+    expect(body.if_updated_at).toBe("2026-06-01T00:00:00Z");
+    expect(body.force).toBeUndefined();
+    expect(body.metadata.status).toBe("in-flight");
+    expect(body.metadata.claimedAt).toBe("2026-06-01T00:00:01Z");
+  });
+
+  test("without ifUpdatedAt: keeps the last-write-wins force:true (release/handled/sweep)", async () => {
+    let body: any;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      body = JSON.parse(String(init?.body));
+      return new Response(null, { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.setInboundStatus("n1", "handled", null);
+    expect(body.force).toBe(true);
+    expect(body.if_updated_at).toBeUndefined();
+  });
+
+  test("a 409 (stale precondition) on a CAS write throws InboundClaimConflictError", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error_type: "conflict" }), { status: 409 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await expect(
+      t.setInboundStatus("n1", "in-flight", "now", "stale-updated-at"),
+    ).rejects.toBeInstanceOf(InboundClaimConflictError);
+  });
+
+  test("a 428 (precondition required) on a CAS write also throws InboundClaimConflictError", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "precondition_required" }), { status: 428 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await expect(
+      t.setInboundStatus("n1", "in-flight", "now", "some-updated-at"),
+    ).rejects.toBeInstanceOf(InboundClaimConflictError);
+  });
+
+  test("a 409 on a NON-CAS write (no ifUpdatedAt) throws a plain Error, not a conflict", async () => {
+    globalThis.fetch = (async () =>
+      new Response("conflict", { status: 409 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    const err = await t.setInboundStatus("n1", "handled", null).catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(InboundClaimConflictError);
+  });
+
+  test("a 500 on a CAS write throws a plain Error (a real failure, not a lost race)", async () => {
+    globalThis.fetch = (async () =>
+      new Response("boom", { status: 500 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    const err = await t.setInboundStatus("n1", "in-flight", "now", "u1").catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(InboundClaimConflictError);
   });
 });
