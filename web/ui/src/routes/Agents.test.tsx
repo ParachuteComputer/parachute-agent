@@ -301,9 +301,34 @@ describe("Agents — edit a def (Phase 4a)", () => {
     await waitFor(() => expect(editAgentDef).toHaveBeenCalledTimes(1));
     expect(editAgentDef).toHaveBeenCalledWith("note-1", {
       systemPrompt: "New body",
-      metadata: { mode: "multi-threaded" },
+      // `model` is ALWAYS sent (here "" — the def had none) so switching back to
+      // Default overwrites a prior value.
+      metadata: { mode: "multi-threaded", model: "" },
       wants: "vault:x:read",
     });
+  });
+
+  it("pre-fills the model from the full def and sends the changed model in metadata", async () => {
+    openEdit();
+    getAgentDef.mockResolvedValue({
+      def: fullDef({ name: "alpha", mode: "single-threaded", systemPrompt: "Body", model: "opus" }),
+    });
+    editAgentDef.mockResolvedValue({ ok: true, def: defRow({ name: "alpha" }) });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    fireEvent.click(await screen.findByTestId("edit-agent"));
+    const form = await screen.findByTestId("edit-agent-form");
+    const select = within(form).getByTestId("edit-model") as HTMLSelectElement;
+    // Pre-filled from the def.
+    expect(select.value).toBe("opus");
+
+    // Switch to sonnet + save.
+    fireEvent.change(select, { target: { value: "sonnet" } });
+    fireEvent.click(within(form).getByRole("button", { name: /save changes/i }));
+
+    await waitFor(() => expect(editAgentDef).toHaveBeenCalledTimes(1));
+    expect(editAgentDef.mock.calls[0]?.[1]?.metadata).toMatchObject({ model: "sonnet" });
   });
 
   it("surfaces a load error with a retry", async () => {

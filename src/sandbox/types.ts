@@ -290,6 +290,17 @@ export interface AgentSpec {
    */
   backend?: AgentBackendKind;
   /**
+   * Which model the PROGRAMMATIC backend runs the turn on — passed verbatim to
+   * `claude -p --model <value>`. Accepts a Claude Code alias (`opus` / `sonnet` /
+   * `haiku`) or a full model id (e.g. `claude-opus-4-8`). Unset → no `--model`
+   * flag, so the turn inherits Claude Code's own default (Sonnet today). Only the
+   * programmatic backend reads this (a `channel`-backend turn runs in the
+   * operator's own session, whose model the operator controls). Set from the def's
+   * `metadata.model`; persisted in spec.json. NOT shell-interpolated — it's a
+   * discrete argv element, so an arbitrary string can't inject.
+   */
+  model?: string;
+  /**
    * Per-channel system prompt — the operator gives the channel a specific role,
    * backend-visible, so the agent gets strong specificity decoupled from the
    * workspace + CLAUDE.md (design 2026-06-16-channel-system-prompt.md). Set when

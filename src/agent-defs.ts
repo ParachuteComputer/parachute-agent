@@ -317,6 +317,21 @@ export function parseAgentDef(note: {
     }
   }
 
+  // Model (optional) — passed to `claude -p --model` by the programmatic backend.
+  // A CC alias (`opus`/`sonnet`/`haiku`) or a full id (`claude-opus-4-8`). We
+  // validate only the CHARSET (no membership list — models evolve), so a typo'd-
+  // but-wellformed value still reaches `--model` and the turn errors clearly,
+  // while a malformed value (spaces/control chars) fails fast as a def error.
+  const model = metaStr(meta.model);
+  if (model !== undefined && model.length > 0) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/.test(model)) {
+      throw new AgentDefParseError(
+        `#agent/definition note ${noteId}: model "${model}" is not a valid model name (letters, numbers, dot, underscore, colon, dash)`,
+      );
+    }
+    spec.model = model;
+  }
+
   // Working directory (optional absolute host cwd). We do NOT statSync here (parse is
   // pure + may run on a box where the dir is mounted differently); the spawn path's
   // own checks apply when the turn runs.
@@ -693,6 +708,8 @@ interface LiveDef {
   pending: string[];
   /** Structured `wants:` connection keys (surfaced for the UI; never a secret). */
   wants: string[];
+  /** The model the programmatic backend runs turns on (from `metadata.model`); unset = CC default. */
+  model?: string;
 }
 
 /**
@@ -719,6 +736,8 @@ export interface AgentDefDetail {
   systemPromptPreview: string;
   /** Structured `wants:` connection keys the agent declared (empty when own-vault only). */
   wants: string[];
+  /** The model the programmatic backend runs turns on (e.g. `opus`); undefined = CC default. */
+  model?: string;
   /** The wake channel inbound routes to this agent on (== name). */
   channel: string;
 }
@@ -747,6 +766,8 @@ export interface AgentDefFull {
   mode: AgentMode;
   /** Structured `wants:` connection keys the agent declared (empty when own-vault only). */
   wants: string[];
+  /** The model the programmatic backend runs turns on (e.g. `opus`); undefined = CC default. */
+  model?: string;
   /** The FULL system prompt — the whole note body (NOT truncated). */
   systemPrompt: string;
   /** The resolved liveness status (`enabled` | `pending` | `error`). */
@@ -879,6 +900,7 @@ export class AgentDefRegistry {
         pending: [...d.pending],
         systemPromptPreview: d.systemPromptPreview,
         wants: [...d.wants],
+        ...(d.model ? { model: d.model } : {}),
         channel: d.name, // agent ≡ channel.
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
@@ -942,6 +964,7 @@ export class AgentDefRegistry {
       pending: [...d.pending],
       systemPromptPreview: d.systemPromptPreview,
       wants: [...d.wants],
+      ...(d.model ? { model: d.model } : {}),
       channel: d.name,
     };
   }
@@ -996,6 +1019,7 @@ export class AgentDefRegistry {
       vault: detail.vault,
       mode: detail.mode,
       wants: [...detail.wants],
+      ...(detail.model ? { model: detail.model } : {}),
       systemPrompt: typeof note.content === "string" ? note.content : "",
       status: detail.status,
     };
@@ -1403,6 +1427,7 @@ export class AgentDefRegistry {
       systemPromptPreview,
       pending: pending ?? [],
       wants: def.wants.map((c) => connectionKey(c)),
+      ...(def.spec.model ? { model: def.spec.model } : {}),
     });
     // Track this note in the per-vault seen set (a confident, freshly-parsed read) so the
     // removed-def diff (loadAll) and the reload-delete path both address it by name. This

@@ -32,6 +32,7 @@ import {
   HttpError,
   listAgentVaults,
 } from "../lib/api.ts";
+import { MODEL_OPTIONS } from "../lib/models.ts";
 
 /**
  * The name field must be a slug. Mirrors the daemon's canonical `NAME_SLUG_RE`
@@ -60,6 +61,7 @@ export function CreateAgent({ vaults }: CreateAgentProps) {
   const [vault, setVault] = useState(vaults[0]?.vault ?? "");
   const [mode, setMode] = useState<AgentMode>("single-threaded");
   const [backend, setBackend] = useState<CreatableBackend>("programmatic");
+  const [model, setModel] = useState("");
   const [systemPrompt, setSystemPrompt] = useState("");
   const [wants, setWants] = useState("");
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -79,8 +81,9 @@ export function CreateAgent({ vaults }: CreateAgentProps) {
         name,
         backend,
         systemPrompt,
-        // `mode` is NOT a top-level field — it rides in metadata.
-        metadata: { mode },
+        // `mode` + `model` are NOT top-level fields — they ride in metadata.
+        // Omit `model` when "Default" so no `--model` flag is forced.
+        metadata: { mode, ...(model ? { model } : {}) },
         // Only send `wants` when the operator entered something.
         ...(wants.trim().length > 0 ? { wants: wants.trim() } : {}),
       });
@@ -214,6 +217,27 @@ export function CreateAgent({ vaults }: CreateAgentProps) {
             testid="backend-channel"
           />
         </fieldset>
+
+        {/* Model — rides in metadata.model → `claude -p --model` (programmatic). */}
+        <div className="field">
+          <label htmlFor="agent-model">Model</label>
+          <select
+            id="agent-model"
+            value={model}
+            data-testid="agent-model"
+            onChange={(e) => setModel(e.target.value)}
+          >
+            {MODEL_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+          <p className="field-hint">
+            Which model Parachute runs this agent on (programmatic backend). A channel-backend
+            agent uses whatever model your own session runs.
+          </p>
+        </div>
 
         {/* System prompt → body.systemPrompt */}
         <div className="field">

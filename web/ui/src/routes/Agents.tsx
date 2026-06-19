@@ -55,6 +55,7 @@ import {
   listConnections,
   teardownDefReloadConnections,
 } from "../lib/hub.ts";
+import { MODEL_OPTIONS, modelLabel } from "../lib/models.ts";
 
 type LoadState =
   | { kind: "loading" }
@@ -345,6 +346,8 @@ export function AgentDetail({
         <dd>{agent.live ? "yes" : "no (defined, not instantiated)"}</dd>
         {def ? (
           <>
+            <dt>Model</dt>
+            <dd data-testid="detail-model">{modelLabel(def.model)}</dd>
             <dt>Def status</dt>
             <dd>{def.status}</dd>
           </>
@@ -466,6 +469,7 @@ export function EditAgentForm({
   const [load, setLoad] = useState<LoadState>({ kind: "loading" });
   const [systemPrompt, setSystemPrompt] = useState("");
   const [mode, setMode] = useState<AgentMode>("single-threaded");
+  const [model, setModel] = useState("");
   const [wants, setWants] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -477,6 +481,7 @@ export function EditAgentForm({
       const d = res.def;
       setSystemPrompt(d.systemPrompt);
       setMode(d.mode);
+      setModel(d.model ?? "");
       setWants(d.wants.join(", "));
       setLoad({ kind: "ready", systemPrompt: d.systemPrompt, mode: d.mode, wants: d.wants.join(", ") });
     } catch (err) {
@@ -502,9 +507,11 @@ export function EditAgentForm({
     try {
       await editAgentDef(noteId, {
         systemPrompt,
-        // `mode` rides in metadata.mode (same as create). `wants` is the comma-string;
-        // send "" to clear when the operator emptied it (the daemon merges metadata).
-        metadata: { mode },
+        // `mode` + `model` ride in metadata (same as create). ALWAYS send `model`
+        // (even "") so switching back to Default overwrites a prior value — the
+        // daemon merges metadata, and an empty model parses as "no --model flag".
+        // `wants` is the comma-string; send "" to clear when emptied.
+        metadata: { mode, model },
         wants: wants.trim(),
       });
       onSaved();
@@ -570,6 +577,27 @@ export function EditAgentForm({
               testid="edit-mode-multi-threaded"
             />
           </fieldset>
+
+          {/* Model → metadata.model (programmatic `claude -p --model`). */}
+          <div className="field">
+            <label htmlFor="edit-model">Model</label>
+            <select
+              id="edit-model"
+              value={model}
+              data-testid="edit-model"
+              onChange={(e) => setModel(e.target.value)}
+            >
+              {MODEL_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <p className="field-hint">
+              Which model Parachute runs this agent on (programmatic backend). A channel-backend
+              agent uses whatever model your own session runs.
+            </p>
+          </div>
 
           {/* System prompt → body (the FULL note body). */}
           <div className="field">

@@ -195,6 +195,8 @@ export interface AgentDefRow {
   systemPromptPreview: string;
   /** Structured `wants:` connection keys (empty when own-vault only). */
   wants: string[];
+  /** The model the programmatic backend runs turns on (e.g. `opus`); absent = CC default. */
+  model?: string;
   /** The wake channel inbound routes to this agent on (== name). */
   channel: string;
 }
@@ -294,6 +296,8 @@ export interface AgentDefFull {
   mode: AgentMode;
   /** Structured `wants:` connection keys (empty when own-vault only). */
   wants: string[];
+  /** The model the programmatic backend runs turns on (e.g. `opus`); absent = CC default. */
+  model?: string;
   /** The FULL system prompt — the whole note body (NOT truncated). */
   systemPrompt: string;
   status: AgentDefStatus;
