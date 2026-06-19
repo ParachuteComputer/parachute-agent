@@ -608,3 +608,36 @@ button.button-danger:disabled {
 .inline-form {
   margin: 0.75rem 0 1rem;
 }
+
+/* ---- Schedules (Phase 4b): the per-agent schedule section in the detail panel ---- */
+.schedules {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-light);
+}
+.schedules .section-head h3 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+/* The cron quick-fill preset buttons under the cron input. */
+.schedule-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.45rem;
+}
+.schedule-presets button {
+  font-size: 0.78rem;
+  padding: 0.2rem 0.55rem;
+}
+/* The run-now / delete buttons in a schedule row. */
+.schedule-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+.schedule-status {
+  font-size: 0.82rem;
+  color: var(--fg-muted);
+  margin: 0.5rem 0 0;
+}

@@ -21,6 +21,10 @@ vi.mock("../lib/api.ts", async (orig) => {
     deleteAgentDef: vi.fn(),
     addAgentVault: vi.fn(),
     removeAgentVault: vi.fn(),
+    listJobs: vi.fn(),
+    createJob: vi.fn(),
+    runJob: vi.fn(),
+    deleteJob: vi.fn(),
   };
 });
 
@@ -32,6 +36,10 @@ const editAgentDef = vi.mocked(api.editAgentDef);
 const deleteAgentDef = vi.mocked(api.deleteAgentDef);
 const addAgentVault = vi.mocked(api.addAgentVault);
 const removeAgentVault = vi.mocked(api.removeAgentVault);
+const listJobs = vi.mocked(api.listJobs);
+const createJob = vi.mocked(api.createJob);
+const runJob = vi.mocked(api.runJob);
+const deleteJob = vi.mocked(api.deleteJob);
 
 function agentRow(over: Partial<api.AgentRow> = {}): api.AgentRow {
   return {
@@ -75,11 +83,25 @@ function fullDef(over: Partial<api.AgentDefFull> = {}): api.AgentDefFull {
   };
 }
 
+function jobRow(over: Partial<api.JobRow> = {}): api.JobRow {
+  return {
+    id: "morning-standup",
+    noteId: "Channels/alpha/jobs/morning-standup",
+    channel: "alpha",
+    message: "Run the morning weave.",
+    schedule: { cron: "0 8 * * *" },
+    enabled: true,
+    createdAt: "2026-06-17T00:00:00.000Z",
+    ...over,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   listAgents.mockResolvedValue({ agents: [] });
   listAgentDefs.mockResolvedValue({ defs: [] });
   listAgentVaults.mockResolvedValue({ vaults: [] });
+  listJobs.mockResolvedValue({ jobs: [] });
 });
 
 afterEach(() => {
@@ -348,5 +370,100 @@ describe("Def-vaults — add / remove (Phase 4a)", () => {
     expect(removeAgentVault).not.toHaveBeenCalled();
     fireEvent.click(await screen.findByTestId("remove-def-vault-confirm-research"));
     await waitFor(() => expect(removeAgentVault).toHaveBeenCalledWith("research"));
+  });
+});
+
+describe("Schedules — per-agent jobs in the detail panel (Phase 4b)", () => {
+  /** Open the detail panel of a vault-backed (channel) agent named "alpha". */
+  function openVaultAgent() {
+    listAgents.mockResolvedValue({
+      agents: [agentRow({ name: "alpha", backend: "channel", channel: "alpha", vault: "default" })],
+    });
+    listAgentDefs.mockResolvedValue({ defs: [defRow({ name: "alpha", channel: "alpha" })] });
+  }
+
+  it("lists this agent's jobs, filtered by channel", async () => {
+    openVaultAgent();
+    listJobs.mockResolvedValue({
+      jobs: [
+        jobRow({ id: "mine", channel: "alpha", lastStatus: "ok", nextRunAt: "2026-06-20T08:00:00.000Z" }),
+        jobRow({ id: "theirs", channel: "other" }), // a different agent's job — filtered out
+      ],
+    });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    const section = await screen.findByTestId("schedules-section");
+    expect(within(section).getByTestId("schedule-row-mine")).toBeInTheDocument();
+    expect(within(section).queryByTestId("schedule-row-theirs")).not.toBeInTheDocument();
+    expect(within(section).getByText("ok")).toBeInTheDocument();
+  });
+
+  it("is ABSENT for a channel-less (interactive) agent", async () => {
+    listAgents.mockResolvedValue({ agents: [agentRow({ name: "tmux", backend: "interactive" })] });
+    listAgentDefs.mockResolvedValue({ defs: [] });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-tmux"));
+    await screen.findByTestId("agent-detail");
+    expect(screen.queryByTestId("schedules-section")).not.toBeInTheDocument();
+  });
+
+  it("shows the empty state when this agent has no jobs", async () => {
+    openVaultAgent();
+    listJobs.mockResolvedValue({ jobs: [jobRow({ id: "theirs", channel: "other" })] });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    expect(await screen.findByTestId("schedules-empty")).toBeInTheDocument();
+  });
+
+  it("create calls createJob with the right body, scoped to the agent's channel", async () => {
+    openVaultAgent();
+    createJob.mockResolvedValue({ ok: true, job: jobRow({ id: "weave" }) });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    fireEvent.click(await screen.findByTestId("add-schedule-toggle"));
+    const form = await screen.findByTestId("schedule-form");
+    fireEvent.change(within(form).getByLabelText(/job id/i), { target: { value: "weave" } });
+    fireEvent.change(within(form).getByLabelText(/message to send/i), { target: { value: "  do the weave  " } });
+    fireEvent.change(within(form).getByLabelText(/cron/i), { target: { value: "0 8 * * *" } });
+    fireEvent.change(within(form).getByLabelText(/timezone/i), { target: { value: "UTC" } });
+    fireEvent.click(within(form).getByRole("button", { name: /create schedule/i }));
+
+    await waitFor(() => expect(createJob).toHaveBeenCalledTimes(1));
+    expect(createJob).toHaveBeenCalledWith({
+      id: "weave",
+      channel: "alpha",
+      message: "do the weave", // trimmed
+      schedule: { cron: "0 8 * * *", tz: "UTC" },
+      enabled: true,
+    });
+  });
+
+  it("run-now calls runJob with the job id", async () => {
+    openVaultAgent();
+    listJobs.mockResolvedValue({ jobs: [jobRow({ id: "mine", channel: "alpha" })] });
+    runJob.mockResolvedValue({ ok: true, id: "mine", status: "ok" });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    fireEvent.click(await screen.findByTestId("schedule-run-mine"));
+    await waitFor(() => expect(runJob).toHaveBeenCalledWith("mine"));
+  });
+
+  it("delete requires a confirm, then calls deleteJob", async () => {
+    openVaultAgent();
+    listJobs.mockResolvedValue({ jobs: [jobRow({ id: "mine", channel: "alpha" })] });
+    deleteJob.mockResolvedValue({ ok: true, id: "mine", removed: true });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("agent-row-alpha"));
+    // First click arms the confirm; the actual delete fires only on the confirm button.
+    fireEvent.click(await screen.findByTestId("schedule-delete-mine"));
+    expect(deleteJob).not.toHaveBeenCalled();
+    fireEvent.click(await screen.findByTestId("schedule-delete-confirm-mine"));
+    await waitFor(() => expect(deleteJob).toHaveBeenCalledWith("mine"));
   });
 });

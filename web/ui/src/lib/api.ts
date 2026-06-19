@@ -400,6 +400,109 @@ export function removeAgentVault(name: string): Promise<RemoveAgentVaultResponse
   return deleteJson<RemoveAgentVaultResponse>(`/agent-vaults/${encodeURIComponent(name)}`);
 }
 
+// ---------------------------------------------------------------------------
+// Scheduled jobs (Agent UI v2 — Phase 4b). A job is "an automated human": send a
+// message to a vault-backed agent on a cron schedule (design 2026-06-17). The SPA
+// folds the per-agent schedule management into the agent detail panel; these wrap
+// the daemon's `/api/jobs*` routes (all `agent:admin`, the same Bearer the rest of
+// the SPA uses). Shapes mirror `Job` in `src/jobs.ts` + the daemon's GET handler
+// (`src/daemon.ts` ~2261-2284 — it appends a computed `nextRunAt` for enabled jobs).
+// ---------------------------------------------------------------------------
+
+/** A job's schedule: a 5-field cron expr + optional IANA tz. Mirrors `JobSchedule`. */
+export interface JobSchedule {
+  /** 5-field cron: `min hour dom mon dow`. */
+  cron: string;
+  /** IANA timezone (optional — daemon-local when absent). */
+  tz?: string;
+}
+
+/**
+ * One scheduled job from `GET /api/jobs`. Mirrors `Job` in `src/jobs.ts` as the
+ * daemon emits it: `id` is the operator slug (the key the run/delete `:id` routes
+ * match on — NOT the vault note path); `nextRunAt` is computed in-memory by the
+ * daemon for ENABLED jobs only (absent for disabled jobs / when tz parsing fails).
+ */
+export interface JobRow {
+  /** The operator-facing slug — addresses the job in `/api/jobs/:id`. */
+  id: string;
+  /** The vault note id/path (informational; the run/delete routes key off `id`). */
+  noteId?: string;
+  /** The target vault channel (== the agent's channel). */
+  channel: string;
+  /** The message injected as the inbound note when the job fires. */
+  message: string;
+  /** When to fire. */
+  schedule: JobSchedule;
+  /** Whether the runner considers this job. */
+  enabled: boolean;
+  /** ISO timestamp the job was created. */
+  createdAt: string;
+  /** ISO timestamp of the most recent fire (set by the runner). */
+  lastRunAt?: string;
+  /** "ok" / "error: …" from the most recent fire. */
+  lastStatus?: string;
+  /** ISO timestamp of the next scheduled fire — computed by the daemon for enabled jobs. */
+  nextRunAt?: string;
+}
+
+export interface JobsResponse {
+  jobs: JobRow[];
+}
+
+/**
+ * The `POST /api/jobs` request body. Mirrors the daemon handler (`src/daemon.ts`
+ * ~2287-2308): `enabled` defaults true daemon-side when omitted. A POST with an
+ * existing `id` UPSERTS (replaces) the job in place.
+ */
+export interface CreateJobBody {
+  id: string;
+  channel: string;
+  message: string;
+  schedule: JobSchedule;
+  enabled?: boolean;
+}
+
+/** `POST /api/jobs` 200 response — the persisted job (with its `noteId` filled in). */
+export interface CreateJobResponse {
+  ok: boolean;
+  job: JobRow;
+}
+
+/** `POST /api/jobs/:id/run` 200 response — the fire-now result. */
+export interface RunJobResponse {
+  ok: boolean;
+  id: string;
+  status: string;
+}
+
+/** `DELETE /api/jobs/:id` 200 response. */
+export interface DeleteJobResponse {
+  ok: boolean;
+  id: string;
+  removed: boolean;
+}
+
+/** List every scheduled job across the live vault channels. */
+export function listJobs(): Promise<JobsResponse> {
+  return getJson<JobsResponse>("/jobs");
+}
+
+/** Create (or upsert by `id`) a scheduled job. Throws `HttpError` on a non-2xx. */
+export function createJob(body: CreateJobBody): Promise<CreateJobResponse> {
+  return postJson<CreateJobResponse>("/jobs", body);
+}
+
+/** Fire a job now. The `id` is URL-encoded (it may be a slug or a path). */
+export function runJob(id: string): Promise<RunJobResponse> {
+  return postJson<RunJobResponse>(`/jobs/${encodeURIComponent(id)}/run`, {});
+}
+
+/** Delete a scheduled job by `id` (URL-encoded). Throws `HttpError` on a non-2xx. */
+export function deleteJob(id: string): Promise<DeleteJobResponse> {
+  return deleteJson<DeleteJobResponse>(`/jobs/${encodeURIComponent(id)}`);
+}
+
 /**
  * The `claude mcp add` one-liner a channel-backend agent's operator runs to
  * connect their own Claude Code session to the channel's MCP endpoint. Mirrors

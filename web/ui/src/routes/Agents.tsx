@@ -33,15 +33,20 @@ import {
   type AgentMode,
   type AgentRow,
   type AgentVaultRow,
+  type JobRow,
   addAgentVault,
+  createJob,
   deleteAgentDef,
+  deleteJob,
   editAgentDef,
   getAgentDef,
   HttpError,
   listAgentDefs,
   listAgentVaults,
   listAgents,
+  listJobs,
   removeAgentVault,
+  runJob,
 } from "../lib/api.ts";
 
 type LoadState =
@@ -390,6 +395,12 @@ export function AgentDetail({
         </p>
       ) : null}
 
+      {/* Schedules — only for a vault-native (channel-backed) agent: a scheduled
+          job is "an automated human" that injects an inbound note on a cron, and
+          the inject path only exists for a vault transport. Interactive /
+          channel-less agents can't be scheduled, so the section is absent. */}
+      {agent.channel ? <SchedulesSection channel={agent.channel} /> : null}
+
       {/* Edit / delete — only for a vault-native def (a note we can mutate). */}
       {noteId ? (
         mode === "delete" ? (
@@ -678,6 +689,378 @@ export function DeleteAgentConfirm({
       </div>
     </div>
   );
+}
+
+/**
+ * The per-agent Schedules section (Agent UI v2 — Phase 4b). Folds the runner's
+ * schedule management — formerly the separate server-rendered `/jobs` page — into
+ * the agent detail panel for a vault-backed agent. It lists THIS agent's jobs
+ * (the daemon's `GET /api/jobs` returns every job across all vault channels; we
+ * client-filter by `channel` — the same index-free filter the daemon's store does,
+ * since there's no per-channel jobs endpoint), and offers create / run-now / delete
+ * with the same inline-form + confirm idioms as Phase 4a. Mirrors the operator
+ * affordances of `src/jobs-ui.ts` (cron + tz inputs, presets, run-now, last-status).
+ */
+export function SchedulesSection({ channel }: { channel: string }) {
+  type LoadState =
+    | { kind: "loading" }
+    | { kind: "error"; message: string }
+    | { kind: "ok"; jobs: JobRow[] };
+  const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const [addOpen, setAddOpen] = useState(false);
+  // The job currently being run / in delete-confirm — keyed by id so a row's
+  // spinner/confirm is scoped to that row.
+  const [running, setRunning] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<string | null>(null);
+  const [rowStatus, setRowStatus] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setState({ kind: "loading" });
+    try {
+      const res = await listJobs();
+      // Client-filter by channel — `GET /api/jobs` returns ALL vault channels'
+      // jobs (no per-channel endpoint), so we keep only this agent's.
+      const jobs = res.jobs.filter((j) => j.channel === channel);
+      setState({ kind: "ok", jobs });
+    } catch (err) {
+      setState({ kind: "error", message: errMessage(err) });
+    }
+  }, [channel]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function onRun(id: string) {
+    setRunning(id);
+    setRowError(null);
+    setRowStatus(null);
+    try {
+      const res = await runJob(id);
+      setRowStatus(`Ran ${id} (${res.status}).`);
+      await load();
+    } catch (err) {
+      setRowError(`Run failed: ${errMessage(err)}`);
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  async function onDelete(id: string) {
+    setDeleting(id);
+    setRowError(null);
+    try {
+      await deleteJob(id);
+      setConfirmDelete(null);
+      await load();
+    } catch (err) {
+      setRowError(errMessage(err));
+    } finally {
+      setDeleting(null);
+    }
+  }
+
+  return (
+    <section className="schedules" aria-label="Schedules" data-testid="schedules-section">
+      <div className="section-head">
+        <h3>Schedules</h3>
+        <span className="section-head-actions">
+          <button
+            type="button"
+            className="secondary"
+            data-testid="add-schedule-toggle"
+            onClick={() => setAddOpen((o) => !o)}
+          >
+            {addOpen ? "Cancel" : "New schedule"}
+          </button>
+        </span>
+      </div>
+      <p className="muted">
+        Send this agent a message on a cron schedule. The runner writes the message as
+        an inbound note; the agent runs its turn as if you typed it.
+      </p>
+
+      {addOpen ? (
+        <ScheduleForm
+          channel={channel}
+          onCancel={() => setAddOpen(false)}
+          onCreated={() => {
+            setAddOpen(false);
+            void load();
+          }}
+        />
+      ) : null}
+
+      {rowStatus ? (
+        <p className="schedule-status" data-testid="schedule-row-status">
+          {rowStatus}
+        </p>
+      ) : null}
+      {rowError ? (
+        <div className="error-banner" role="alert" data-testid="schedule-row-error">
+          {rowError}
+        </div>
+      ) : null}
+
+      {state.kind === "loading" ? <div className="loading">Loading schedules…</div> : null}
+      {state.kind === "error" ? (
+        <div className="error-banner" role="alert" data-testid="schedules-error">
+          {state.message}{" "}
+          <button type="button" className="secondary" onClick={() => void load()}>
+            Retry
+          </button>
+        </div>
+      ) : null}
+
+      {state.kind === "ok" ? (
+        state.jobs.length === 0 ? (
+          <div className="empty" data-testid="schedules-empty">
+            No schedules yet for this agent.
+          </div>
+        ) : (
+          <table>
+            <thead>
+              <tr>
+                <th>Id</th>
+                <th>Cron</th>
+                <th>Next run</th>
+                <th>Last status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {state.jobs.map((j) => (
+                <tr key={j.id} data-testid={`schedule-row-${j.id}`}>
+                  <td className="cell-name">
+                    <code>{j.id}</code>
+                    {!j.enabled ? <span className="cell-dim"> (disabled)</span> : null}
+                  </td>
+                  <td>
+                    <code>{j.schedule.cron}</code>
+                    {j.schedule.tz ? <span className="cell-dim"> {j.schedule.tz}</span> : null}
+                  </td>
+                  <td className={j.nextRunAt ? "" : "cell-dim"}>{fmtTime(j.nextRunAt)}</td>
+                  <td>
+                    {j.lastStatus ? (
+                      <span
+                        className={
+                          j.lastStatus.startsWith("error") ? "pill status-error" : "pill status-enabled"
+                        }
+                      >
+                        {j.lastStatus}
+                      </span>
+                    ) : (
+                      <span className="cell-dim">—</span>
+                    )}
+                    {j.lastRunAt ? (
+                      <span className="cell-dim"> {fmtTime(j.lastRunAt)}</span>
+                    ) : null}
+                  </td>
+                  <td>
+                    {confirmDelete === j.id ? (
+                      <span className="confirm-inline">
+                        <button
+                          type="button"
+                          className="button-danger"
+                          data-testid={`schedule-delete-confirm-${j.id}`}
+                          disabled={deleting === j.id}
+                          onClick={() => void onDelete(j.id)}
+                        >
+                          {deleting === j.id ? "Deleting…" : "Confirm delete"}
+                        </button>
+                        <button
+                          type="button"
+                          className="cancel-link"
+                          onClick={() => setConfirmDelete(null)}
+                        >
+                          Cancel
+                        </button>
+                      </span>
+                    ) : (
+                      <span className="schedule-row-actions">
+                        <button
+                          type="button"
+                          className="secondary"
+                          data-testid={`schedule-run-${j.id}`}
+                          disabled={running === j.id}
+                          onClick={() => void onRun(j.id)}
+                        >
+                          {running === j.id ? "Running…" : "Run now"}
+                        </button>
+                        <button
+                          type="button"
+                          className="button-danger"
+                          data-testid={`schedule-delete-${j.id}`}
+                          onClick={() => {
+                            setRowError(null);
+                            setConfirmDelete(j.id);
+                          }}
+                        >
+                          Delete
+                        </button>
+                      </span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )
+      ) : null}
+    </section>
+  );
+}
+
+/** Cron presets mirroring `src/jobs-ui.ts` — quick-fills for the cron input. */
+const CRON_PRESETS: { label: string; cron: string }[] = [
+  { label: "daily 8am", cron: "0 8 * * *" },
+  { label: "hourly", cron: "0 * * * *" },
+  { label: "every 15m", cron: "*/15 * * * *" },
+  { label: "weekdays 9am", cron: "0 9 * * 1-5" },
+  { label: "weekly Mon 8am", cron: "0 8 * * 1" },
+];
+
+/**
+ * The inline create-schedule form. The operator names a slug id, the message to
+ * inject, a cron (with presets), and an optional IANA tz. `createJob` upserts a
+ * `#agent/job` note; the daemon validates the cron + tz and 400s a bad one, which
+ * surfaces inline. Mirrors the `inline-form` idiom of the Phase-4a add-def-vault form.
+ */
+export function ScheduleForm({
+  channel,
+  onCancel,
+  onCreated,
+}: {
+  channel: string;
+  onCancel: () => void;
+  onCreated: () => void;
+}) {
+  const [id, setId] = useState("");
+  const [message, setMessage] = useState("");
+  const [cron, setCron] = useState("");
+  const [tz, setTz] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const idValid = /^[a-zA-Z0-9_-]+$/.test(id);
+  const canCreate = idValid && message.trim().length > 0 && cron.trim().length > 0 && !saving;
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!canCreate) return;
+    setSaving(true);
+    setError(null);
+    try {
+      await createJob({
+        id,
+        channel,
+        message: message.trim(),
+        schedule: { cron: cron.trim(), ...(tz.trim() ? { tz: tz.trim() } : {}) },
+        enabled: true,
+      });
+      onCreated();
+    } catch (err) {
+      setError(errMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form className="inline-form" onSubmit={onSubmit} aria-label="New schedule" data-testid="schedule-form">
+      {error ? (
+        <div className="error-banner" role="alert" data-testid="schedule-form-error">
+          {error}
+        </div>
+      ) : null}
+
+      <div className="field">
+        <label htmlFor="schedule-id">Job id (slug)</label>
+        <input
+          id="schedule-id"
+          type="text"
+          value={id}
+          placeholder="morning-standup"
+          autoComplete="off"
+          onChange={(e) => setId(e.target.value)}
+        />
+        {id.length > 0 && !idValid ? (
+          <p className="field-error" data-testid="schedule-id-invalid">
+            Must be a slug — letters, numbers, dash, underscore only.
+          </p>
+        ) : null}
+      </div>
+
+      <div className="field">
+        <label htmlFor="schedule-message">Message to send</label>
+        <textarea
+          id="schedule-message"
+          rows={3}
+          value={message}
+          placeholder="Run the morning weave…"
+          onChange={(e) => setMessage(e.target.value)}
+        />
+      </div>
+
+      <div className="field">
+        <label htmlFor="schedule-cron">Cron (min hour dom mon dow)</label>
+        <input
+          id="schedule-cron"
+          type="text"
+          value={cron}
+          placeholder="0 8 * * *"
+          autoComplete="off"
+          onChange={(e) => setCron(e.target.value)}
+        />
+        <div className="schedule-presets">
+          {CRON_PRESETS.map((p) => (
+            <button
+              key={p.cron}
+              type="button"
+              className="secondary"
+              onClick={() => setCron(p.cron)}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="field">
+        <label htmlFor="schedule-tz">Timezone (IANA, optional)</label>
+        <input
+          id="schedule-tz"
+          type="text"
+          value={tz}
+          placeholder="America/Los_Angeles"
+          autoComplete="off"
+          onChange={(e) => setTz(e.target.value)}
+        />
+        <p className="field-hint">Leave blank to use the daemon's local timezone.</p>
+      </div>
+
+      <div className="form-actions">
+        <button type="submit" disabled={!canCreate}>
+          {saving ? "Scheduling…" : "Create schedule"}
+        </button>
+        <button type="button" className="cancel-link" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/** Format an ISO timestamp for display (locale), falling back to em-dash / the raw value. */
+function fmtTime(iso?: string): string {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
 }
 
 /** A labelled radio with a help line — the edit form's mode rows (mirrors CreateAgent). */
