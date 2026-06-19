@@ -619,12 +619,14 @@ button.button-danger:disabled {
 }
 
 /* ---- Schedules (Phase 4b): the per-agent schedule section in the detail panel ---- */
-.schedules {
+.schedules,
+.detail-section {
   margin-top: 1.25rem;
   padding-top: 1rem;
   border-top: 1px solid var(--border-light);
 }
-.schedules .section-head h3 {
+.schedules .section-head h3,
+.detail-section .section-head h3 {
   margin: 0;
   font-size: 1.05rem;
 }
