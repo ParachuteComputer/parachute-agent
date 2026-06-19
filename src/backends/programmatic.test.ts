@@ -279,6 +279,38 @@ describe("buildProgrammaticClaudeArgs", () => {
     expect(argv).not.toContain("--append-system-prompt-file");
     expect(argv).not.toContain("--system-prompt-file");
   });
+
+  test("model set → --model <value> as a discrete argv pair", () => {
+    const argv = buildProgrammaticClaudeArgs({
+      message: "hi",
+      mcpConfigPath: "/ws/.mcp.json",
+      model: "opus",
+    });
+    const i = argv.indexOf("--model");
+    expect(i).toBeGreaterThan(-1);
+    expect(argv[i + 1]).toBe("opus");
+  });
+
+  test("model unset/empty/whitespace → NO --model flag (inherit CC default)", () => {
+    expect(
+      buildProgrammaticClaudeArgs({ message: "hi", mcpConfigPath: "/ws/.mcp.json" }),
+    ).not.toContain("--model");
+    expect(
+      buildProgrammaticClaudeArgs({ message: "hi", mcpConfigPath: "/ws/.mcp.json", model: "" }),
+    ).not.toContain("--model");
+    expect(
+      buildProgrammaticClaudeArgs({ message: "hi", mcpConfigPath: "/ws/.mcp.json", model: "   " }),
+    ).not.toContain("--model");
+  });
+
+  test("model is trimmed before becoming the flag value", () => {
+    const argv = buildProgrammaticClaudeArgs({
+      message: "hi",
+      mcpConfigPath: "/ws/.mcp.json",
+      model: "  claude-opus-4-8  ",
+    });
+    expect(argv[argv.indexOf("--model") + 1]).toBe("claude-opus-4-8");
+  });
 });
 
 // ---- single-turn runner tests ----------------------------------------------

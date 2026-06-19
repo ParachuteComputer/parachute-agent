@@ -125,6 +125,25 @@ describe("CreateAgent form", () => {
     expect(createAgentDef.mock.calls[0]![0].metadata).toEqual({ mode: "multi-threaded" });
   });
 
+  it("includes metadata.model only when a non-default model is chosen", async () => {
+    renderForm();
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "opus-agent" } });
+    fireEvent.change(screen.getByTestId("agent-model"), { target: { value: "opus" } });
+    fireEvent.click(screen.getByRole("button", { name: /create agent/i }));
+
+    await waitFor(() => expect(createAgentDef).toHaveBeenCalledTimes(1));
+    expect(createAgentDef.mock.calls[0]![0].metadata).toEqual({ mode: "single-threaded", model: "opus" });
+  });
+
+  it("omits metadata.model when left at Default", async () => {
+    renderForm();
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "default-agent" } });
+    fireEvent.click(screen.getByRole("button", { name: /create agent/i }));
+
+    await waitFor(() => expect(createAgentDef).toHaveBeenCalledTimes(1));
+    expect(createAgentDef.mock.calls[0]![0].metadata).not.toHaveProperty("model");
+  });
+
   it("includes `wants` only when entered", async () => {
     renderForm();
     fireEvent.change(screen.getByLabelText("Name"), { target: { value: "wanty" } });

@@ -87,6 +87,35 @@ describe("parseAgentDef", () => {
     expect(spec.egress).toEqual(["api.github.com", "registry.npmjs.org"]);
   });
 
+  test("metadata.model → spec.model (alias or full id); absent → undefined", () => {
+    const withModel = parseAgentDef(
+      { id: "n1", content: "x", metadata: { name: "a", model: "opus" } },
+      { vault: "default" },
+    );
+    expect(withModel.spec.model).toBe("opus");
+
+    const fullId = parseAgentDef(
+      { id: "n1", content: "x", metadata: { name: "a", model: "claude-opus-4-8" } },
+      { vault: "default" },
+    );
+    expect(fullId.spec.model).toBe("claude-opus-4-8");
+
+    const noModel = parseAgentDef(
+      { id: "n1", content: "x", metadata: { name: "a" } },
+      { vault: "default" },
+    );
+    expect(noModel.spec.model).toBeUndefined();
+  });
+
+  test("a malformed model (spaces/control chars) is a parse error, not a silent passthrough", () => {
+    expect(() =>
+      parseAgentDef(
+        { id: "n", content: "x", metadata: { name: "a", model: "opus 4.8" } },
+        { vault: "v" },
+      ),
+    ).toThrow(/not a valid model name/);
+  });
+
   test("a blank body → no systemPrompt (CC default untouched), no mode flag", () => {
     const def = parseAgentDef(
       { id: "n1", content: "   \n  ", metadata: { name: "a", systemPromptMode: "replace" } },

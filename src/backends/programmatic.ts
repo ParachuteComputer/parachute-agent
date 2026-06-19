@@ -189,6 +189,12 @@ export function buildProgrammaticClaudeArgs(opts: {
   systemPromptFile?: string;
   /** How the system prompt composes — append (default) keeps CC's base; replace overrides it. */
   systemPromptMode?: "append" | "replace";
+  /**
+   * Model to run the turn on (`claude -p --model <value>`) — a CC alias
+   * (`opus`/`sonnet`/`haiku`) or a full model id. Omitted/empty → no `--model`
+   * flag, inheriting CC's default. Passed as a discrete argv element (no shell).
+   */
+  model?: string;
 }): string[] {
   const bin = opts.claudeBin ?? "claude";
   const argv = [
@@ -203,6 +209,11 @@ export function buildProgrammaticClaudeArgs(opts: {
     opts.mcpConfigPath,
     "--dangerously-skip-permissions",
   ];
+  // Model is OPTIONAL — only add the flag when the spec set one, so an unset
+  // model inherits Claude Code's own default rather than pinning a value here.
+  if (typeof opts.model === "string" && opts.model.trim().length > 0) {
+    argv.push("--model", opts.model.trim());
+  }
   // System prompt (file-backed). Append KEEPS CC's capable default + adds the role;
   // replace overrides it entirely. Re-passed every turn (the flag isn't persistent).
   if (opts.systemPromptFile) {
@@ -429,6 +440,7 @@ export class ProgrammaticBackend implements AgentBackend {
       ...(systemPromptFile
         ? { systemPromptFile, systemPromptMode: spec.systemPromptMode ?? "append" }
         : {}),
+      ...(spec.model ? { model: spec.model } : {}),
     });
 
     // Sandbox-wrap via the SHARED seam — same egress floor + scoped-read
