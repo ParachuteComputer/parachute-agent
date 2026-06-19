@@ -4,8 +4,8 @@ import type { Job } from "./jobs.ts";
 import {
   ProgrammaticAgentRegistry,
   type WriteOutbound,
-  type WriteRun,
-  type RunNote,
+  type WriteThread,
+  type ThreadNote,
 } from "./backends/registry.ts";
 import type {
   AgentBackend,
@@ -369,8 +369,9 @@ describe("Runner — driver wiring (start/stop)", () => {
 // job's channel. The def's `mode` governs downstream at the deliver chokepoint. This
 // is what fixes "a scheduled job silently resumes the chat thread" — the operator
 // expresses ephemerality via `mode: multi-threaded` on the DEF, and the runner's fire
-// then runs a fresh turn + leaves a run note (a single-threaded def's fire resumes the
-// thread as today). We wire the runner's `fire` to the REAL registry enqueue path
+// then runs a fresh turn + materializes a per-fire thread note (a single-threaded def's
+// fire resumes the thread as today + upserts its one thread note). We wire the runner's
+// `fire` to the REAL registry enqueue path
 // (fire → enqueue → mode-aware deliver) so the end-to-end behavior is asserted, not
 // just the runner-in-isolation contract.
 // ---------------------------------------------------------------------------
@@ -403,9 +404,9 @@ class ModeFakeBackend implements AgentBackend {
 }
 
 const noopOutbound: WriteOutbound = async () => {};
-function runRec(): { runs: RunNote[]; fn: WriteRun } {
-  const runs: RunNote[] = [];
-  return { runs, fn: async (r) => void runs.push(r) };
+function threadRec(): { threads: ThreadNote[]; fn: WriteThread } {
+  const threads: ThreadNote[] = [];
+  return { threads, fn: async (t) => void threads.push(t) };
 }
 async function flushTurns(pred: () => boolean, tries = 200): Promise<void> {
   for (let i = 0; i < tries && !pred(); i++) await new Promise<void>((r) => setTimeout(r, 1));
@@ -425,10 +426,10 @@ function wireRunner(reg: ProgrammaticAgentRegistry, clock = fakeClock("2026-06-1
 }
 
 describe("Runner — a scheduled fire honors the def's mode", () => {
-  test("a MULTI-THREADED def's scheduled fire is fresh (no resume) + writes a run note", async () => {
+  test("a MULTI-THREADED def's scheduled fire is fresh (no resume) + materializes a thread note", async () => {
     const backend = new ModeFakeBackend();
-    const runs = runRec();
-    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopOutbound, writeRun: runs.fn });
+    const threads = threadRec();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopOutbound, writeThread: threads.fn });
     await reg.register({ name: "digest", channels: ["digest"], mode: "multi-threaded", definition: "Agents/digest" });
     // Even with a prior session id seeded, a multi-threaded fire must NOT resume.
     backend.seed("digest", "sess-OLD");
@@ -437,34 +438,35 @@ describe("Runner — a scheduled fire honors the def's mode", () => {
     // runNow needs the job in the store; drive `fire` directly (the runner's fire is
     // what we're testing routes through the mode-aware deliver).
     await r["fire"](job({ id: "digest-job", channel: "digest", message: "run the digest" }));
-    await flushTurns(() => runs.runs.length === 1);
+    await flushTurns(() => threads.threads.length === 1);
 
     // Fresh-per-fire: the scheduled fire did NOT resume the chat thread.
     expect(backend.resumed.get("digest")).toBe(false);
-    // …and it left a run record (the multi-threaded record, since there's no resumed transcript).
-    expect(runs.runs).toHaveLength(1);
-    expect(runs.runs[0]!.mode).toBe("multi-threaded");
-    expect(runs.runs[0]!.status).toBe("ok");
-    expect(runs.runs[0]!.input).toBe("run the digest");
+    // …and it materialized one thread note per fire (the multi-threaded record).
+    expect(threads.threads).toHaveLength(1);
+    expect(threads.threads[0]!.mode).toBe("multi-threaded");
+    expect(threads.threads[0]!.status).toBe("ok");
+    expect(threads.threads[0]!.input).toBe("run the digest");
   });
 
-  test("REGRESSION: a SINGLE-THREADED def's scheduled fire RESUMES the thread + writes NO run note", async () => {
+  test("REGRESSION: a SINGLE-THREADED def's scheduled fire RESUMES the thread + materializes ONE thread note", async () => {
     const backend = new ModeFakeBackend();
-    const runs = runRec();
-    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopOutbound, writeRun: runs.fn });
+    const threads = threadRec();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: noopOutbound, writeThread: threads.fn });
     // No mode → single-threaded (the default = today's behavior).
     await reg.register({ name: "uni-dev", channels: ["uni-dev"] });
     backend.seed("uni-dev", "sess-EXISTING"); // a prior turn established the thread.
 
     const r = wireRunner(reg);
     await r["fire"](job({ id: "uni-job", channel: "uni-dev", message: "daily check-in" }));
-    await flushTurns(() => backend.resumed.has("uni-dev"));
-    // Let any erroneous run-note write land, then assert none did.
-    await new Promise<void>((r2) => setTimeout(r2, 5));
+    await flushTurns(() => threads.threads.length === 1);
 
     // A single-threaded def's scheduled fire RESUMES the existing chat thread (today's behavior).
     expect(backend.resumed.get("uni-dev")).toBe(true);
-    // …and writes NO run note — the channel transcript is its record.
-    expect(runs.runs).toHaveLength(0);
+    // …and materializes ONE thread note (the unified model — single-threaded now writes a
+    // thread note too, named after the def, holding a rolling summary).
+    expect(threads.threads).toHaveLength(1);
+    expect(threads.threads[0]!.mode).toBe("single-threaded");
+    expect(threads.threads[0]!.name).toBe("uni-dev");
   });
 });

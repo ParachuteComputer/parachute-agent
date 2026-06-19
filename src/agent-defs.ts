@@ -252,8 +252,11 @@ export function parseAgentDef(note: {
   // Execution-lifecycle mode (the Phase-3 prerequisite). An agent is SINGLE-THREADED
   // or MULTI-THREADED. Default `single-threaded` (= today: one persistent session per
   // channel, resumed + persisted each turn). `multi-threaded` is thread-keyed — today
-  // (no inbound thread id yet) every fire mints a fresh thread (no resume, no persist,
-  // writes an `#agent/run` note).
+  // (no inbound thread id yet) every fire mints a fresh thread (no resume, no persist).
+  // BOTH modes now materialize an `#agent/thread` note (the unified model
+  // `definition -> thread -> message`): single-threaded upserts ONE thread note per
+  // channel (named after the def, rolling summary + turn_count); multi-threaded writes
+  // one thread note per fire.
   //
   // DUAL-ACCEPT the legacy aliases, mapping silently (no operator-facing break, no
   // migration of already-authored notes):
@@ -290,8 +293,8 @@ export function parseAgentDef(note: {
     channels: [name], // wake channel = the agent name (agent ≡ channel)
     backend,
     mode,
-    // The def note id — provenance carried into a multi-threaded run note (interim plain
-    // id string; typed link fields are a future vault feature).
+    // The def note id — provenance carried into the `#agent/thread` note (BOTH modes;
+    // interim plain id string; typed link fields are a future vault feature).
     definition: noteId,
     // Own-vault binding (4a): the def-vault, write-scoped. NOT sourced from the note
     // — it's the vault the note LIVES in (passed in by the caller).

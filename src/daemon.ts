@@ -121,7 +121,7 @@ import {
 import {
   ProgrammaticAgentRegistry,
   type WriteOutbound,
-  type WriteRun,
+  type WriteThread,
   type TurnEventSink,
 } from "./backends/registry.ts";
 import {
@@ -725,32 +725,37 @@ export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutboun
 }
 
 /**
- * Build the {@link WriteRun} the programmatic registry posts a multi-threaded turn's run
- * record through — resolve the channel's transport from the live `channels` map and
- * call its `writeRun()` (a VaultTransport writes an `#agent/run` note). A transport
- * without a durable store (telegram) has no `writeRun`; we no-op there (a multi-threaded
- * turn on a non-vault channel still runs — it just leaves no run note). A missing transport
- * (channel deregistered between the turn + its run record) throws; the registry logs it
- * and moves on (it never re-runs the turn).
+ * Build the {@link WriteThread} the programmatic registry posts each turn's thread note
+ * through — the UNIFIED model, called for BOTH modes (the structural unification: every
+ * turn materializes a thread note). Resolve the channel's transport from the live
+ * `channels` map and call its `writeThread()` (a VaultTransport writes a `#agent/thread`
+ * note; single-threaded upserts one note per channel, multi-threaded writes one per fire).
+ * A transport without a durable store (telegram) has no `writeThread`; we no-op there (the
+ * turn still runs — it just leaves no thread note). A missing transport (channel
+ * deregistered between the turn + its thread record) throws; the registry logs it and moves
+ * on (it never re-runs the turn).
  */
-export function buildWriteRun(channels: Map<string, Channel>): WriteRun {
-  return async (run) => {
-    const ch = channels.get(run.channel);
+export function buildWriteThread(channels: Map<string, Channel>): WriteThread {
+  return async (thread) => {
+    const ch = channels.get(thread.channel);
     if (!ch) {
-      throw new Error(`no live transport for channel "${run.channel}" — cannot write the run note`);
+      throw new Error(
+        `no live transport for channel "${thread.channel}" — cannot write the thread note`,
+      );
     }
-    // Only a transport with a durable store implements writeRun (the VaultTransport).
-    if (!ch.transport.writeRun) return;
-    await ch.transport.writeRun({
-      channel: run.channel,
-      ...(run.definition ? { definition: run.definition } : {}),
-      mode: run.mode,
-      status: run.status,
-      input: run.input,
-      output: run.output,
-      started_at: run.started_at,
-      ended_at: run.ended_at,
-      ...(run.usage ? { usage: run.usage } : {}),
+    // Only a transport with a durable store implements writeThread (the VaultTransport).
+    if (!ch.transport.writeThread) return;
+    await ch.transport.writeThread({
+      channel: thread.channel,
+      ...(thread.name ? { name: thread.name } : {}),
+      ...(thread.definition ? { definition: thread.definition } : {}),
+      mode: thread.mode,
+      status: thread.status,
+      input: thread.input,
+      output: thread.output,
+      started_at: thread.started_at,
+      ended_at: thread.ended_at,
+      ...(thread.usage ? { usage: thread.usage } : {}),
     });
   };
 }
@@ -811,7 +816,7 @@ export function createDefaultProgrammaticRegistry(
   return new ProgrammaticAgentRegistry({
     backend,
     writeOutbound: buildWriteOutbound(channels),
-    writeRun: buildWriteRun(channels),
+    writeThread: buildWriteThread(channels),
     ...(onTurnEvent ? { onTurnEvent } : {}),
   });
 }

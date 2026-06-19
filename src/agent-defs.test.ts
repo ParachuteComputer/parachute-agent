@@ -238,7 +238,7 @@ describe("parseAgentDef", () => {
       { vault: "default" },
     );
     expect(def.spec.mode).toBe("single-threaded");
-    // The def note id is threaded onto the spec as provenance (for a multi-threaded run note).
+    // The def note id is threaded onto the spec as provenance (for the `#agent/thread` note).
     expect(def.spec.definition).toBe("Agents/uni-dev");
   });
 

@@ -33,31 +33,41 @@ export interface ReplyArgs {
 }
 
 /**
- * The durable record of ONE `multi-threaded` agent turn (the execution-lifecycle
- * taxonomy). A multi-threaded turn has no resumed transcript to be its record, so the
- * daemon writes a run note instead. (A `single-threaded` turn writes NONE — the channel
- * transcript is its record.) The transport that backs the channel persists this; only the
- * VaultTransport implements it (a `#agent/run` note) — other transports omit the optional
- * method.
+ * One turn's input to materializing a `#agent/thread` note — the UNIFIED model
+ * (`definition -> thread -> message`). BOTH execution-lifecycle modes materialize a thread
+ * note (the structural unification: everything is a thread; a "run" was always a thread
+ * with one turn). The transport that backs the channel persists this; only the
+ * VaultTransport implements it (a `#agent/thread` note) — other transports omit the
+ * optional method.
+ *
+ * MODE difference (resolved transport-side): `single-threaded` upserts ONE thread note per
+ * channel at a deterministic path named after the def and rolls up turn_count + usage;
+ * `multi-threaded` writes one thread note PER FIRE. The carrier shape is the same.
  */
-export interface RunRecord {
+export interface ThreadRecord {
   /** The channel the turn ran on. */
   channel: string;
-  /** The `#agent/definition` note id this run came from (provenance; plain id string). */
+  /**
+   * The agent/def name — the single-threaded thread is "named after the definition": this
+   * sanitizes to the deterministic path leaf so the one-per-channel note upserts in place.
+   * Omitted falls back to the channel (the 1:1 default, where channel == name).
+   */
+  name?: string;
+  /** The `#agent/definition` note id this thread came from (provenance; plain id string). */
   definition?: string;
-  /** The mode the turn ran under (always `multi-threaded` for a run note today). */
+  /** The mode the turn ran under — governs thread identity + whether the note upserts. */
   mode: AgentMode;
-  /** Outcome — `ok` (success) or `error` (the turn failed). */
+  /** Outcome of THIS turn — `ok` (success) or `error` (the turn failed). */
   status: "ok" | "error";
   /** The inbound text the turn was handed (the `-p` prompt). */
   input: string;
   /** The reply text on success, or the failure reason on error. */
   output: string;
-  /** ISO timestamp the turn started. */
+  /** ISO timestamp the turn started (single-threaded preserves the FIRST turn's). */
   started_at: string;
-  /** ISO timestamp the turn ended. */
+  /** ISO timestamp the turn ended (becomes the thread's `last_turn_at`). */
   ended_at: string;
-  /** Optional token/cost usage for observability (serialized into the note metadata). */
+  /** Optional token/cost usage for this turn (single-threaded accumulates into the note). */
   usage?: { inputTokens?: number; outputTokens?: number; totalCostUsd?: number };
 }
 
@@ -127,13 +137,13 @@ export interface Transport {
   /** Optional: fetch an attachment, returning a local path. */
   download?(args: DownloadArgs): Promise<{ path: string }>;
   /**
-   * Optional: write the durable record of a completed `multi-threaded` turn (an
-   * `#agent/run` note for the VaultTransport). Only meaningful for a vault-backed
-   * channel; transports without a durable store omit it. The daemon calls it ONLY for
-   * multi-threaded turns (a single-threaded turn's record is its channel transcript).
-   * Returns the written record's id(s).
+   * Optional: materialize a `#agent/thread` note for a completed turn (the VaultTransport's
+   * `#agent/thread` note). Only meaningful for a vault-backed channel; transports without a
+   * durable store omit it. The daemon calls it for BOTH execution-lifecycle modes (the
+   * structural unification — every turn materializes a thread note): single-threaded upserts
+   * one note per channel, multi-threaded writes one per fire. Returns the written note id(s).
    */
-  writeRun?(run: RunRecord): Promise<{ sent: string[] }>;
+  writeThread?(thread: ThreadRecord): Promise<{ sent: string[] }>;
   /**
    * Optional: handle an HTTP request the daemon didn't handle itself. The
    * daemon owns `Bun.serve`; a transport that needs to contribute routes (e.g.
