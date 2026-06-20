@@ -499,6 +499,13 @@ export class ProgrammaticAgentRegistry {
     this.byChannel.delete(channel);
     this.nameToChannel.delete(name);
     this.queues.delete(channel);
+    // Clear the EXPECTED mark + any buffered pending inbound for this channel too —
+    // the agent is gone, so a pending message has nothing to drain into and would
+    // strand forever (and the next register would replay stale messages). The daemon's
+    // teardown wrapper also calls unexpectChannel, but clearing it here makes direct
+    // registry callers safe too (the reviewer's latent-footgun nit).
+    this.expectedChannels.delete(channel);
+    this.pending.delete(channel);
     // Clear the persisted resume id so a re-spawn starts fresh (the backend's
     // `stop` is a no-op beyond that — there's no process to kill).
     if (handle) {

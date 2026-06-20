@@ -404,6 +404,47 @@ describe("VaultTransport — writeThread (#agent/thread note, the unified model)
     expect(stored!.content).toContain("NOT delivered");
   });
 
+  test("SINGLE-THREADED FULL lifecycle start→end(ok)→end(error,sameTurn): count goes 0→1→1, never double-counts (thread-as-container + FIX 1)", async () => {
+    // The real drain path now writes a `working` start-ensure BEFORE the turn, then an
+    // `end` record, then (on outbound failure) an `end` re-record with sameTurn. This is
+    // the one combination the prior FIX-1 test didn't exercise: a start-ensure preceding
+    // the re-record. The start must NOT count; the first end counts once; the sameTurn
+    // re-record must keep it.
+    let stored: { metadata: Record<string, string>; content: string } | undefined;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = init?.method ?? "GET";
+      if (u.includes("/api/notes/") && method === "GET") {
+        if (!stored) return new Response("not found", { status: 404 });
+        return new Response(JSON.stringify(stored), { status: 200 });
+      }
+      if (u.includes("/api/notes/") && method === "PATCH") {
+        const body = JSON.parse(String(init?.body)) as { metadata: Record<string, string>; content: string };
+        stored = { metadata: body.metadata, content: body.content };
+        return new Response(JSON.stringify({ id: "thread-eng" }), { status: 200 });
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+    const base = {
+      channel: "eng", name: "eng", mode: "single-threaded" as const, input: "q",
+      started_at: "2026-06-18T07:00:00.000Z", ended_at: "2026-06-18T07:00:05.000Z", threadId: "t1",
+    };
+    // 1) start-ensure (working) — the container, BEFORE the turn. Must NOT count.
+    await t.writeThread({ ...base, status: "working", output: "", phase: "start" });
+    expect(stored!.metadata.turn_count).toBe("0");
+    expect(stored!.metadata.status).toBe("working");
+    // 2) end(ok) — the turn completed: count once.
+    await t.writeThread({ ...base, status: "ok", output: "a", phase: "end" });
+    expect(stored!.metadata.turn_count).toBe("1");
+    expect(stored!.metadata.status).toBe("ok");
+    // 3) end(error, sameTurn) — outbound write failed, re-record the SAME turn. No increment.
+    await t.writeThread({ ...base, status: "error", output: "reply produced but NOT delivered", phase: "end", sameTurn: true });
+    expect(stored!.metadata.turn_count).toBe("1"); // STILL 1 — start didn't count, sameTurn didn't re-count.
+    expect(stored!.metadata.status).toBe("error");
+  });
+
   test("MULTI-THREADED re-record reuses the passed threadId leaf — ONE note, not a duplicate (PR #3 FIX 1)", async () => {
     const patchPaths: string[] = [];
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
