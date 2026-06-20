@@ -495,9 +495,9 @@ export const AGENT_VAULT_TAG_SCHEMA: ReadonlyArray<{
     //  - channel    → "all jobs targeting agent X"
     //  - enabled    → "active jobs" (enabled:"true") vs paused ("false")
     //  - lastStatus → "jobs whose last run errored"
-    // The full field set + usage lives in the runner design + the in-vault reference note;
-    // the schema is permissive, so the other job fields (jobId/cron/tz/createdAt/lastRunAt)
-    // ride as undeclared metadata.
+    // The full field set is `JobNoteMetadata` in src/jobs.ts (design
+    // 2026-06-17-runner-scheduled-agent-turns); the schema is permissive, so the other
+    // job fields (jobId/cron/tz/createdAt/lastRunAt) ride as undeclared metadata.
     fields: {
       channel: { type: "string", indexed: true },
       enabled: { type: "string", indexed: true },
