@@ -193,6 +193,28 @@ export function isTransientTurnError(reason: string): boolean {
   );
 }
 
+/**
+ * Does this turn-failure reason look like a `--resume` of a session that no longer
+ * exists — claude's "No conversation found with session ID" class (expiry / transcript
+ * cleanup / a missing session jsonl)? Governs the ONE-TIME fresh-create fallback in
+ * {@link ProgrammaticBackend.deliver} that keeps an expired session from BRICKING the
+ * thread on every future turn (issue #132).
+ *
+ * ⚠️ TEXT-BASED — this matches claude's ERROR WORDING (anthropics/claude-code#33912),
+ * which is VERSION-FRAGILE: if claude changes the phrasing this detector silently stops
+ * matching. It is deliberately CONSERVATIVE — it only governs a RECOVERY fallback, so a
+ * MISS degrades to today's behavior (the pre-existing brick), never anything worse; it
+ * can't, e.g., turn a real failure into a spurious success. A future STRUCTURED error
+ * signal (an exit-code or a stream-json error subtype) would be more robust and is the
+ * preferred long-term fix. Kept tight enough not to match a generic failure: it requires
+ * "conversation"/"session" near the not-found phrasing (never a bare "not found").
+ */
+export function isSessionNotFoundError(reason: string): boolean {
+  return /no conversation found|session not found|no session (?:found |with )|conversation .{0,30}not found|could not find .{0,20}session/i.test(
+    reason,
+  );
+}
+
 /** Default real sleep for the retry backoff (overridable via `deps.sleepFn` in tests). */
 const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -337,6 +359,17 @@ export class ProgrammaticBackend implements AgentBackend {
    * A failure (mint refused, non-zero exit, `is_error: true`, non-success subtype,
    * empty output) returns `{ ok: false, error }` — it does NOT throw, so the daemon
    * always learns the outcome inline.
+   *
+   * SESSION-EXPIRY SELF-HEAL (#132): a `--resume` turn whose Claude session no longer
+   * exists ("No conversation found with session ID" — expiry / transcript cleanup) is
+   * NOT a transient error (no retry helps) and, left alone, would BRICK the thread on
+   * EVERY future turn (the stale id stays on the thread note). When a resume turn fails
+   * with a {@link isSessionNotFoundError} reason, `deliver` falls back ONCE to a fresh
+   * `--session-id <new uuid>` create, re-establishing continuity from this turn forward.
+   * The new turn's echoed session id flows out on the {@link DeliverResult} exactly as
+   * usual, so the registry persists the NEW id onto the thread note and later turns
+   * resume it. The fallback fires AT MOST once (only on a resume turn; the create it
+   * runs has `resume: false`, so it can never re-trigger).
    */
   async deliver(handle: AgentHandle, message: string, session: TurnSession, onInterim?: InterimSink): Promise<DeliverResult> {
     const spec = handle.spec;
@@ -464,36 +497,6 @@ export class ProgrammaticBackend implements AgentBackend {
       writeFileSync(systemPromptFile, spec.systemPrompt, { mode: 0o600 });
     }
 
-    // The DAEMON owns the session uuid (the caller resolved it from the durable
-    // `#agent/thread` note — single-threaded resumes its persisted session, multi-
-    // threaded gets a fresh uuid every fire). The backend reads no session store: it
-    // just runs the turn with the supplied {@link TurnSession} — `--resume <id>` to
-    // continue, `--session-id <id>` to create.
-    const argv = buildProgrammaticClaudeArgs({
-      message,
-      mcpConfigPath,
-      sessionId: session.id,
-      resumeSession: session.resume,
-      ...(this.deps.claudeBin ? { claudeBin: this.deps.claudeBin } : {}),
-      ...(systemPromptFile
-        ? { systemPromptFile, systemPromptMode: spec.systemPromptMode ?? "append" }
-        : {}),
-      ...(spec.model ? { model: spec.model } : {}),
-    });
-
-    // Sandbox-wrap via the SHARED seam — same egress floor + scoped-read
-    // confinement the interactive spawn gets. The wrapped argv carries the policy.
-    const wrapped = await wrapArgvInSandbox({
-      spec,
-      workspace,
-      runtimeReadOnly: this.deps.runtimeReadOnly,
-      hubOrigin: this.deps.hubOrigin,
-      ...(this.deps.vaultUrl ? { vaultUrl: this.deps.vaultUrl } : {}),
-      argv,
-      ...(this.deps.sandboxEngine ? { sandboxEngine: this.deps.sandboxEngine } : {}),
-      ...(this.deps.ripgrep ? { ripgrep: this.deps.ripgrep } : {}),
-    });
-
     // The agent's WORKING dir (design 2026-06-16-agent-filesystem-and-sharing.md):
     // the spec's `workspace` (a shared real dir) when set, else the private session
     // dir (today's behavior). The cwd is decoupled from the private dir —
@@ -523,23 +526,16 @@ export class ProgrammaticBackend implements AgentBackend {
     // Layer the scrubbed agent env UNDER the sandbox wrapper's env; the HOME/config/
     // temp vars layer LAST so they win. CLAUDE_CODE_OAUTH_TOKEN injected;
     // ANTHROPIC_API_KEY/CLAUDE_API_KEY absent (the subscription-billing guarantee).
+    // (Session-INDEPENDENT — computed ONCE; the per-turn `wrapped.env` layers on top
+    // inside `attemptTurn` below.)
     const childEnv = buildAgentChildEnv(
       this.deps.parentEnv ?? process.env,
       claudeOauthToken,
       mergedChannelEnv,
     );
-    const launchEnv: Record<string, string | undefined> = {
-      ...childEnv,
-      ...wrapped.env,
-      ...homeEnv,
-    };
 
-    // Run the turn, with a bounded retry on TRANSIENT upstream errors (API 529/overload,
-    // 5xx, rate-limit, network). The argv is fixed (built above with the turn-start
-    // `--resume` sid), so each attempt re-runs the SAME turn. STREAM stdout incrementally
-    // (interim events for the live view) while draining stderr in parallel; the interim
-    // sink is best-effort + must not throw. A spawn/IO fault is a value (not a throw); a
-    // non-transient failure or exhausted retries returns the failure for the daemon to learn.
+    // The interim sink is best-effort + must not throw (session-INDEPENDENT). A push
+    // to a closed SSE stream / a sink fault must never break the turn.
     const safeInterim: InterimSink = (e) => {
       if (!onInterim) return;
       try {
@@ -549,80 +545,148 @@ export class ProgrammaticBackend implements AgentBackend {
       }
     };
     const sleepFn = this.deps.sleepFn ?? realSleep;
-    for (let attempt = 1; attempt <= TURN_MAX_ATTEMPTS; attempt++) {
-      let parsed;
-      let stderr: string;
-      let code: number;
-      try {
-        const proc = this.deps.spawnFn(wrapped.argv, { env: launchEnv, cwd });
-        [parsed, stderr] = await Promise.all([
-          parseStreamJsonStream(proc.stdout, safeInterim),
-          drainStream(proc.stderr),
-        ]);
-        code = await proc.exited;
-      } catch (err) {
-        // A spawn/IO fault (ENOENT, resource) is a config/permanent class — not retried.
-        return { ok: false, error: `claude -p spawn failed: ${(err as Error).message}` };
-      }
 
-      if (parsed.success === true) {
-        // The captured session id is RETURNED (below) for the caller to persist onto
-        // the thread note — the backend no longer owns a session store. The id we
-        // passed in (session.id) and Claude's echoed parsed.sessionId are normally the
-        // same; the registry prefers the echoed one and falls back to session.id.
+    // Run ONE turn for the given session — build the session-DEPENDENT argv
+    // (`--resume <id>` vs `--session-id <id>`), sandbox-wrap it, then run the bounded
+    // transient-retry loop. Relocated into a closure so a session-expiry FALLBACK can
+    // run it a SECOND time with a fresh create session (#132). The session-independent
+    // setup above (workspace, .mcp.json, system-prompt file, cwd, home/child env,
+    // interim sink) is shared across both attempts.
+    const attemptTurn = async (turnSession: TurnSession): Promise<DeliverResult> => {
+      // The DAEMON owns the session uuid (the caller resolved it from the durable
+      // `#agent/thread` note — single-threaded resumes its persisted session, multi-
+      // threaded gets a fresh uuid every fire). The backend reads no session store: it
+      // just runs the turn with the supplied {@link TurnSession} — `--resume <id>` to
+      // continue, `--session-id <id>` to create.
+      const argv = buildProgrammaticClaudeArgs({
+        message,
+        mcpConfigPath,
+        sessionId: turnSession.id,
+        resumeSession: turnSession.resume,
+        ...(this.deps.claudeBin ? { claudeBin: this.deps.claudeBin } : {}),
+        ...(systemPromptFile
+          ? { systemPromptFile, systemPromptMode: spec.systemPromptMode ?? "append" }
+          : {}),
+        ...(spec.model ? { model: spec.model } : {}),
+      });
 
-        const usage: DeliverUsage | undefined = parsed.usage
-          ? {
-              ...(typeof parsed.usage.input_tokens === "number" ? { inputTokens: parsed.usage.input_tokens } : {}),
-              ...(typeof parsed.usage.output_tokens === "number" ? { outputTokens: parsed.usage.output_tokens } : {}),
-              ...(typeof parsed.totalCostUsd === "number" ? { totalCostUsd: parsed.totalCostUsd } : {}),
-            }
-          : typeof parsed.totalCostUsd === "number"
-            ? { totalCostUsd: parsed.totalCostUsd }
-            : undefined;
+      // Sandbox-wrap via the SHARED seam — same egress floor + scoped-read
+      // confinement the interactive spawn gets. The wrapped argv carries the policy.
+      const wrapped = await wrapArgvInSandbox({
+        spec,
+        workspace,
+        runtimeReadOnly: this.deps.runtimeReadOnly,
+        hubOrigin: this.deps.hubOrigin,
+        ...(this.deps.vaultUrl ? { vaultUrl: this.deps.vaultUrl } : {}),
+        argv,
+        ...(this.deps.sandboxEngine ? { sandboxEngine: this.deps.sandboxEngine } : {}),
+        ...(this.deps.ripgrep ? { ripgrep: this.deps.ripgrep } : {}),
+      });
 
+      const launchEnv: Record<string, string | undefined> = {
+        ...childEnv,
+        ...wrapped.env,
+        ...homeEnv,
+      };
+
+      // Run the turn, with a bounded retry on TRANSIENT upstream errors (API 529/overload,
+      // 5xx, rate-limit, network). The argv is fixed (built above for THIS turn's session),
+      // so each attempt re-runs the SAME turn. STREAM stdout incrementally (interim events
+      // for the live view) while draining stderr in parallel; the interim sink is best-effort
+      // + must not throw. A spawn/IO fault is a value (not a throw); a non-transient failure
+      // or exhausted retries returns the failure for the daemon to learn.
+      for (let attempt = 1; attempt <= TURN_MAX_ATTEMPTS; attempt++) {
+        let parsed;
+        let stderr: string;
+        let code: number;
+        try {
+          const proc = this.deps.spawnFn(wrapped.argv, { env: launchEnv, cwd });
+          [parsed, stderr] = await Promise.all([
+            parseStreamJsonStream(proc.stdout, safeInterim),
+            drainStream(proc.stderr),
+          ]);
+          code = await proc.exited;
+        } catch (err) {
+          // A spawn/IO fault (ENOENT, resource) is a config/permanent class — not retried.
+          return { ok: false, error: `claude -p spawn failed: ${(err as Error).message}` };
+        }
+
+        if (parsed.success === true) {
+          // The captured session id is RETURNED (below) for the caller to persist onto
+          // the thread note — the backend no longer owns a session store. The id we
+          // passed in (turnSession.id) and Claude's echoed parsed.sessionId are normally
+          // the same; the registry prefers the echoed one and falls back to turnSession.id.
+
+          const usage: DeliverUsage | undefined = parsed.usage
+            ? {
+                ...(typeof parsed.usage.input_tokens === "number" ? { inputTokens: parsed.usage.input_tokens } : {}),
+                ...(typeof parsed.usage.output_tokens === "number" ? { outputTokens: parsed.usage.output_tokens } : {}),
+                ...(typeof parsed.totalCostUsd === "number" ? { totalCostUsd: parsed.totalCostUsd } : {}),
+              }
+            : typeof parsed.totalCostUsd === "number"
+              ? { totalCostUsd: parsed.totalCostUsd }
+              : undefined;
+
+          return {
+            ok: true,
+            reply: parsed.reply ?? "",
+            ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
+            ...(usage ? { usage } : {}),
+          };
+        }
+
+        // FAILURE — compute the reason (non-zero exit / is_error / non-success subtype /
+        // no result event), same precedence as before.
+        const reason =
+          parsed.errorMessage ??
+          (parsed.subtype ? `claude -p turn failed (subtype: ${parsed.subtype})` : undefined) ??
+          (code !== 0
+            ? `claude -p exited ${code}${stderr.trim() ? `: ${stderr.trim().slice(0, 500)}` : ""}`
+            : "claude -p produced no success result (no result event in output)");
+
+        // Retry ONLY a transient error, and only while attempts remain (incremental backoff).
+        if (attempt < TURN_MAX_ATTEMPTS && isTransientTurnError(reason)) {
+          const backoff =
+            TURN_RETRY_BACKOFF_MS[attempt - 1] ?? TURN_RETRY_BACKOFF_MS[TURN_RETRY_BACKOFF_MS.length - 1] ?? 5_000;
+          console.warn(
+            `parachute-agent: transient turn error for channel "${channel}" ` +
+              `(attempt ${attempt}/${TURN_MAX_ATTEMPTS}, retrying in ${backoff}ms): ${reason}`,
+          );
+          await sleepFn(backoff);
+          continue;
+        }
+        // RETURN the session id even on a FINAL failure — a turn can fail AFTER
+        // establishing a session; the id is still the continuation handle for the next
+        // turn. The registry persists it onto the thread note (`result.sessionId ??
+        // turnSession.id`), so the next turn resumes the conversation.
+        // Non-transient, or out of attempts → return the failure (the daemon records
+        // status:error AND posts a user-facing failure note to the channel).
         return {
-          ok: true,
-          reply: parsed.reply ?? "",
+          ok: false,
+          error: reason,
           ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
-          ...(usage ? { usage } : {}),
         };
       }
+      // Unreachable — every loop path returns — but satisfies the type checker.
+      return { ok: false, error: "claude -p: retries exhausted" };
+    };
 
-      // FAILURE — compute the reason (non-zero exit / is_error / non-success subtype /
-      // no result event), same precedence as before.
-      const reason =
-        parsed.errorMessage ??
-        (parsed.subtype ? `claude -p turn failed (subtype: ${parsed.subtype})` : undefined) ??
-        (code !== 0
-          ? `claude -p exited ${code}${stderr.trim() ? `: ${stderr.trim().slice(0, 500)}` : ""}`
-          : "claude -p produced no success result (no result event in output)");
-
-      // Retry ONLY a transient error, and only while attempts remain (incremental backoff).
-      if (attempt < TURN_MAX_ATTEMPTS && isTransientTurnError(reason)) {
-        const backoff =
-          TURN_RETRY_BACKOFF_MS[attempt - 1] ?? TURN_RETRY_BACKOFF_MS[TURN_RETRY_BACKOFF_MS.length - 1] ?? 5_000;
-        console.warn(
-          `parachute-agent: transient turn error for channel "${channel}" ` +
-            `(attempt ${attempt}/${TURN_MAX_ATTEMPTS}, retrying in ${backoff}ms): ${reason}`,
-        );
-        await sleepFn(backoff);
-        continue;
-      }
-      // RETURN the session id even on a FINAL failure — a turn can fail AFTER
-      // establishing a session; the id is still the continuation handle for the next
-      // turn. The registry persists it onto the thread note (`result.sessionId ??
-      // turnSession.id`), so the next turn resumes the conversation.
-      // Non-transient, or out of attempts → return the failure (the daemon records
-      // status:error AND posts a user-facing failure note to the channel).
-      return {
-        ok: false,
-        error: reason,
-        ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
-      };
+    let result = await attemptTurn(session);
+    // Session-expiry recovery (#132): a --resume turn whose session no longer exists is
+    // NOT transient (no retry would help) and would otherwise brick the thread on every
+    // future turn (the stale id stays on the note). Fall back ONCE to a fresh create so
+    // continuity self-heals from here — the new turn's echoed id flows out for the
+    // registry to persist. Only on a RESUME turn; the create itself is never retried this
+    // way (the fallback session has resume:false → a not-found on it can't re-trigger).
+    if (!result.ok && session.resume && isSessionNotFoundError(result.error)) {
+      const fresh = crypto.randomUUID();
+      console.warn(
+        `parachute-agent: resume session for channel "${channel}" not found (expired?) — ` +
+          `starting a fresh session ${fresh}: ${result.error}`,
+      );
+      result = await attemptTurn({ id: fresh, resume: false });
     }
-    // Unreachable — every loop path returns — but satisfies the type checker.
-    return { ok: false, error: "claude -p: retries exhausted" };
+    return result;
   }
 
   /**

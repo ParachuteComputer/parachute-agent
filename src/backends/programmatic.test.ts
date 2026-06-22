@@ -28,6 +28,7 @@ import {
   buildProgrammaticClaudeArgs,
   PROGRAMMATIC_BACKEND_KIND,
   isTransientTurnError,
+  isSessionNotFoundError,
   TURN_MAX_ATTEMPTS,
   TURN_RETRY_BACKOFF_MS,
   type ProgrammaticBackendDeps,
@@ -1235,5 +1236,141 @@ describe("isTransientTurnError", () => {
     ]) {
       expect(isTransientTurnError(s)).toBe(false);
     }
+  });
+});
+
+describe("isSessionNotFoundError", () => {
+  test("resume-of-a-missing-session phrasings → true", () => {
+    for (const s of [
+      "No conversation found with session ID: 3f8c-...",
+      "no conversation found",
+      "Session not found",
+      "claude -p exited 1: Error: No session found for id abc",
+      "Could not find a session with that id",
+      "the conversation with that id was not found",
+    ]) {
+      expect(isSessionNotFoundError(s)).toBe(true);
+    }
+  });
+
+  test("generic / unrelated failures → false (conservative — never a bare 'not found')", () => {
+    for (const s of [
+      "claude -p exited 1: some other error",
+      "rate limit",
+      "",
+      "401 unauthorized",
+      "file not found", // a bare "not found" without conversation/session
+      "tag_scope_violation",
+    ]) {
+      expect(isSessionNotFoundError(s)).toBe(false);
+    }
+  });
+});
+
+// ---- session-expiry → fresh-create fallback (#132) -------------------------
+
+/**
+ * A spawnFn that branches on whether the wrapped argv carries `--resume`:
+ *  - a `--resume` turn returns `onResume` (default: a session-not-found failure),
+ *  - a `--session-id` (create) turn returns `onCreate` (default: success).
+ * Records each call so a test can assert the flag transition resume → fresh create.
+ */
+function flagBranchingSpawn(opts: {
+  onResume?: string;
+  onCreate?: string;
+  resumeCode?: number;
+  createCode?: number;
+}): {
+  fn: ProgrammaticSpawnFn;
+  calls: Array<{ argv: string[]; cmd: string }>;
+} {
+  const calls: Array<{ argv: string[]; cmd: string }> = [];
+  const fn: ProgrammaticSpawnFn = (argv) => {
+    const cmd = argv[2] ?? ""; // the fake engine echoes the claude command in argv[2]
+    calls.push({ argv, cmd });
+    const isResume = cmd.includes("--resume");
+    const out = isResume ? (opts.onResume ?? "") : (opts.onCreate ?? "");
+    const code = isResume ? (opts.resumeCode ?? 0) : (opts.createCode ?? 0);
+    return { stdout: new Response(out).body, stderr: new Response("").body, exited: Promise.resolve(code) };
+  };
+  return { fn, calls };
+}
+
+/** A non-success stream-json result with a session id + an arbitrary error message. */
+function failTurn(sessionId: string, message: string): string {
+  return ndjson(
+    { type: "system", subtype: "init", session_id: sessionId, apiKeySource: "none" },
+    { type: "result", subtype: "error_during_execution", is_error: true, result: message, session_id: sessionId },
+  );
+}
+
+describe("ProgrammaticBackend.deliver — session-expiry → fresh-create fallback (#132)", () => {
+  test("resume → session-not-found → fresh --session-id create succeeds; NEW id returned; two spawns", async () => {
+    mkDirs("fallback-ok");
+    const { fn, calls } = flagBranchingSpawn({
+      // The --resume turn fails with claude's session-not-found error…
+      onResume: failTurn("old-uuid", "No conversation found with session ID: old-uuid"),
+      // …and a fresh --session-id create turn SUCCEEDS (claude echoes the create id).
+      onCreate: successTurn("fresh-created-uuid", "recovered after fresh create"),
+    });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "continue please", resumeSession("old-uuid"));
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.reply).toBe("recovered after fresh create");
+      // The sessionId is the NEW (create) id echoed by claude — NOT the dead "old-uuid".
+      expect(result.sessionId).toBe("fresh-created-uuid");
+      expect(result.sessionId).not.toBe("old-uuid");
+    }
+
+    // TWO spawns: first --resume old-uuid, then --session-id <fresh> (a DIFFERENT uuid).
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.cmd).toContain("--resume old-uuid");
+    expect(calls[0]!.cmd).not.toContain("--session-id");
+    expect(calls[1]!.cmd).toContain("--session-id");
+    expect(calls[1]!.cmd).not.toContain("--resume");
+    // The fresh create id is a generated uuid — present, and NOT the dead old one.
+    const createIdx = calls[1]!.argv[2]!.indexOf("--session-id ");
+    const freshId = calls[1]!.argv[2]!.slice(createIdx + "--session-id ".length).split(/\s/)[0]!;
+    expect(freshId).not.toBe("old-uuid");
+    expect(freshId.length).toBeGreaterThan(0);
+  });
+
+  test("a resume turn that fails with a NON-not-found (non-transient) error does NOT fall back", async () => {
+    mkDirs("fallback-no");
+    const { fn, calls } = flagBranchingSpawn({
+      // A generic, non-not-found, non-transient failure on the resume turn.
+      onResume: failTurn("old-uuid", "401 unauthorized: invalid token"),
+      onCreate: successTurn("would-not-be-used", "should never run"),
+    });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "continue", resumeSession("old-uuid"));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("401 unauthorized");
+    // ONE spawn only — no fresh-create fallback for a non-not-found failure.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.cmd).toContain("--resume old-uuid");
+  });
+
+  test("session-not-found on a CREATE turn does NOT loop (the session.resume guard prevents the fallback)", async () => {
+    mkDirs("fallback-create");
+    // A CREATE turn (resume:false) that itself returns a not-found error. The fallback
+    // is guarded on session.resume, so a create's not-found can never re-trigger it.
+    const { fn, calls } = recordingSpawn({
+      stdout: failTurn("sess-CREATE", "No conversation found with session ID: sess-CREATE"),
+    });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "first turn", createSession("sess-CREATE"));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toContain("No conversation found");
+    // EXACTLY one spawn — the guard prevented any fallback create.
+    expect(calls).toHaveLength(1);
   });
 });
