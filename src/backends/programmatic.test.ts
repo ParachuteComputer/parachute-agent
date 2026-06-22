@@ -1104,24 +1104,28 @@ describe("ProgrammaticBackend.deliver — transient-error retry with incremental
   test("retries a TRANSIENT turn error (backoff), then succeeds", async () => {
     mkDirs("retry-ok");
     const sleeps: number[] = [];
+    const state = new AgentSessionState({ stateDir });
     const { fn, calls } = sequencedSpawn([
       transientResult("s1", "API Error: 529 Overloaded. Try again."),
       successTurn("s2", "recovered"),
     ]);
     const backend = new ProgrammaticBackend(
       baseDeps(fn, {
+        sessionState: state,
         sleepFn: async (ms) => {
           sleeps.push(ms);
         },
       }),
     );
-    const handle = await backend.start(specWithVault());
+    const handle = await backend.start(specWithVault("eng"));
     const result = await backend.deliver(handle, "go");
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.reply).toBe("recovered");
     expect(calls.length).toBe(2); // one retry
     expect(sleeps).toHaveLength(1); // one backoff
     expect(sleeps[0]).toBe(TURN_RETRY_BACKOFF_MS[0]); // the first (incremental) interval
+    // The SUCCESSFUL attempt's sid is persisted (not the failed attempt's "s1").
+    expect(state.get("eng")).toBe("s2");
   });
 
   test("does NOT retry a non-transient turn error (fails fast, no sleep)", async () => {
@@ -1147,22 +1151,26 @@ describe("ProgrammaticBackend.deliver — transient-error retry with incremental
   test("a persistently TRANSIENT error exhausts the retries → { ok:false }", async () => {
     mkDirs("retry-exhaust");
     const sleeps: number[] = [];
+    const state = new AgentSessionState({ stateDir });
     const { fn, calls } = recordingSpawn({
       stdout: transientResult("s", "API Error: 503 Service Unavailable"),
     });
     const backend = new ProgrammaticBackend(
       baseDeps(fn, {
+        sessionState: state,
         sleepFn: async (ms) => {
           sleeps.push(ms);
         },
       }),
     );
-    const handle = await backend.start(specWithVault());
+    const handle = await backend.start(specWithVault("eng"));
     const result = await backend.deliver(handle, "go");
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toContain("503");
     expect(calls.length).toBe(TURN_MAX_ATTEMPTS); // all attempts used
     expect(sleeps.length).toBe(TURN_MAX_ATTEMPTS - 1); // one backoff before each retry
+    // The session id is still persisted even on a FINAL failure (continuation handle).
+    expect(state.get("eng")).toBe("s");
   });
 });
 
