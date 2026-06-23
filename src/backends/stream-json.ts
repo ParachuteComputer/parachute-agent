@@ -323,11 +323,13 @@ function foldLine(
  */
 export function parseStreamJson(stdout: string): ParsedTurn {
   const turn: ParsedTurn = {};
-  const toolNames = new Map<string, string>();
+  // No sink + no toolNames map: foldLine's interim branches (which build/consult the
+  // map) are all gated on `onInterim`, so the blob path needs neither — final-result
+  // semantics are identical with or without them.
   for (const rawLine of stdout.split("\n")) {
     const line = rawLine.trim();
     if (!line) continue;
-    foldLine(line, turn, undefined, toolNames);
+    foldLine(line, turn);
   }
   return turn;
 }

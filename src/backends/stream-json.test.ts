@@ -356,6 +356,61 @@ describe("parseStreamJsonStream — enriched tool events (inputs + result previe
     expect(input.endsWith("…")).toBe(true);
   });
 
+  test("an input at EXACTLY the cap is NOT truncated (no marker)", async () => {
+    // A JSON string whose serialized form is exactly MAX_TOOL_INPUT_CHARS chars: the
+    // `> max` (strictly-greater) guard must leave it untouched, no `…`.
+    const padTo = MAX_TOOL_INPUT_CHARS - JSON.stringify({ command: "" }).length;
+    const exactCmd = "z".repeat(padTo);
+    const inputObj = { command: exactCmd };
+    const expected = JSON.stringify(inputObj);
+    expect(expected.length).toBe(MAX_TOOL_INPUT_CHARS); // sanity: we built it right
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "tin-exact" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "tool_use", id: "tu_x", name: "Bash", input: inputObj }] },
+        session_id: "tin-exact",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "tin-exact" },
+    );
+    const { events } = await collectInterim(blob);
+    expect(events).toContainEqual({ kind: "tool", tool: "Bash", input: expected });
+    expect((events.find((e) => e.kind === "tool") as { input?: string }).input!.endsWith("…")).toBe(false);
+  });
+
+  test("the id→name map accumulates MULTIPLE tool_use ids before their results arrive", async () => {
+    // Two tool_use blocks fire, THEN two tool_results — each result must be labeled
+    // with the right tool via the per-parse id→name map (no cross-talk, map survives).
+    const blob = ndjson(
+      { type: "system", subtype: "init", session_id: "multi" },
+      {
+        type: "assistant",
+        message: {
+          content: [
+            { type: "tool_use", id: "tu_a", name: "Read", input: { file_path: "/a" } },
+            { type: "tool_use", id: "tu_b", name: "Bash", input: { command: "ls" } },
+          ],
+        },
+        session_id: "multi",
+      },
+      {
+        type: "user",
+        message: {
+          content: [
+            { type: "tool_result", tool_use_id: "tu_b", is_error: false, content: "bash out" },
+            { type: "tool_result", tool_use_id: "tu_a", is_error: false, content: "read out" },
+          ],
+        },
+        session_id: "multi",
+      },
+      { type: "result", subtype: "success", is_error: false, result: "done", session_id: "multi" },
+    );
+    const { events } = await collectInterim(blob);
+    // tu_b → Bash, tu_a → Read (results arrived in reverse order; labels still correct)
+    expect(events).toContainEqual({ kind: "tool_result", tool: "Bash", ok: true, preview: "bash out" });
+    expect(events).toContainEqual({ kind: "tool_result", tool: "Read", ok: true, preview: "read out" });
+  });
+
   test("a tool_use with NO input omits the input field (back-compat shape)", async () => {
     const blob = ndjson(
       { type: "system", subtype: "init", session_id: "tin-none" },
