@@ -25,6 +25,9 @@
  */
 
 import { describe, test, expect, afterEach } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { VaultTransport, AGENT_VAULT_TAG_SCHEMA, AGENT_THREAD_TAG, AGENT_JOB_TAG, InboundClaimConflictError, noteAgentKey } from "./vault.ts";
 import type { TransportContext, InboundMessage } from "../transport.ts";
 import { instantiateTransport } from "../registry.ts";
@@ -188,6 +191,187 @@ describe("VaultTransport — reply (outbound note write)", () => {
     const t = new VaultTransport(baseConfig());
     await t.start(fakeCtx("eng"));
     await expect(t.reply({ channel: "eng", text: "x" })).rejects.toThrow(/write reply failed/);
+  });
+});
+
+describe("VaultTransport — OUTBOUND file attachments (Phase 2: upload + link)", () => {
+  let tmp = "";
+  afterEach(() => {
+    if (tmp) rmSync(tmp, { recursive: true, force: true });
+    tmp = ""; // reset so the next test mkdtemps a FRESH dir (not the just-deleted one).
+  });
+  /** Create a temp file with the given bytes; returns its absolute path. */
+  function tmpFile(name: string, body: string): string {
+    if (!tmp) tmp = mkdtempSync(join(tmpdir(), "vault-outbox-"));
+    const p = join(tmp, name);
+    writeFileSync(p, body);
+    return p;
+  }
+
+  /**
+   * A fetch stub that routes the three POSTs the reply path makes:
+   *   - .../api/notes            → create the outbound note (id "note-OUT")
+   *   - .../api/storage/upload   → upload (configurable status + body per call index)
+   *   - .../<id>/attachments     → link (configurable status)
+   * Records each call so a test can assert the ordering + payloads.
+   */
+  function replyFetch(opts: {
+    uploadResponses?: Array<{ status: number; body: unknown }>;
+    linkStatus?: number;
+  }) {
+    const calls: { url: string; method: string; body?: string; isForm: boolean }[] = [];
+    let uploadIdx = 0;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = (init?.method ?? "GET").toUpperCase();
+      const isForm = init?.body instanceof FormData;
+      calls.push({ url: u, method, body: isForm ? undefined : String(init?.body ?? ""), isForm });
+      if (u.endsWith("/api/notes") && method === "POST") {
+        return new Response(JSON.stringify({ id: "note-OUT" }), { status: 201 });
+      }
+      if (u.endsWith("/api/storage/upload") && method === "POST") {
+        const r = opts.uploadResponses?.[uploadIdx] ?? {
+          status: 201,
+          body: { path: `2026-06-25/up${uploadIdx}.png`, mimeType: "image/png" },
+        };
+        uploadIdx += 1;
+        return new Response(JSON.stringify(r.body), { status: r.status });
+      }
+      if (u.includes("/attachments") && method === "POST") {
+        return new Response(JSON.stringify({ id: "att-1" }), { status: opts.linkStatus ?? 201 });
+      }
+      // ensureSchema PUTs (from start) + anything else → ok.
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    return { calls };
+  }
+
+  test("uploads each outbox file to storage + links it onto the just-written outbound note", async () => {
+    const { calls } = replyFetch({
+      uploadResponses: [
+        { status: 201, body: { path: "2026-06-25/a.png", mimeType: "image/png" } },
+        { status: 201, body: { path: "2026-06-25/b.pdf", mimeType: "application/pdf" } },
+      ],
+    });
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    const f1 = tmpFile("chart.png", "PNGBYTES");
+    const f2 = tmpFile("report.pdf", "PDFBYTES");
+    const result = await t.reply({ channel: "eng", text: "here", files: [f1, f2] });
+    expect(result.sent).toEqual(["note-OUT"]);
+
+    // The note POST came FIRST (so the attachments link to a real note id), then the two
+    // upload+link pairs.
+    const ordered = calls.filter(
+      (c) =>
+        c.url.endsWith("/api/notes") ||
+        c.url.endsWith("/api/storage/upload") ||
+        c.url.includes("/attachments"),
+    );
+    expect(ordered[0]!.url).toBe("http://127.0.0.1:1940/vault/default/api/notes");
+    const uploads = calls.filter((c) => c.url.endsWith("/api/storage/upload"));
+    const links = calls.filter((c) => c.url.includes("/attachments"));
+    expect(uploads).toHaveLength(2);
+    expect(uploads.every((c) => c.isForm)).toBe(true); // multipart
+    expect(links).toHaveLength(2);
+    // The link POSTs target the just-created note id + carry { path, mimeType } from upload.
+    expect(links[0]!.url).toBe("http://127.0.0.1:1940/vault/default/api/notes/note-OUT/attachments");
+    const linkBody = JSON.parse(links[0]!.body!) as { path: string; mimeType: string };
+    expect(linkBody).toEqual({ path: "2026-06-25/a.png", mimeType: "image/png" });
+  });
+
+  test("a disallowed-extension file (vault 400) is SKIPPED — the reply + other files still post", async () => {
+    const { calls } = replyFetch({
+      uploadResponses: [
+        { status: 400, body: { error: "File type .exe not allowed" } }, // rejected
+        { status: 201, body: { path: "2026-06-25/ok.png", mimeType: "image/png" } }, // accepted
+      ],
+    });
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    const bad = tmpFile("evil.exe", "MZ...");
+    const good = tmpFile("ok.png", "PNG");
+    const result = await t.reply({ channel: "eng", text: "two files", files: [bad, good] });
+    // The reply note still posted (text is durable).
+    expect(result.sent).toEqual(["note-OUT"]);
+    // Both uploads attempted; only the ACCEPTED one gets linked (the 400 file is skipped).
+    expect(calls.filter((c) => c.url.endsWith("/api/storage/upload"))).toHaveLength(2);
+    const links = calls.filter((c) => c.url.includes("/attachments"));
+    expect(links).toHaveLength(1);
+    expect((JSON.parse(links[0]!.body!) as { path: string }).path).toBe("2026-06-25/ok.png");
+  });
+
+  test("an oversize file (vault 413) is SKIPPED gracefully — reply still posts, no link", async () => {
+    const { calls } = replyFetch({
+      uploadResponses: [{ status: 413, body: { error: "File too large (200MB). Max: 100MB" } }],
+    });
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    const big = tmpFile("huge.mp4", "BIGDATA");
+    const result = await t.reply({ channel: "eng", text: "big one", files: [big] });
+    expect(result.sent).toEqual(["note-OUT"]); // reply still posted.
+    expect(calls.filter((c) => c.url.includes("/attachments"))).toHaveLength(0); // never linked.
+  });
+
+  test("a LINK failure (vault non-ok) is isolated — the reply still posts, other files unaffected", async () => {
+    const { calls } = replyFetch({
+      uploadResponses: [
+        { status: 201, body: { path: "2026-06-25/a.png", mimeType: "image/png" } },
+        { status: 201, body: { path: "2026-06-25/b.png", mimeType: "image/png" } },
+      ],
+      linkStatus: 500, // BOTH links fail — must not throw / break the reply.
+    });
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    const f1 = tmpFile("a.png", "A");
+    const f2 = tmpFile("b.png", "B");
+    const result = await t.reply({ channel: "eng", text: "links fail", files: [f1, f2] });
+    expect(result.sent).toEqual(["note-OUT"]); // reply still posted (no throw).
+    // Both uploads + both link ATTEMPTS happened (each isolated).
+    expect(calls.filter((c) => c.url.endsWith("/api/storage/upload"))).toHaveLength(2);
+    expect(calls.filter((c) => c.url.includes("/attachments"))).toHaveLength(2);
+  });
+
+  test("a missing local file is skipped, not fatal — the reply still posts", async () => {
+    const { calls } = replyFetch({});
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    const result = await t.reply({
+      channel: "eng",
+      text: "ghost file",
+      files: ["/no/such/file/anywhere.png"],
+    });
+    expect(result.sent).toEqual(["note-OUT"]);
+    // The file couldn't be read → no upload attempted.
+    expect(calls.filter((c) => c.url.endsWith("/api/storage/upload"))).toHaveLength(0);
+  });
+
+  test("a zero-byte file is skipped (no empty-blob upload)", async () => {
+    const { calls } = replyFetch({});
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    const empty = tmpFile("empty.png", "");
+    const result = await t.reply({ channel: "eng", text: "empty", files: [empty] });
+    expect(result.sent).toEqual(["note-OUT"]);
+    expect(calls.filter((c) => c.url.endsWith("/api/storage/upload"))).toHaveLength(0);
+  });
+
+  test("NO files → unchanged reply: a single notes POST, no upload/link", async () => {
+    const { calls } = replyFetch({});
+    const t = new VaultTransport(baseConfig());
+    await t.start(fakeCtx("eng"));
+
+    const result = await t.reply({ channel: "eng", text: "text only" });
+    expect(result.sent).toEqual(["note-OUT"]);
+    expect(calls.filter((c) => c.url.endsWith("/api/notes"))).toHaveLength(1);
+    expect(calls.filter((c) => c.url.endsWith("/api/storage/upload"))).toHaveLength(0);
+    expect(calls.filter((c) => c.url.includes("/attachments"))).toHaveLength(0);
   });
 });
 

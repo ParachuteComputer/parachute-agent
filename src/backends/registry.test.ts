@@ -114,11 +114,19 @@ class FakeBackend implements AgentBackend {
   }
 }
 
-/** A recorder WriteOutbound — captures every posted reply. */
-function recorder(): { calls: { channel: string; reply: string; inReplyTo?: string }[]; fn: WriteOutbound } {
-  const calls: { channel: string; reply: string; inReplyTo?: string }[] = [];
-  const fn: WriteOutbound = async (channel, reply, inReplyTo) => {
-    calls.push({ channel, reply, ...(inReplyTo ? { inReplyTo } : {}) });
+/** A recorder WriteOutbound — captures every posted reply (incl. Phase-2 outbound files). */
+function recorder(): {
+  calls: { channel: string; reply: string; inReplyTo?: string; files?: string[] }[];
+  fn: WriteOutbound;
+} {
+  const calls: { channel: string; reply: string; inReplyTo?: string; files?: string[] }[] = [];
+  const fn: WriteOutbound = async (channel, reply, inReplyTo, _threadId, files) => {
+    calls.push({
+      channel,
+      reply,
+      ...(inReplyTo ? { inReplyTo } : {}),
+      ...(files ? { files } : {}),
+    });
   };
   return { calls, fn };
 }
@@ -329,6 +337,82 @@ describe("ProgrammaticAgentRegistry — inbound enqueue + outbound", () => {
     expect(rec.calls).toHaveLength(2);
     expect(rec.calls[0]!.reply).toContain("surprise throw");
     expect(rec.calls[1]!).toEqual({ channel: "eng", reply: "reply:second (ok)" });
+  });
+});
+
+describe("ProgrammaticAgentRegistry — OUTBOUND file attachments (Phase 2)", () => {
+  test("a turn's swept outbox files ride through writeOutbound as `files` alongside the reply text", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m, sid) => ({
+      ok: true,
+      reply: "here you go",
+      sessionId: sid,
+      outboxFiles: [
+        { absPath: "/ws/eng/outbox/chart.png", basename: "chart.png" },
+        { absPath: "/ws/eng/outbox/report.pdf", basename: "report.pdf" },
+      ],
+    });
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "make me a chart" });
+    await until(() => rec.calls.length === 1);
+
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.reply).toBe("here you go");
+    expect(rec.calls[0]!.files).toEqual([
+      "/ws/eng/outbox/chart.png",
+      "/ws/eng/outbox/report.pdf",
+    ]);
+  });
+
+  test("outbox files with NO reply text STILL write an outbound note (so the attachment has a note to hang off)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m, sid) => ({
+      ok: true,
+      reply: "",
+      sessionId: sid,
+      outboxFiles: [{ absPath: "/ws/eng/outbox/only.png", basename: "only.png" }],
+    });
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "just the file please" });
+    await until(() => rec.calls.length === 1);
+
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.reply).toBe("");
+    expect(rec.calls[0]!.files).toEqual(["/ws/eng/outbox/only.png"]);
+  });
+
+  test("NO outbox files → text-only reply, `files` is undefined (unchanged behavior)", async () => {
+    const backend = new FakeBackend();
+    // The default resultFor returns no outboxFiles.
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "hi" });
+    await until(() => rec.calls.length === 1);
+
+    expect(rec.calls).toHaveLength(1);
+    expect(rec.calls[0]!.reply).toBe("reply:hi");
+    expect(rec.calls[0]!.files).toBeUndefined();
+  });
+
+  test("empty reply AND no outbox files → NO outbound note at all (clean chat)", async () => {
+    const backend = new FakeBackend();
+    backend.resultFor = (m, sid) => ({ ok: true, reply: "", sessionId: sid });
+    const rec = recorder();
+    const reg = new ProgrammaticAgentRegistry({ backend, writeOutbound: rec.fn });
+    await reg.register(specFor("eng"));
+
+    reg.enqueue("eng", { content: "tool-only work" });
+    await until(() => backend.calls.length === 1);
+    await new Promise<void>((r) => setTimeout(r, 5));
+    expect(rec.calls).toHaveLength(0);
   });
 });
 

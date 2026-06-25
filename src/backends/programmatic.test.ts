@@ -20,7 +20,7 @@
  *  - stop() clears the resume id; status() is live.
  */
 import { describe, test, expect, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, statSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, statSync, existsSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -32,6 +32,9 @@ import {
   safeAttachmentBasename,
   ATTACHMENT_STAGING_DIR,
   ATTACHMENT_MAX_COUNT,
+  OUTBOX_DIR,
+  OUTBOX_MAX_COUNT,
+  buildOutboxInstruction,
   TURN_MAX_ATTEMPTS,
   TURN_RETRY_BACKOFF_MS,
   type ProgrammaticBackendDeps,
@@ -1711,5 +1714,205 @@ describe("ProgrammaticBackend.deliver — inbound attachment staging", () => {
     expect(result.ok).toBe(true);
     // No file staged → the lazy mkdir never fired → no empty attachments/ dir.
     expect(existsSync(join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OUTBOUND FILE ATTACHMENTS (Phase 2) — the backend tells the turn how to attach
+// (write into ./outbox/) + sweeps the PRIVATE session outbox/ after a SUCCESSFUL
+// turn, surfacing the files on the result for the daemon to upload + link onto the
+// outbound note. The outbox is RESET per-turn so files never bleed across turns.
+// ---------------------------------------------------------------------------
+
+/** The absolute outbox dir for an agent's private session workspace. */
+function outboxOf(name = "eng"): string {
+  return join(sessionsDir, name, OUTBOX_DIR);
+}
+
+/** Write a file into the agent's private outbox (creating the dir) — simulating what the
+ *  turn would do. Called from a spawnFn so it lands DURING the turn, before the sweep. */
+function seedOutbox(name: string, files: Record<string, string>): void {
+  const dir = outboxOf(name);
+  mkdirSync(dir, { recursive: true });
+  for (const [fname, body] of Object.entries(files)) {
+    writeFileSync(join(dir, fname), body);
+  }
+}
+
+describe("ProgrammaticBackend.deliver — outbound file attachments (outbox sweep)", () => {
+  test("the turn message always carries the outbox instruction naming the ABSOLUTE outbox dir", async () => {
+    mkDirs("outbox-instr");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-O", "done") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "do a thing", createSession("sess-O"));
+    expect(result.ok).toBe(true);
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain("do a thing");
+    // The instruction names the ABSOLUTE private-session outbox dir (NOT a `./outbox/`
+    // relative hint), so the agent writes where the sweep actually reads — even when its
+    // cwd is a shared spec.workspace.
+    expect(cmd).toContain(buildOutboxInstruction(outboxOf("eng")));
+    expect(cmd).toContain(outboxOf("eng"));
+    expect(cmd).not.toContain("./outbox/");
+  });
+
+  test("files the turn writes into outbox/ are swept + surfaced on the result (safe basenames)", async () => {
+    mkDirs("outbox-sweep");
+    // The spawnFn seeds the outbox DURING the turn (before the post-turn sweep).
+    const calls: string[][] = [];
+    const fn: ProgrammaticSpawnFn = (argv) => {
+      calls.push(argv);
+      seedOutbox("eng", { "chart.png": "PNGDATA", "report.pdf": "PDFDATA" });
+      return {
+        stdout: new Response(successTurn("sess-S", "here you go")).body,
+        stderr: new Response("").body,
+        exited: Promise.resolve(0),
+      };
+    };
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "make files", createSession("sess-S"));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.outboxFiles).toBeDefined();
+    const names = (result.outboxFiles ?? []).map((f) => f.basename).sort();
+    expect(names).toEqual(["chart.png", "report.pdf"]);
+    // Absolute paths point INTO the private session outbox.
+    for (const f of result.outboxFiles ?? []) {
+      expect(f.absPath.startsWith(outboxOf("eng"))).toBe(true);
+      expect(existsSync(f.absPath)).toBe(true);
+    }
+  });
+
+  test("a FAILED turn never surfaces outbox files (swept only on success)", async () => {
+    mkDirs("outbox-fail");
+    const fn: ProgrammaticSpawnFn = () => {
+      // The turn wrote a file, but the turn ITSELF fails — we must not surface it.
+      seedOutbox("eng", { "orphan.png": "X" });
+      return {
+        stdout: new Response(
+          ndjson({ type: "result", subtype: "error_during_execution", is_error: true, session_id: "sess-FX" }),
+        ).body,
+        stderr: new Response("").body,
+        exited: Promise.resolve(1),
+      };
+    };
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "fail", createSession("sess-FX"));
+    expect(result.ok).toBe(false);
+    // No outboxFiles field on a failure result (type-level: only the success arm carries it).
+    expect((result as { outboxFiles?: unknown }).outboxFiles).toBeUndefined();
+  });
+
+  test("the outbox is RESET per-turn — a prior turn's leftover never bleeds into the next reply", async () => {
+    mkDirs("outbox-reset");
+    // Pre-seed a leftover file BEFORE the first turn (as if a prior turn left it).
+    seedOutbox("eng", { "stale.png": "OLD" });
+    // The turn does NOT write anything new → after the pre-turn reset the outbox is empty.
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-R", "no files this time") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "reset please", createSession("sess-R"));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // The stale file was cleared at the start of the turn → no swept files.
+    expect(result.outboxFiles).toBeUndefined();
+    expect(existsSync(join(outboxOf("eng"), "stale.png"))).toBe(false);
+  });
+
+  test("NO outbox files → text-only reply (outboxFiles absent), unchanged behavior", async () => {
+    mkDirs("outbox-none");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-NN", "plain") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "nothing to attach", createSession("sess-NN"));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.reply).toBe("plain");
+    expect(result.outboxFiles).toBeUndefined();
+  });
+
+  test("subdirs + zero-byte (partial) files are skipped; only regular non-empty files sweep", async () => {
+    mkDirs("outbox-filter");
+    const fn: ProgrammaticSpawnFn = () => {
+      const dir = outboxOf("eng");
+      mkdirSync(join(dir, "a-subdir"), { recursive: true });
+      writeFileSync(join(dir, "empty.png"), ""); // zero-byte → skip.
+      writeFileSync(join(dir, "good.png"), "REAL");
+      return {
+        stdout: new Response(successTurn("sess-FT", "filtered")).body,
+        stderr: new Response("").body,
+        exited: Promise.resolve(0),
+      };
+    };
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "filter", createSession("sess-FT"));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const names = (result.outboxFiles ?? []).map((f) => f.basename);
+    expect(names).toEqual(["good.png"]);
+  });
+
+  test("a SYMLINK in the outbox is skipped — never dereferenced + uploaded (security defense in depth)", async () => {
+    mkDirs("outbox-symlink");
+    // A target file OUTSIDE the outbox the symlink points at.
+    const outsideDir = mkdtempSync(join(tmpdir(), "outbox-outside-"));
+    const secret = join(outsideDir, "secret.png");
+    writeFileSync(secret, "SECRETBYTES");
+    const fn: ProgrammaticSpawnFn = () => {
+      const dir = outboxOf("eng");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "real.png"), "REAL");
+      // A symlink inside the outbox pointing at the outside secret.
+      symlinkSync(secret, join(dir, "link.png"));
+      return {
+        stdout: new Response(successTurn("sess-LN", "ok")).body,
+        stderr: new Response("").body,
+        exited: Promise.resolve(0),
+      };
+    };
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+    try {
+      const result = await backend.deliver(handle, "symlink", createSession("sess-LN"));
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // Only the real regular file was swept; the symlink was rejected.
+      expect((result.outboxFiles ?? []).map((f) => f.basename)).toEqual(["real.png"]);
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  test("caps the swept files at OUTBOX_MAX_COUNT", async () => {
+    mkDirs("outbox-cap");
+    const total = OUTBOX_MAX_COUNT + 5;
+    const fn: ProgrammaticSpawnFn = () => {
+      const files: Record<string, string> = {};
+      // Zero-pad so the sweep's lexical sort is stable + matches numeric order.
+      for (let i = 0; i < total; i++) files[`f${String(i).padStart(3, "0")}.png`] = `B${i}`;
+      seedOutbox("eng", files);
+      return {
+        stdout: new Response(successTurn("sess-CAP", "many")).body,
+        stderr: new Response("").body,
+        exited: Promise.resolve(0),
+      };
+    };
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "lots", createSession("sess-CAP"));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect((result.outboxFiles ?? []).length).toBe(OUTBOX_MAX_COUNT);
   });
 });

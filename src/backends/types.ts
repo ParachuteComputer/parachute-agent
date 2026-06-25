@@ -124,6 +124,21 @@ export interface DeliverUsage {
 }
 
 /**
+ * One file the turn wrote into its PRIVATE session workspace `outbox/` dir (Phase 2:
+ * outbound file attachments). Swept by the backend after a successful turn + surfaced
+ * on the {@link DeliverResult} so the daemon's outbound write uploads it to the vault
+ * + links it onto the outbound note. UNTRUSTED filename (the agent chose it) — the
+ * backend already reduced it to a safe basename, but the downstream vault upload
+ * re-derives the storage filename + validates the extension server-side.
+ */
+export interface OutboxFile {
+  /** Absolute path to the swept file on disk (inside the private session `outbox/`). */
+  absPath: string;
+  /** A SAFE basename (no path components, no traversal) — the display name + ext source. */
+  basename: string;
+}
+
+/**
  * The result of delivering one message — a discriminated union so a failure is
  * always observable inline (never a silent drop). On success the daemon turns
  * `reply` into an outbound `#agent/message/outbound` note (the wiring follow-up).
@@ -141,6 +156,16 @@ export type DeliverResult =
       sessionId?: string;
       /** Optional token/cost usage for observability. */
       usage?: DeliverUsage;
+      /**
+       * OUTBOUND FILE ATTACHMENTS (Phase 2): files the turn wrote into its PRIVATE
+       * session workspace `outbox/` dir. After a successful turn the backend sweeps
+       * that dir and surfaces the swept files here (absolute path + a safe basename);
+       * the daemon's outbound write uploads each to the vault + links it onto the
+       * outbound `#agent/message/outbound` note so a surface renders it. Absent/empty
+       * → a text-only reply (today's behavior). Surfaced ONLY on a successful turn
+       * (an outbox from a failed turn is discarded with the workspace).
+       */
+      outboxFiles?: OutboxFile[];
     }
   | {
       ok: false;
@@ -201,6 +226,12 @@ export interface AgentBackend {
    * a safe basename) before the turn and appends a workspace-relative pointer to the
    * prompt, so the `claude -p` turn can `Read` them. ADDITIVE — absent/empty → no
    * staging, the turn behaves exactly as before.
+   *
+   * OUTBOUND attachments (Phase 2) are the symmetric inverse: the backend tells the turn
+   * to write any reply attachments into its private `outbox/` dir, then — on a SUCCESSFUL
+   * turn — sweeps that dir and surfaces the files on the result's `outboxFiles`, which the
+   * daemon uploads to the vault + links onto the outbound note. ADDITIVE — no outbox files
+   * → an unchanged text-only reply.
    */
   deliver(
     handle: AgentHandle,

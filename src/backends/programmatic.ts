@@ -54,7 +54,7 @@
  * it is handed.
  */
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readdirSync, lstatSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSpec } from "../sandbox/types.ts";
 import type { InboundAttachment } from "../transport.ts";
@@ -85,6 +85,7 @@ import type {
   DeliverResult,
   DeliverUsage,
   InterimSink,
+  OutboxFile,
   TurnSession,
 } from "./types.ts";
 
@@ -103,6 +104,35 @@ export const ATTACHMENT_STAGING_DIR = "attachments" as const;
 export const ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024;
 /** Max number of attachments staged per turn — a sane bound on fan-out. */
 export const ATTACHMENT_MAX_COUNT = 20;
+
+/**
+ * OUTBOUND FILE ATTACHMENTS (Phase 2) — the symmetric inverse of inbound staging.
+ * The turn writes files into the PRIVATE session `outbox/` (named by ABSOLUTE path in the
+ * turn instruction, so it works regardless of the turn's cwd); after a SUCCESSFUL turn the
+ * backend sweeps the dir + surfaces the files so the daemon's outbound write uploads each
+ * to the vault + links it onto the outbound note.
+ */
+/** The subdir (under the PRIVATE session workspace) the turn writes outbound files into. */
+export const OUTBOX_DIR = "outbox" as const;
+/** Max number of outbox files swept per turn — the same fan-out bound as inbound staging. */
+export const OUTBOX_MAX_COUNT = 20;
+
+/**
+ * Build the instruction appended to the turn so the agent knows HOW to attach a file to
+ * its reply. It names the ABSOLUTE outbox dir (the PRIVATE session `outbox/`, the dir the
+ * sweep actually reads) — NOT a `./outbox/` relative hint, because the turn's cwd is
+ * `spec.workspace` (a shared dir) when one is set, so a relative path would land in the
+ * WRONG place and never be swept. Mirrors how inbound attachments are surfaced by absolute
+ * path. Kept short + imperative. `outboxDir` is the absolute path from `deliver`.
+ */
+export function buildOutboxInstruction(outboxDir: string): string {
+  return (
+    `To attach a file to your reply, write it into ${outboxDir} (create the dir if needed). ` +
+    "Files there are uploaded to the vault and attached to your reply. Allowed types: " +
+    "images (.png .jpg .jpeg .gif .webp), .pdf, audio (.wav .mp3 .m4a .ogg .webm), .mp4 " +
+    "— other types are skipped. Omit this if you have no file to attach."
+  );
+}
 
 /**
  * Sanitize a (possibly untrusted, possibly path-ful) attachment filename/path to a SAFE
@@ -547,6 +577,30 @@ export class ProgrammaticBackend implements AgentBackend {
       }
     }
 
+    // ── OUTBOUND FILE ATTACHMENTS (Phase 2) ─────────────────────────────────────────
+    // The symmetric inverse of inbound staging: tell the turn HOW to attach a file to its
+    // reply (write it into the ABSOLUTE outbox dir), then — after a SUCCESSFUL turn — sweep
+    // that dir + surface the files for the daemon's outbound write to upload + link onto the
+    // outbound note. The outbox is the PRIVATE session `outbox/` (NEVER a shared
+    // `spec.workspace`), and it is RESET to empty BEFORE the turn so a prior turn's files
+    // can't bleed into this one's reply. The instruction names the ABSOLUTE path (not a
+    // `./outbox/` relative hint) — the turn's cwd is the SHARED `spec.workspace` when one is
+    // set, so a relative path would write to the wrong dir and never be swept. We append the
+    // instruction to EVERY turn (cheap + idempotent — the dir is empty unless the agent
+    // writes to it). Only the vault transport acts on the swept files downstream; a non-vault
+    // channel simply ignores them.
+    const outboxDir = join(workspace, OUTBOX_DIR);
+    // Per-turn fresh: clear any leftover from a prior turn (best-effort; a stale dir must
+    // never block the turn). Recreated lazily by the agent if it attaches.
+    try {
+      rmSync(outboxDir, { recursive: true, force: true });
+    } catch {
+      // A failed pre-clean is non-fatal — the post-turn sweep filters by mtime-free read,
+      // but the bleed risk is bounded because a SUCCESSFUL turn always re-sweeps the current
+      // contents (a prior turn's files would only persist if THIS turn also failed to clean).
+    }
+    turnMessage = `${turnMessage}\n\n[${buildOutboxInstruction(outboxDir)}]`;
+
     // System prompt (design 2026-06-16-channel-system-prompt.md). When the spec
     // carries one, write it to a per-session file (0600) and pass the `-file` flag.
     // The flag is PER-INVOCATION (not persistent), so we (re)write the file + pass
@@ -692,11 +746,19 @@ export class ProgrammaticBackend implements AgentBackend {
               ? { totalCostUsd: parsed.totalCostUsd }
               : undefined;
 
+          // OUTBOUND FILE ATTACHMENTS (Phase 2): sweep the PRIVATE session `outbox/` for
+          // files the turn wrote, ONLY on success — surfaced on the result so the daemon's
+          // outbound write uploads + links them onto the outbound note. Best-effort: a sweep
+          // failure logs + yields no files (the text reply still posts). An outbox from a
+          // FAILED turn is never swept (it's discarded with the turn outcome).
+          const outboxFiles = this.sweepOutbox(outboxDir);
+
           return {
             ok: true,
             reply: parsed.reply ?? "",
             ...(parsed.sessionId ? { sessionId: parsed.sessionId } : {}),
             ...(usage ? { usage } : {}),
+            ...(outboxFiles.length > 0 ? { outboxFiles } : {}),
           };
         }
 
@@ -882,6 +944,74 @@ export class ProgrammaticBackend implements AgentBackend {
       }
     }
     return staged;
+  }
+
+  /**
+   * Sweep the agent's PRIVATE session `outbox/` for files the turn wrote, returning each
+   * as an {@link OutboxFile} (absolute path + a SAFE basename). Called ONLY after a
+   * SUCCESSFUL turn — the daemon's outbound write uploads each to the vault + links it onto
+   * the outbound note (Phase 2). Best-effort + bounded:
+   *  - the dir absent / unreadable → `[]` (no outbox = a text-only reply, today's behavior);
+   *  - SKIP subdirectories, symlinks, and zero-byte files (a partial/in-progress write);
+   *  - the basename is reduced to a SAFE basename ({@link safeAttachmentBasename}) — the
+   *    AGENT chose the filename, so it's untrusted (defense in depth; the vault upload
+   *    re-derives the storage name + validates the extension server-side too);
+   *  - capped at {@link OUTBOX_MAX_COUNT} (a sane fan-out bound, mirrors inbound staging).
+   *
+   * This does NOT delete the swept files — the whole `outbox/` is RESET at the START of the
+   * NEXT turn (the per-turn-fresh contract in {@link deliver}), and the session workspace is
+   * the agent's own private dir, so leftover files never leak across agents.
+   */
+  private sweepOutbox(outboxDir: string): OutboxFile[] {
+    let entries: string[];
+    try {
+      entries = readdirSync(outboxDir);
+    } catch {
+      // Absent (the common case — the agent attached nothing) or unreadable → no files.
+      return [];
+    }
+    // Stable order so a multi-file reply is deterministic (and the cap takes the first N).
+    entries.sort();
+    const swept: OutboxFile[] = [];
+    const usedNames = new Set<string>();
+    for (const name of entries) {
+      if (swept.length >= OUTBOX_MAX_COUNT) {
+        console.warn(
+          `parachute-agent: outbox has more than ${OUTBOX_MAX_COUNT} files; ` +
+            `attaching the first ${OUTBOX_MAX_COUNT}.`,
+        );
+        break;
+      }
+      const absPath = join(outboxDir, name);
+      let st;
+      try {
+        // `lstatSync` (does NOT follow symlinks) so a SYMLINK inside the outbox — even one
+        // pointing at a regular file OUTSIDE the outbox (e.g. /etc/hosts) — is rejected by
+        // the `isFile()` check below (a symlink is `isSymbolicLink()`, not `isFile()`), not
+        // dereferenced and uploaded. Defense in depth: the sandbox write-confinement already
+        // stops the agent creating such a symlink, but never read+upload through one.
+        st = lstatSync(absPath);
+      } catch {
+        continue; // a vanished entry / race — skip.
+      }
+      // Only REGULAR, NON-EMPTY files: skip subdirs, symlinks, special files, and a zero-byte
+      // (partial/in-progress) write so we never upload an empty blob or a symlink target.
+      if (!st.isFile() || st.size === 0) continue;
+      // The AGENT chose this filename — sanitize to a safe basename (defense in depth).
+      let base = safeAttachmentBasename(name);
+      // De-dup colliding sanitized names so two files don't collapse to one display name.
+      if (usedNames.has(base)) {
+        let n = 2;
+        const dot = base.lastIndexOf(".");
+        const stem = dot > 0 ? base.slice(0, dot) : base;
+        const ext = dot > 0 ? base.slice(dot) : "";
+        while (usedNames.has(`${stem}-${n}${ext}`)) n++;
+        base = `${stem}-${n}${ext}`;
+      }
+      usedNames.add(base);
+      swept.push({ absPath, basename: base });
+    }
+    return swept;
   }
 
   /**

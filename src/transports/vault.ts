@@ -240,6 +240,13 @@ const DEFAULT_VAULT_URL = "http://127.0.0.1:1940";
 const DEFAULT_PATH_PREFIX = "channel";
 
 /**
+ * OUTBOUND FILE ATTACHMENTS (Phase 2): max files uploaded + linked onto one outbound note.
+ * Defense in depth — the programmatic backend already caps the outbox sweep at the same
+ * bound, but the transport seam shouldn't trust an unbounded `args.files`.
+ */
+const OUTBOX_UPLOAD_MAX_COUNT = 20;
+
+/**
  * Thrown by {@link VaultTransport.setInboundStatus} when a compare-and-swap claim
  * (an `ifUpdatedAt` precondition) FAILED — the note changed since it was read, so
  * another writer won the race (agent#101). The vault returns **409** (`error_type:
@@ -783,7 +790,126 @@ export class VaultTransport implements Transport {
     } catch {
       // Non-JSON / empty body — keep the proposed id.
     }
+
+    // OUTBOUND FILE ATTACHMENTS (Phase 2): after the note exists (so attachments link to a
+    // real note id), upload each swept outbox file to vault storage + link it onto THIS
+    // outbound note. Best-effort + per-file isolated (a disallowed/oversize file is skipped
+    // + logged); the reply text already posted above. A no-files reply is unchanged.
+    if (args.files && args.files.length > 0) {
+      await this.uploadAndLinkFiles(noteId, args.files);
+    }
+
     return { sent: [noteId] };
+  }
+
+  /**
+   * OUTBOUND FILE ATTACHMENTS (Phase 2) — upload each local file to vault storage, then link
+   * it onto the just-written outbound note. The symmetric inverse of the programmatic
+   * backend's inbound staging (which FETCHES vault storage → workspace). The vault token this
+   * transport already holds (`this.token`, a `vault:<name>:write` JWT) authenticates both.
+   *
+   * The two-step contract (parachute-vault `routes.ts`):
+   *   1. UPLOAD bytes — `POST <vaultUrl>/vault/<name>/api/storage/upload` (multipart, field
+   *      `file`) → `201 { path, mimeType }`. The vault VALIDATES the extension server-side
+   *      (an allowlist: .wav .mp3 .m4a .ogg .webm .png .jpg .jpeg .gif .webp .pdf .mp4) and
+   *      caps size at 100MB. A disallowed extension → 400; over the cap → 413. We handle BOTH
+   *      GRACEFULLY: skip that file, log, continue — a single bad file NEVER fails the reply
+   *      (the note already posted) or the other files.
+   *   2. LINK — `POST <vaultUrl>/vault/<name>/api/notes/<noteId>/attachments` JSON `{ path,
+   *      mimeType }` (from the upload response) → `201`. A link failure also skips + logs.
+   *
+   * SECURITY/ROBUSTNESS:
+   *  - The filename uploaded is a SAFE BASENAME ({@link basenameOf}) — the agent chose the
+   *    outbox filename, so it's untrusted; the vault also re-derives the stored filename
+   *    (`<ts>-<uuid><ext>`) so traversal in the upload name can't reshape storage.
+   *  - Per-file isolated: each file's upload+link runs in its own try/catch; one failure
+   *    (network, 400, 413, missing file) is contained.
+   *  - Capped at {@link OUTBOX_UPLOAD_MAX_COUNT} (defense in depth; the backend already caps
+   *    the sweep, but the seam shouldn't trust an unbounded list).
+   *  - NEVER throws — the reply text is already durable; an upload failure must not flip the
+   *    reply to an error (the registry's retry/record logic keys on `reply()` throwing).
+   */
+  private async uploadAndLinkFiles(noteId: string, files: string[]): Promise<void> {
+    const capped = files.slice(0, OUTBOX_UPLOAD_MAX_COUNT);
+    if (files.length > OUTBOX_UPLOAD_MAX_COUNT) {
+      console.warn(
+        `vault transport: ${files.length} outbound files exceeds the cap ` +
+          `(${OUTBOX_UPLOAD_MAX_COUNT}); attaching the first ${OUTBOX_UPLOAD_MAX_COUNT}.`,
+      );
+    }
+    for (const filePath of capped) {
+      try {
+        // Read the bytes off disk. A missing/unreadable file (e.g. cleaned between sweep +
+        // write) is skipped — Bun.file().arrayBuffer() rejects, caught below.
+        const file = Bun.file(filePath);
+        const bytes = await file.arrayBuffer();
+        if (bytes.byteLength === 0) {
+          // A zero-byte (partial) file slipped past the sweep — skip rather than upload an
+          // empty blob.
+          console.warn(`vault transport: outbound file "${filePath}" is empty — skipping.`);
+          continue;
+        }
+        const filename = basenameOf(filePath) || "attachment";
+        const form = new FormData();
+        // The vault derives the mime + the stored filename from the (extension of the)
+        // uploaded filename; pass the SAFE basename so the extension is preserved for the
+        // server-side allowlist check + mime derivation.
+        form.append("file", new Blob([bytes]), filename);
+
+        const uploadUrl = `${this.vaultUrl}/vault/${this.vault}/api/storage/upload`;
+        const upRes = await fetch(uploadUrl, {
+          method: "POST",
+          headers: { authorization: `Bearer ${this.token}` },
+          body: form,
+        });
+        if (!upRes.ok) {
+          // 400 (disallowed extension) / 413 (too big) / any other → SKIP this file, keep
+          // the reply + the rest. The vault's body carries a human reason.
+          const detail = await upRes.text().catch(() => "");
+          console.warn(
+            `vault transport: uploading outbound file "${filename}" failed (${upRes.status}) ` +
+              `${detail} — skipping this attachment (reply already posted)`.trim(),
+          );
+          continue;
+        }
+        const uploaded = (await upRes.json().catch(() => null)) as
+          | { path?: string; mimeType?: string }
+          | null;
+        if (!uploaded || typeof uploaded.path !== "string" || !uploaded.path) {
+          console.warn(
+            `vault transport: upload of "${filename}" returned no path — skipping the link.`,
+          );
+          continue;
+        }
+        const mimeType = uploaded.mimeType || "application/octet-stream";
+
+        // LINK the uploaded asset onto the outbound note. `<noteId>` is the just-created
+        // note's id (the storage attachments route resolves a note by id OR path).
+        const linkUrl = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(noteId)}/attachments`;
+        const linkRes = await fetch(linkUrl, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${this.token}`,
+          },
+          body: JSON.stringify({ path: uploaded.path, mimeType }),
+        });
+        if (!linkRes.ok) {
+          const detail = await linkRes.text().catch(() => "");
+          console.warn(
+            `vault transport: linking attachment "${uploaded.path}" to note "${noteId}" ` +
+              `failed (${linkRes.status}) ${detail} — skipping this attachment`.trim(),
+          );
+          continue;
+        }
+      } catch (err) {
+        // Missing file / network fault / bad JSON — isolated, skipped, logged.
+        console.warn(
+          `vault transport: attaching outbound file "${filePath}" errored (skipping): ` +
+            `${(err as Error).message}`,
+        );
+      }
+    }
   }
 
   /**

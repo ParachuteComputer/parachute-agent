@@ -836,3 +836,57 @@ describe("buildWriteCallback — own-it-don't-strand for an unknown reply_to cha
     expect(captured!.content).toContain("[callback]");
   });
 });
+
+describe("buildWriteOutbound — OUTBOUND file attachments forwarded to the transport (Phase 2)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  test("the swept outbox file paths flow through buildWriteOutbound → VaultTransport.reply → upload + link onto the outbound note", async () => {
+    // Stub global fetch: the note POST, the storage upload, and the attachments link.
+    const seen: { url: string; method: string }[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = String(url);
+      const method = (init?.method ?? "GET").toUpperCase();
+      seen.push({ url: u, method });
+      if (u.endsWith("/api/notes") && method === "POST") {
+        return new Response(JSON.stringify({ id: "out-note-1" }), { status: 201 });
+      }
+      if (u.endsWith("/api/storage/upload")) {
+        return new Response(JSON.stringify({ path: "2026-06-25/x.png", mimeType: "image/png" }), { status: 201 });
+      }
+      if (u.includes("/attachments")) {
+        return new Response(JSON.stringify({ id: "att" }), { status: 201 });
+      }
+      return new Response("{}", { status: 200 }); // ensureSchema PUTs.
+    }) as unknown as typeof fetch;
+
+    const vt = new VaultTransport({ vault: "default", vaultUrl: "http://127.0.0.1:1940", token: "x" });
+    (vt as unknown as { ctx: unknown }).ctx = { channel: "eng", emit() {}, emitPermissionVerdict() {} };
+    const channels = new Map<string, Channel>([
+      ["eng", { name: "eng", transport: vt, entry: { name: "eng", transport: "vault" } }],
+    ]);
+
+    // A real local file the upload reads off disk.
+    const dir = mkdtempSync(join(tmpdir(), "wire-outbox-"));
+    try {
+      const { writeFileSync } = await import("node:fs");
+      const f = join(dir, "chart.png");
+      writeFileSync(f, "PNGBYTES");
+
+      const write = buildWriteOutbound(channels);
+      const res = await write("eng", "here's your chart", "inbound-7", "thread-9", [f]);
+      expect(res && (res as { id?: string }).id).toBe("out-note-1");
+
+      // The full chain ran: note POST → storage upload → attachments link.
+      expect(seen.some((c) => c.url.endsWith("/api/notes") && c.method === "POST")).toBe(true);
+      expect(seen.some((c) => c.url.endsWith("/api/storage/upload") && c.method === "POST")).toBe(true);
+      expect(
+        seen.some((c) => c.url.endsWith("/vault/default/api/notes/out-note-1/attachments") && c.method === "POST"),
+      ).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

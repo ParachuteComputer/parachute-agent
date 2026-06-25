@@ -98,6 +98,15 @@ export type WriteOutbound = (
    * deferred (those notes are externally written; see the PR notes).
    */
   threadId?: string,
+  /**
+   * OUTBOUND FILE ATTACHMENTS (Phase 2): local file paths the turn wrote into its private
+   * `outbox/` (swept by the backend). The daemon's wiring hands them to the transport's
+   * `reply({ files })`; only the VaultTransport acts on them (uploads each to vault storage
+   * + links it onto the just-written outbound note). Absent/empty → a text-only reply
+   * (today's behavior). Best-effort downstream: a single file's upload/link failure is
+   * skipped + logged; the reply text + accepted files still post.
+   */
+  files?: string[],
 ) => Promise<{ id?: string } | void>;
 
 /**
@@ -902,20 +911,29 @@ export class ProgrammaticAgentRegistry {
 
       // The outbound reply — the channel-transcript delivery (the chat bubble). It is
       // ADDITIVE to the primary thread-note record already written above (for BOTH modes).
-      // Empty reply → NO note (reviewer contract — `reply` can be ""): a turn that produced
-      // no text (e.g. tool-only work) leaves the chat clean.
+      // Empty reply AND no outbox files → NO note (reviewer contract — `reply` can be ""): a
+      // turn that produced no text and attached nothing (e.g. tool-only work) leaves the chat
+      // clean. But a turn that attached a FILE with no text DOES get an outbound note (empty
+      // body) so the attachment has a note to hang off (Phase 2).
       //
       // `sourceMessage` — the delivered outbound note id, captured for the callback's
       // `source_message` so an orchestrator can PULL the full reply text. Stays undefined
       // for an empty/tool-only turn (no note) — the callback still fires (status:ok), it
       // just has no reply note to point at (the orchestrator pulls from `source_thread`).
+      //
+      // OUTBOUND FILE ATTACHMENTS (Phase 2): the files the turn wrote into its private
+      // `outbox/` (swept by the backend onto `result.outboxFiles`) ride to the outbound seam
+      // → the transport's `reply({ files })`, which uploads + links each onto THIS outbound
+      // note. Map to absolute paths here (the daemon's reply-args carry `files: string[]`).
+      const outboxPaths = (result.outboxFiles ?? []).map((f) => f.absPath);
       let sourceMessage: string | undefined;
-      if (result.reply && result.reply.length > 0) {
+      if ((result.reply && result.reply.length > 0) || outboxPaths.length > 0) {
         const delivered = await this.deliverOutboundWithRetry(
           channel,
-          result.reply,
+          result.reply ?? "",
           msg.inReplyTo,
           turnThreadId,
+          outboxPaths.length > 0 ? outboxPaths : undefined,
         );
         if (delivered.ok) sourceMessage = delivered.noteId;
         if (!delivered.ok) {
@@ -1134,6 +1152,14 @@ export class ProgrammaticAgentRegistry {
     reply: string,
     inReplyTo?: string,
     threadId?: string,
+    /**
+     * OUTBOUND FILE ATTACHMENTS (Phase 2): local file paths the turn wrote into its
+     * private `outbox/`. Threaded to the outbound seam → the transport's `reply({ files })`
+     * (only the VaultTransport uploads + links them onto the note). Absent/empty → a
+     * text-only reply. A per-file upload/link failure is handled gracefully inside the
+     * transport (skip + log); it does NOT fail the reply, so it never triggers a retry here.
+     */
+    files?: string[],
   ): Promise<{ ok: true; noteId?: string } | { ok: false; error: string }> {
     let lastError = "";
     for (let attempt = 0; attempt <= OUTBOUND_MAX_RETRIES; attempt++) {
@@ -1141,7 +1167,7 @@ export class ProgrammaticAgentRegistry {
         // Capture the written note id (when the seam returns one) so the caller can
         // point a callback's `source_message` at the delivered reply. A void return →
         // no id (the callback then omits source_message — still fires).
-        const written = await this.writeOutbound(channel, reply, inReplyTo, threadId);
+        const written = await this.writeOutbound(channel, reply, inReplyTo, threadId, files);
         return { ok: true, ...(written && written.id ? { noteId: written.id } : {}) };
       } catch (err) {
         lastError = (err as Error).message;

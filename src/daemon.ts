@@ -673,7 +673,7 @@ export function attachedQueueStoreFor(
  * fork the conversation).
  */
 export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutbound {
-  return async (channel, reply, inReplyTo, threadId) => {
+  return async (channel, reply, inReplyTo, threadId, files) => {
     const ch = channels.get(channel);
     if (!ch) {
       throw new Error(`no live transport for channel "${channel}" — cannot post the reply`);
@@ -685,10 +685,16 @@ export function buildWriteOutbound(channels: Map<string, Channel>): WriteOutboun
     const meta: Record<string, string> = {};
     if (inReplyTo) meta.in_reply_to = inReplyTo;
     if (threadId) meta.thread = threadId;
+    // OUTBOUND FILE ATTACHMENTS (Phase 2): the local paths the turn wrote into its private
+    // `outbox/`. The VaultTransport's `reply()` uploads each to vault storage + links it
+    // onto the just-written outbound note (best-effort, per-file isolated — a disallowed/
+    // oversize file is skipped, the reply still posts). A non-vault transport (telegram)
+    // already handles `files` (uploads them as photos/docs); this is additive there.
     const sent = await ch.transport.reply({
       channel,
       text: reply,
       ...(Object.keys(meta).length > 0 ? { meta } : {}),
+      ...(files && files.length > 0 ? { files } : {}),
     });
     // Surface the written outbound note id so the agent-to-agent callback can point its
     // `source_message` at it (the orchestrator pulls the full reply from there). `reply()`
