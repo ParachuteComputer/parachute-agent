@@ -791,7 +791,16 @@ export class ProgrammaticBackend implements AgentBackend {
     const stagingDir = join(workspace, ATTACHMENT_STAGING_DIR);
     // The canonical staging-dir prefix the write target must stay under (defense in depth).
     const stagingPrefix = stagingDir.endsWith("/") ? stagingDir : `${stagingDir}/`;
-    mkdirSync(stagingDir, { recursive: true });
+    // Create the staging dir LAZILY — only just before the first real write. So a turn where
+    // every attachment fails/skips leaves NO empty `attachments/` dir behind (the "no staging
+    // side effects unless a file actually staged" contract).
+    let stagingDirReady = false;
+    const ensureStagingDir = (): void => {
+      if (!stagingDirReady) {
+        mkdirSync(stagingDir, { recursive: true });
+        stagingDirReady = true;
+      }
+    };
 
     const staged: Array<{ absPath: string; mimeType: string }> = [];
     const usedNames = new Set<string>();
@@ -827,6 +836,9 @@ export class ProgrammaticBackend implements AgentBackend {
       }
 
       try {
+        // The storage path is `date/filename` — `encodeURIComponent` percent-encodes the
+        // slash to `%2F`; the vault storage route `decodeURIComponent`s it back before
+        // matching (vault routes.ts), so a single encoded segment is the correct form.
         const url = `${vaultArg.url}/vault/${vaultArg.entry.name}/api/storage/${encodeURIComponent(att.path)}`;
         const res = await fetchFn(url, {
           headers: { authorization: `Bearer ${vaultArg.entry.token}` },
@@ -839,6 +851,17 @@ export class ProgrammaticBackend implements AgentBackend {
           );
           continue;
         }
+        // Pre-flight on Content-Length so an over-cap blob is skipped WITHOUT buffering its
+        // whole body. Best-effort: a missing/garbage header falls through to the post-read
+        // check below (the real guard).
+        const declared = Number(res.headers.get("content-length"));
+        if (Number.isFinite(declared) && declared > ATTACHMENT_MAX_BYTES) {
+          console.warn(
+            `parachute-agent: attachment "${att.path}" declares ${declared} bytes, over the ` +
+              `${ATTACHMENT_MAX_BYTES}-byte cap — skipping this file.`,
+          );
+          continue;
+        }
         const buf = Buffer.from(await res.arrayBuffer());
         if (buf.byteLength > ATTACHMENT_MAX_BYTES) {
           console.warn(
@@ -847,6 +870,7 @@ export class ProgrammaticBackend implements AgentBackend {
           );
           continue;
         }
+        ensureStagingDir();
         writeFileSync(target, buf, { mode: 0o600 });
         usedNames.add(base);
         staged.push({ absPath: target, mimeType: att.mimeType || "application/octet-stream" });

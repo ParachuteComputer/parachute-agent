@@ -1312,7 +1312,7 @@ describe("VaultTransport — ingestInbound", () => {
     const ctx = fakeCtx("eng");
     // start synchronously enough for the test (start just stores ctx).
     void t.start(ctx);
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "note-in-1",
       content: "hello session",
       tags: ["#agent/message", "#agent/message/inbound"],
@@ -1338,7 +1338,7 @@ describe("VaultTransport — ingestInbound", () => {
     const t = new VaultTransport(baseConfig());
     const ctx = fakeCtx("eng");
     void t.start(ctx);
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "our-own-reply",
       content: "I am awake",
       tags: ["#agent/message", "#agent/message/outbound"],
@@ -1351,7 +1351,7 @@ describe("VaultTransport — ingestInbound", () => {
     const t = new VaultTransport(baseConfig());
     const ctx = fakeCtx("eng");
     void t.start(ctx);
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "x",
       content: "y",
       metadata: { channel: "eng", direction: "outbound" },
@@ -1444,7 +1444,7 @@ describe("VaultTransport — ingestInbound", () => {
     const t = new VaultTransport(baseConfig());
     const ctx = fakeCtx("worker");
     void t.start(ctx);
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "note-deleg-1",
       content: "do the sub-task",
       tags: ["#agent/message", "#agent/message/inbound"],
@@ -1688,7 +1688,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     await flush(); // let the fire-and-forget ensureSchema settle (it must not reject globally)
 
     // Transport still delivers inbound after a failed schema declaration.
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "n1",
       content: "still works",
       tags: ["#agent/message", "#agent/message/inbound"],

@@ -31,6 +31,7 @@ import {
   isSessionNotFoundError,
   safeAttachmentBasename,
   ATTACHMENT_STAGING_DIR,
+  ATTACHMENT_MAX_COUNT,
   TURN_MAX_ATTEMPTS,
   TURN_RETRY_BACKOFF_MS,
   type ProgrammaticBackendDeps,
@@ -1648,5 +1649,67 @@ describe("ProgrammaticBackend.deliver — inbound attachment staging", () => {
     expect(result.ok).toBe(true);
     expect(existsSync(join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR))).toBe(false);
     expect(calls[0]!.argv[2]!).not.toContain("Attached files");
+  });
+
+  test("caps the number of staged attachments at ATTACHMENT_MAX_COUNT", async () => {
+    mkDirs("att-cap");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-C", "ok") });
+    // Build MAX_COUNT + 5 fetchable blobs + matching attachment refs.
+    const blobs: Record<string, string> = {};
+    const refs: InboundAttachment[] = [];
+    const total = ATTACHMENT_MAX_COUNT + 5;
+    for (let i = 0; i < total; i++) {
+      const p = `2026-06-24/f${i}.bin`;
+      blobs[p] = `B${i}`;
+      refs.push(att(p, "application/octet-stream"));
+    }
+    const { fetchFn, blobCalls } = mintAndBlobFetch(blobs);
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "many", createSession("sess-C"), undefined, refs);
+    expect(result.ok).toBe(true);
+
+    // Only the first MAX_COUNT were fetched + staged; the overflow was dropped.
+    expect(blobCalls).toHaveLength(ATTACHMENT_MAX_COUNT);
+    const stagingDir = join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR);
+    expect(existsSync(join(stagingDir, `f0.bin`))).toBe(true);
+    expect(existsSync(join(stagingDir, `f${ATTACHMENT_MAX_COUNT - 1}.bin`))).toBe(true);
+    expect(existsSync(join(stagingDir, `f${ATTACHMENT_MAX_COUNT}.bin`))).toBe(false);
+  });
+
+  test("an agent that binds NO vault → attachments skipped (no token to fetch), turn still runs", async () => {
+    mkDirs("att-novault");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-V", "no vault reply") });
+    // A fetch that 500s on any blob — proving we NEVER reach it (no vault → no fetch).
+    const { fetchFn, blobCalls } = mintAndBlobFetch({});
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    // Spec with channels but NO vault binding.
+    const handle = await backend.start({ name: "eng", channels: ["eng"] } as AgentSpec);
+
+    const result = await backend.deliver(handle, "file but no vault", createSession("sess-V"), undefined, [
+      att("2026-06-24/x.png", "image/png"),
+    ]);
+    expect(result.ok).toBe(true);
+    // No blob fetched, no staging dir, no prompt pointer — the turn ran with text only.
+    expect(blobCalls).toHaveLength(0);
+    expect(existsSync(join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR))).toBe(false);
+    expect(calls[0]!.argv[2]!).not.toContain("Attached files");
+  });
+
+  test("all attachments failing → NO empty staging dir left behind", async () => {
+    mkDirs("att-allfail");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-F", "ok") });
+    const { fetchFn } = mintAndBlobFetch({}); // every blob 404s
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "all bad", createSession("sess-F"), undefined, [
+      att("2026-06-24/a.png", "image/png"),
+      att("2026-06-24/b.png", "image/png"),
+    ]);
+    expect(result.ok).toBe(true);
+    // No file staged → the lazy mkdir never fired → no empty attachments/ dir.
+    expect(existsSync(join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR))).toBe(false);
   });
 });
