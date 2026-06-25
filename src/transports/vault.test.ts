@@ -1312,7 +1312,7 @@ describe("VaultTransport — ingestInbound", () => {
     const ctx = fakeCtx("eng");
     // start synchronously enough for the test (start just stores ctx).
     void t.start(ctx);
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "note-in-1",
       content: "hello session",
       tags: ["#agent/message", "#agent/message/inbound"],
@@ -1338,7 +1338,7 @@ describe("VaultTransport — ingestInbound", () => {
     const t = new VaultTransport(baseConfig());
     const ctx = fakeCtx("eng");
     void t.start(ctx);
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "our-own-reply",
       content: "I am awake",
       tags: ["#agent/message", "#agent/message/outbound"],
@@ -1351,12 +1351,89 @@ describe("VaultTransport — ingestInbound", () => {
     const t = new VaultTransport(baseConfig());
     const ctx = fakeCtx("eng");
     void t.start(ctx);
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "x",
       content: "y",
       metadata: { channel: "eng", direction: "outbound" },
     });
     expect(ctx.emitted).toHaveLength(0);
+  });
+
+  test("SURFACES attachments on the emitted InboundMessage when the note carries them (Phase 1)", async () => {
+    // The webhook payload carries `note.attachments` inline (the has-attachments signal);
+    // ingestInbound then fetches the authoritative attachment list (REST) and surfaces the
+    // refs on the emitted message so the programmatic backend can stage them.
+    const calls: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push(String(url));
+      // The attachment-list endpoint → a bare Attachment[] array (vault REST shape).
+      return new Response(
+        JSON.stringify([
+          { id: "a1", noteId: "note-att-1", path: "2026-06-24/pic.png", mimeType: "image/png", createdAt: "x" },
+          { id: "a2", noteId: "note-att-1", path: "2026-06-24/doc.pdf", mimeType: "application/pdf", createdAt: "x" },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    const t = new VaultTransport(baseConfig());
+    const ctx = fakeCtx("eng");
+    void t.start(ctx);
+    await t.ingestInbound({
+      id: "note-att-1",
+      content: "look at these",
+      tags: ["#agent/message", "#agent/message/inbound"],
+      metadata: { agent: "eng", direction: "inbound", sender: "aaron" },
+      // inline list from the trigger payload — the has-attachments SIGNAL.
+      attachments: [{ id: "a1", path: "2026-06-24/pic.png", mimeType: "image/png" }],
+    });
+
+    // It fetched the attachment-list endpoint with the channel's vault token.
+    expect(calls.some((u) => u.endsWith("/vault/default/api/notes/note-att-1/attachments"))).toBe(true);
+
+    expect(ctx.emitted).toHaveLength(1);
+    const m = ctx.emitted[0]!;
+    expect(m.content).toBe("look at these");
+    expect(m.attachments).toBeDefined();
+    expect(m.attachments).toHaveLength(2);
+    expect(m.attachments![0]).toEqual({ path: "2026-06-24/pic.png", mimeType: "image/png", filename: "pic.png" });
+    expect(m.attachments![1]).toEqual({ path: "2026-06-24/doc.pdf", mimeType: "application/pdf", filename: "doc.pdf" });
+  });
+
+  test("attachment-list fetch FAILURE is best-effort — the message is still emitted with text, no attachments", async () => {
+    globalThis.fetch = (async () => new Response("boom", { status: 500 })) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    const ctx = fakeCtx("eng");
+    void t.start(ctx);
+    await t.ingestInbound({
+      id: "note-att-fail",
+      content: "still delivered",
+      tags: ["#agent/message", "#agent/message/inbound"],
+      metadata: { agent: "eng", direction: "inbound" },
+      attachments: [{ id: "a1", path: "2026-06-24/pic.png", mimeType: "image/png" }],
+    });
+    expect(ctx.emitted).toHaveLength(1);
+    expect(ctx.emitted[0]!.content).toBe("still delivered");
+    expect(ctx.emitted[0]!.attachments).toBeUndefined();
+  });
+
+  test("NO inline attachments → NO fetch, emits synchronously (today's behavior)", () => {
+    // Any fetch here would throw — proving the no-attachment path never reaches out.
+    globalThis.fetch = (async () => {
+      throw new Error("must not fetch");
+    }) as unknown as typeof fetch;
+    const t = new VaultTransport(baseConfig());
+    const ctx = fakeCtx("eng");
+    void t.start(ctx);
+    // Not awaited — emit must be synchronous (before any await) when there are no attachments.
+    void t.ingestInbound({
+      id: "note-plain",
+      content: "no files",
+      tags: ["#agent/message", "#agent/message/inbound"],
+      metadata: { agent: "eng", direction: "inbound" },
+    });
+    expect(ctx.emitted).toHaveLength(1);
+    expect(ctx.emitted[0]!.attachments).toBeUndefined();
   });
 
   test("FLATTENS the agent-to-agent callback fields (reply_to/correlation_id/delegation_depth) into meta", () => {
@@ -1367,7 +1444,7 @@ describe("VaultTransport — ingestInbound", () => {
     const t = new VaultTransport(baseConfig());
     const ctx = fakeCtx("worker");
     void t.start(ctx);
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "note-deleg-1",
       content: "do the sub-task",
       tags: ["#agent/message", "#agent/message/inbound"],
@@ -1611,7 +1688,7 @@ describe("VaultTransport — ensureSchema (tag-schema declaration on connect)", 
     await flush(); // let the fire-and-forget ensureSchema settle (it must not reject globally)
 
     // Transport still delivers inbound after a failed schema declaration.
-    t.ingestInbound({
+    void t.ingestInbound({
       id: "n1",
       content: "still works",
       tags: ["#agent/message", "#agent/message/inbound"],

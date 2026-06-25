@@ -45,6 +45,7 @@
 import type { AgentSpec, AgentMode } from "../sandbox/types.ts";
 import { normalizeChannel } from "../sandbox/types.ts";
 import type { AgentBackend, AgentHandle, InterimTurnEvent, TurnSession } from "./types.ts";
+import type { InboundAttachment } from "../transport.ts";
 
 /**
  * The streaming-view sink (design 2026-06-16 build item #1): the daemon wires this
@@ -326,6 +327,13 @@ export interface QueuedMessage {
    * to a finite integer before it lands here; a missing/garbage value reads as 0.
    */
   delegationDepth?: number;
+  /**
+   * Files attached to this inbound message (Phase 1: inbound file attachments → the
+   * programmatic turn). Threaded transport → daemon → `deliver`; the programmatic
+   * backend stages each into the agent's private session workspace so the turn can
+   * `Read` it. Absent/empty → no attachments (today's behavior unchanged).
+   */
+  attachments?: InboundAttachment[];
 }
 
 /** A registered programmatic agent's live status (surfaced in /health + the list). */
@@ -805,8 +813,14 @@ export class ProgrammaticAgentRegistry {
         // Forward each interim event to the streaming-view sink (keyed by channel)
         // as the turn runs — the "watch it work" live progress. The sink swallows
         // its own throws (emitTurnEvent), so a dead live stream can't break the turn.
-        result = await this.backend.deliver(handle.backendHandle, msg.content, turnSession, (e) =>
-          this.emitTurnEvent(channel, e),
+        result = await this.backend.deliver(
+          handle.backendHandle,
+          msg.content,
+          turnSession,
+          (e) => this.emitTurnEvent(channel, e),
+          // Phase 1: inbound attachments → the programmatic backend stages them into the
+          // agent's private workspace so the turn can Read them. Absent/empty → no staging.
+          msg.attachments,
         );
       } catch (err) {
         // The backend contract is failure-as-VALUE, never a throw — but defend so a

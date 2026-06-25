@@ -45,6 +45,9 @@
 
 import type { AgentSpec } from "../sandbox/types.ts";
 import type { InterimTurnEvent } from "./stream-json.ts";
+import type { InboundAttachment } from "../transport.ts";
+
+export type { InboundAttachment } from "../transport.ts";
 
 export type { InterimTurnEvent } from "./stream-json.ts";
 
@@ -192,8 +195,20 @@ export interface AgentBackend {
    * the turn behaves exactly as before; the final {@link DeliverResult} is the
    * durable record either way. (Only the programmatic backend streams today; an
    * interactive retrofit may ignore it.)
+   *
+   * `attachments` (optional, Phase 1) are files attached to the inbound message. The
+   * programmatic backend stages each into the agent's PRIVATE session workspace (under
+   * a safe basename) before the turn and appends a workspace-relative pointer to the
+   * prompt, so the `claude -p` turn can `Read` them. ADDITIVE — absent/empty → no
+   * staging, the turn behaves exactly as before.
    */
-  deliver(handle: AgentHandle, message: string, session: TurnSession, onInterim?: InterimSink): Promise<DeliverResult>;
+  deliver(
+    handle: AgentHandle,
+    message: string,
+    session: TurnSession,
+    onInterim?: InterimSink,
+    attachments?: InboundAttachment[],
+  ): Promise<DeliverResult>;
 
   /**
    * Tear the agent down. For the programmatic backend this is a NO-OP — there is no

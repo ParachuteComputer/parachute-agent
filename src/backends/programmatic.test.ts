@@ -29,12 +29,16 @@ import {
   PROGRAMMATIC_BACKEND_KIND,
   isTransientTurnError,
   isSessionNotFoundError,
+  safeAttachmentBasename,
+  ATTACHMENT_STAGING_DIR,
+  ATTACHMENT_MAX_COUNT,
   TURN_MAX_ATTEMPTS,
   TURN_RETRY_BACKOFF_MS,
   type ProgrammaticBackendDeps,
   type ProgrammaticSpawnFn,
 } from "./programmatic.ts";
 import type { TurnSession } from "./types.ts";
+import type { InboundAttachment } from "../transport.ts";
 import type { SandboxEngine } from "../sandbox/index.ts";
 import type { SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { AgentSpec } from "../sandbox/types.ts";
@@ -1436,5 +1440,276 @@ describe("ProgrammaticBackend.deliver — session-expiry → fresh-create fallba
     if (!result.ok) expect(result.error).toContain("No conversation found");
     // EXACTLY one spawn — the guard prevented any fallback create.
     expect(calls).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// INBOUND FILE ATTACHMENTS (Phase 1) — the programmatic backend stages each
+// attached file into the agent's PRIVATE session workspace (under a SAFE
+// basename, no traversal) and appends a pointer line to the turn prompt so the
+// `claude -p` turn can Read it. Best-effort + isolated per-file.
+// ---------------------------------------------------------------------------
+
+/**
+ * A fetch fake that serves BOTH the mint hub (POST → a token) AND vault storage
+ * blobs (GET .../api/storage/<path> → bytes). `blobs` maps a storage path → the
+ * byte body to return; a path not in the map 404s.
+ */
+function mintAndBlobFetch(blobs: Record<string, string> = {}): {
+  fetchFn: typeof fetch;
+  blobCalls: Array<{ url: string; auth: string | undefined }>;
+} {
+  let n = 0;
+  const blobCalls: Array<{ url: string; auth: string | undefined }> = [];
+  const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
+    const u = String(url);
+    const method = (init?.method ?? "GET").toUpperCase();
+    if (u.includes("/api/storage/")) {
+      const auth = (init?.headers as Record<string, string> | undefined)?.authorization;
+      blobCalls.push({ url: u, auth });
+      const enc = u.split("/api/storage/")[1] ?? "";
+      const path = decodeURIComponent(enc);
+      const body = blobs[path];
+      if (body === undefined) return new Response("not found", { status: 404 });
+      return new Response(body, { status: 200, headers: { "content-type": "application/octet-stream" } });
+    }
+    if (method === "POST") {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { scope: string };
+      n += 1;
+      return new Response(
+        JSON.stringify({ jti: `j${n}`, token: `TOK-${n}`, expires_at: "2026-09-01T00:00:00Z", scope: body.scope }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response("unexpected", { status: 500 });
+  }) as unknown as typeof fetch;
+  return { fetchFn, blobCalls };
+}
+
+function att(path: string, mimeType: string, filename?: string): InboundAttachment {
+  return { path, mimeType, filename: filename ?? path.split("/").pop()! };
+}
+
+describe("safeAttachmentBasename — path-traversal sanitization (security)", () => {
+  test("strips directory components + traversal markers to a plain basename", () => {
+    expect(safeAttachmentBasename("../../etc/passwd")).toBe("passwd");
+    expect(safeAttachmentBasename("/abs/path/report.png")).toBe("report.png");
+    expect(safeAttachmentBasename("a/b/c/note.md")).toBe("note.md");
+    expect(safeAttachmentBasename("..\\..\\windows\\system32\\cmd.exe")).toBe("cmd.exe");
+  });
+  test("collapses disallowed chars to underscore + strips leading dots", () => {
+    expect(safeAttachmentBasename(".hidden")).toBe("hidden");
+    expect(safeAttachmentBasename("a b.png")).toBe("a_b.png");
+  });
+  test("degenerate input → a stable non-empty default", () => {
+    expect(safeAttachmentBasename("")).toBe("file");
+    expect(safeAttachmentBasename("..")).toBe("file");
+    expect(safeAttachmentBasename("/")).toBe("file");
+    expect(safeAttachmentBasename("./")).toBe("file");
+  });
+});
+
+describe("ProgrammaticBackend.deliver — inbound attachment staging", () => {
+  test("stages each blob into the PRIVATE workspace under a safe basename + appends the prompt line", async () => {
+    mkDirs("att-stage");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-A", "looked at the files") });
+    const { fetchFn, blobCalls } = mintAndBlobFetch({
+      "2026-06-24/abc.png": "PNGBYTES",
+      "2026-06-24/def.txt": "hello world",
+    });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(
+      handle,
+      "what is in these",
+      createSession("sess-A"),
+      undefined,
+      [att("2026-06-24/abc.png", "image/png"), att("2026-06-24/def.txt", "text/plain")],
+    );
+    expect(result.ok).toBe(true);
+
+    // Both blobs fetched from the storage endpoint, Bearer the per-turn minted vault token.
+    expect(blobCalls).toHaveLength(2);
+    for (const c of blobCalls) {
+      expect(c.url).toContain("/vault/default/api/storage/");
+      expect(c.auth).toMatch(/^Bearer TOK-/);
+    }
+
+    // Both files staged into the PRIVATE session workspace's attachments/ subdir.
+    const stagingDir = join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR);
+    expect(existsSync(join(stagingDir, "abc.png"))).toBe(true);
+    expect(existsSync(join(stagingDir, "def.txt"))).toBe(true);
+    expect(readFileSync(join(stagingDir, "abc.png"), "utf-8")).toBe("PNGBYTES");
+    expect(readFileSync(join(stagingDir, "def.txt"), "utf-8")).toBe("hello world");
+
+    // The staged paths are WITHIN the private workspace.
+    expect(join(stagingDir, "abc.png").startsWith(join(sessionsDir, "eng"))).toBe(true);
+
+    // The turn prompt (argv) carries the attachment pointer line with the staged
+    // absolute paths + mime types, appended after the original message.
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain("Attached files");
+    expect(cmd).toContain(join(stagingDir, "abc.png"));
+    expect(cmd).toContain("image/png");
+    expect(cmd).toContain(join(stagingDir, "def.txt"));
+    expect(cmd).toContain("text/plain");
+    expect(cmd).toContain("what is in these");
+  });
+
+  test("a malicious filename is staged as a SAFE basename inside the staging dir, never outside (security)", async () => {
+    mkDirs("att-traversal");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-T", "ok") });
+    // The blob's STORAGE PATH (what we fetch) is benign; the FILENAME is the attack vector.
+    const { fetchFn } = mintAndBlobFetch({ "2026-06-24/legit.bin": "EVILBYTES" });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(
+      handle,
+      "stage this",
+      createSession("sess-T"),
+      undefined,
+      [att("2026-06-24/legit.bin", "application/octet-stream", "../../../../tmp/pwned.sh")],
+    );
+    expect(result.ok).toBe(true);
+
+    const stagingDir = join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR);
+    // Landed INSIDE the staging dir under a sanitized basename, NOT at /tmp/pwned.sh.
+    expect(existsSync(join(stagingDir, "pwned.sh"))).toBe(true);
+    expect(existsSync("/tmp/pwned.sh")).toBe(false);
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain(join(stagingDir, "pwned.sh"));
+    expect(cmd).not.toContain("/tmp/pwned.sh");
+  });
+
+  test("a malicious storage PATH (no separate filename) also sanitizes to a basename in the staging dir", async () => {
+    mkDirs("att-pathtraversal");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-P", "ok") });
+    // The path the daemon hands us IS the attack; we fetch it verbatim but stage by basename.
+    const traversal = "../../../../tmp/evil.sh";
+    const { fetchFn } = mintAndBlobFetch({ [traversal]: "X" });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "x", createSession("sess-P"), undefined, [
+      { path: traversal, mimeType: "text/plain", filename: traversal },
+    ]);
+    expect(result.ok).toBe(true);
+    const stagingDir = join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR);
+    expect(existsSync(join(stagingDir, "evil.sh"))).toBe(true);
+    expect(existsSync("/tmp/evil.sh")).toBe(false);
+  });
+
+  test("a single blob fetch failure is isolated — the other file stages + the turn runs", async () => {
+    mkDirs("att-isolated");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-I", "partial") });
+    const { fetchFn } = mintAndBlobFetch({ "2026-06-24/good.png": "GOODBYTES" });
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(
+      handle,
+      "two files",
+      createSession("sess-I"),
+      undefined,
+      [att("2026-06-24/missing.png", "image/png"), att("2026-06-24/good.png", "image/png")],
+    );
+    expect(result.ok).toBe(true);
+
+    const stagingDir = join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR);
+    expect(existsSync(join(stagingDir, "good.png"))).toBe(true);
+    expect(existsSync(join(stagingDir, "missing.png"))).toBe(false);
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).toContain(join(stagingDir, "good.png"));
+    expect(cmd).not.toContain("missing.png");
+  });
+
+  test("NO attachments → identical behavior to today (no staging dir, no prompt change)", async () => {
+    mkDirs("att-none");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-N", "plain reply") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "no files here", createSession("sess-N"));
+    expect(result.ok).toBe(true);
+    expect(existsSync(join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR))).toBe(false);
+    const cmd = calls[0]!.argv[2]!;
+    expect(cmd).not.toContain("Attached files");
+    expect(cmd).toContain("no files here");
+  });
+
+  test("an empty attachments array → no staging, no prompt change", async () => {
+    mkDirs("att-empty");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-E", "x") });
+    const backend = new ProgrammaticBackend(baseDeps(fn));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "hello", createSession("sess-E"), undefined, []);
+    expect(result.ok).toBe(true);
+    expect(existsSync(join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR))).toBe(false);
+    expect(calls[0]!.argv[2]!).not.toContain("Attached files");
+  });
+
+  test("caps the number of staged attachments at ATTACHMENT_MAX_COUNT", async () => {
+    mkDirs("att-cap");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-C", "ok") });
+    // Build MAX_COUNT + 5 fetchable blobs + matching attachment refs.
+    const blobs: Record<string, string> = {};
+    const refs: InboundAttachment[] = [];
+    const total = ATTACHMENT_MAX_COUNT + 5;
+    for (let i = 0; i < total; i++) {
+      const p = `2026-06-24/f${i}.bin`;
+      blobs[p] = `B${i}`;
+      refs.push(att(p, "application/octet-stream"));
+    }
+    const { fetchFn, blobCalls } = mintAndBlobFetch(blobs);
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "many", createSession("sess-C"), undefined, refs);
+    expect(result.ok).toBe(true);
+
+    // Only the first MAX_COUNT were fetched + staged; the overflow was dropped.
+    expect(blobCalls).toHaveLength(ATTACHMENT_MAX_COUNT);
+    const stagingDir = join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR);
+    expect(existsSync(join(stagingDir, `f0.bin`))).toBe(true);
+    expect(existsSync(join(stagingDir, `f${ATTACHMENT_MAX_COUNT - 1}.bin`))).toBe(true);
+    expect(existsSync(join(stagingDir, `f${ATTACHMENT_MAX_COUNT}.bin`))).toBe(false);
+  });
+
+  test("an agent that binds NO vault → attachments skipped (no token to fetch), turn still runs", async () => {
+    mkDirs("att-novault");
+    const { fn, calls } = recordingSpawn({ stdout: successTurn("sess-V", "no vault reply") });
+    // A fetch that 500s on any blob — proving we NEVER reach it (no vault → no fetch).
+    const { fetchFn, blobCalls } = mintAndBlobFetch({});
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    // Spec with channels but NO vault binding.
+    const handle = await backend.start({ name: "eng", channels: ["eng"] } as AgentSpec);
+
+    const result = await backend.deliver(handle, "file but no vault", createSession("sess-V"), undefined, [
+      att("2026-06-24/x.png", "image/png"),
+    ]);
+    expect(result.ok).toBe(true);
+    // No blob fetched, no staging dir, no prompt pointer — the turn ran with text only.
+    expect(blobCalls).toHaveLength(0);
+    expect(existsSync(join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR))).toBe(false);
+    expect(calls[0]!.argv[2]!).not.toContain("Attached files");
+  });
+
+  test("all attachments failing → NO empty staging dir left behind", async () => {
+    mkDirs("att-allfail");
+    const { fn } = recordingSpawn({ stdout: successTurn("sess-F", "ok") });
+    const { fetchFn } = mintAndBlobFetch({}); // every blob 404s
+    const backend = new ProgrammaticBackend(baseDeps(fn, { fetchFn }));
+    const handle = await backend.start(specWithVault("eng"));
+
+    const result = await backend.deliver(handle, "all bad", createSession("sess-F"), undefined, [
+      att("2026-06-24/a.png", "image/png"),
+      att("2026-06-24/b.png", "image/png"),
+    ]);
+    expect(result.ok).toBe(true);
+    // No file staged → the lazy mkdir never fired → no empty attachments/ dir.
+    expect(existsSync(join(sessionsDir, "eng", ATTACHMENT_STAGING_DIR))).toBe(false);
   });
 });

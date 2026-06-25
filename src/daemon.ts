@@ -323,6 +323,9 @@ export function contextFor(
           // the vault transport's ingestInbound). When `reply_to` is present, the drain
           // delivers a callback to that channel on turn completion. See callbackFieldsFromMeta.
           ...callbackFieldsFromMeta(msg.meta),
+          // Phase 1: carry inbound file attachments through to the turn (the programmatic
+          // backend stages them into the agent's private workspace so the turn can Read them).
+          ...(msg.attachments && msg.attachments.length > 0 ? { attachments: msg.attachments } : {}),
         });
         return;
       }
@@ -344,6 +347,9 @@ export function contextFor(
           // that arrives before its recipient agent is live must still trigger a callback
           // once the buffered turn runs on register() (the agent#121 replay path).
           ...callbackFieldsFromMeta(msg.meta),
+          // Phase 1: carry inbound attachments through the pending buffer too, so a turn
+          // that runs on register() still stages them.
+          ...(msg.attachments && msg.attachments.length > 0 ? { attachments: msg.attachments } : {}),
         });
         if (outcome === "queued") return;
         // outcome === "unknown" — not an expected programmatic channel. It may still be a
@@ -2583,7 +2589,17 @@ export function createFetchHandler(
       let body: {
         trigger?: string;
         event?: string;
-        note?: { id?: string; path?: string; content?: string; tags?: string[]; metadata?: Record<string, unknown> };
+        note?: {
+          id?: string;
+          path?: string;
+          content?: string;
+          tags?: string[];
+          metadata?: Record<string, unknown>;
+          // The vault `send: "json"` trigger payload includes the note's attachments
+          // inline (each `{ id, path, mimeType, ... }`) — the has-attachments signal +
+          // fast-path the transport uses to surface inbound files (Phase 1).
+          attachments?: Array<{ id?: string; path?: string; mimeType?: string }>;
+        };
       };
       try {
         body = (await req.json()) as typeof body;
@@ -2649,7 +2665,16 @@ export function createFetchHandler(
       // Idempotency: a duplicate trigger delivery for the same note must not
       // double-wake. First-seen → process; already-seen → ack without emitting.
       if (markSeen(note.id)) {
-        vt.ingestInbound({ id: note.id, content: note.content, tags: note.tags, metadata: note.metadata });
+        // Await — ingestInbound is async when the note carries attachments (it fetches
+        // the attachment list before emitting). The `note.attachments` inline list from
+        // the trigger payload is forwarded as the has-attachments signal (Phase 1).
+        await vt.ingestInbound({
+          id: note.id,
+          content: note.content,
+          tags: note.tags,
+          metadata: note.metadata,
+          ...(note.attachments ? { attachments: note.attachments } : {}),
+        });
       }
       // Never write back to the note — the v1 trigger handles its own
       // created/rendered_at markers vault-side.
