@@ -57,6 +57,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentSpec } from "../sandbox/types.ts";
+import type { InboundAttachment } from "../transport.ts";
 import { normalizeChannel } from "../sandbox/types.ts";
 import type { SandboxEngine } from "../sandbox/index.ts";
 import {
@@ -91,6 +92,41 @@ import type {
 const AGENT_NAME_SLUG = /^[a-z0-9_-]+$/i;
 
 export const PROGRAMMATIC_BACKEND_KIND = "programmatic" as const;
+
+/** The staging subdir (under the PRIVATE session workspace) inbound files are written into. */
+export const ATTACHMENT_STAGING_DIR = "attachments" as const;
+/**
+ * Per-attachment byte ceiling for staging. Matches the vault's own 100MB upload cap
+ * (parachute-vault `/api/storage` POST), so we never refuse a file the vault accepted —
+ * but caps a runaway/over-large blob from filling the workspace.
+ */
+export const ATTACHMENT_MAX_BYTES = 100 * 1024 * 1024;
+/** Max number of attachments staged per turn — a sane bound on fan-out. */
+export const ATTACHMENT_MAX_COUNT = 20;
+
+/**
+ * Sanitize a (possibly untrusted, possibly path-ful) attachment filename/path to a SAFE
+ * BASENAME for staging — NO path traversal, NO directory components. `path`/`filename`
+ * come from VAULT DATA (not the operator), so this is the security boundary: we take the
+ * LAST path segment, drop any `..`/empty segments, strip NUL + leading dots, and replace
+ * every character outside `[A-Za-z0-9._-]` with `_`. The result can ONLY name a file
+ * DIRECTLY inside the staging dir — never escape it. Returns `"file"` for a degenerate
+ * input so a write target always exists. The caller additionally verifies the joined
+ * path stays under the staging dir (defense in depth).
+ */
+export function safeAttachmentBasename(name: string): string {
+  // Take the final segment across both slash flavors; this alone defeats `../../etc/x`
+  // (every `..` and the leading dirs are discarded — only the trailing segment survives).
+  const segments = name.split(/[/\\]+/);
+  let base = segments.length > 0 ? segments[segments.length - 1]! : "";
+  // Strip NUL bytes + control chars, collapse disallowed chars to `_`.
+  base = base.replace(/\0/g, "").replace(/[^A-Za-z0-9._-]/g, "_");
+  // No leading dots (no `.`, `..`, or hidden-file surprises).
+  base = base.replace(/^\.+/, "");
+  if (base.length === 0 || base === "." || base === "..") return "file";
+  // Bound the length so a pathological name can't blow up the path.
+  return base.slice(0, 200);
+}
 
 /**
  * The minimal subprocess shape the runner awaits — a slice of `Bun.spawn`'s return
@@ -372,7 +408,13 @@ export class ProgrammaticBackend implements AgentBackend {
    * resume it. The fallback fires AT MOST once (only on a resume turn; the create it
    * runs has `resume: false`, so it can never re-trigger).
    */
-  async deliver(handle: AgentHandle, message: string, session: TurnSession, onInterim?: InterimSink): Promise<DeliverResult> {
+  async deliver(
+    handle: AgentHandle,
+    message: string,
+    session: TurnSession,
+    onInterim?: InterimSink,
+    attachments?: InboundAttachment[],
+  ): Promise<DeliverResult> {
     const spec = handle.spec;
     if (!spec) {
       return { ok: false, error: `ProgrammaticBackend.deliver: handle for "${handle.name}" carries no spec` };
@@ -485,6 +527,26 @@ export class ProgrammaticBackend implements AgentBackend {
     const mcpConfigPath = join(workspace, ".mcp.json");
     writeFileSync(mcpConfigPath, mcpConfigJson, { mode: 0o600 });
 
+    // ── INBOUND FILE ATTACHMENTS (Phase 1) ─────────────────────────────────────────
+    // Stage each attached file into the agent's PRIVATE session workspace (under a SAFE
+    // basename — NO path traversal; the path/filename come from VAULT DATA), then append a
+    // pointer line to the turn message so the `claude -p` turn can `Read` them. The private
+    // workspace is already in the sandbox read scope (composeFilesystemView always allows
+    // `base.workspace`), so NO sandbox-policy change is needed. Staged into the PRIVATE dir
+    // (NEVER a shared `spec.workspace`) — mirroring how `.mcp.json`/`system-prompt.txt` stay
+    // per-agent even when the working dir is shared. Best-effort + isolated: a single
+    // attachment's fetch/stage failure logs + is SKIPPED (the turn still runs with the rest
+    // + the text). Absent/empty → no staging, no prompt change (today's behavior exactly).
+    let turnMessage = message;
+    if (attachments && attachments.length > 0) {
+      const staged = await this.stageAttachments(workspace, attachments, vaultArg);
+      if (staged.length > 0) {
+        const lines = staged.map((s) => `- ${s.absPath} (${s.mimeType})`);
+        turnMessage =
+          `${message}\n\n[Attached files — read them as needed:\n${lines.join("\n")}\n]`;
+      }
+    }
+
     // System prompt (design 2026-06-16-channel-system-prompt.md). When the spec
     // carries one, write it to a per-session file (0600) and pass the `-file` flag.
     // The flag is PER-INVOCATION (not persistent), so we (re)write the file + pass
@@ -560,7 +622,7 @@ export class ProgrammaticBackend implements AgentBackend {
       // just runs the turn with the supplied {@link TurnSession} — `--resume <id>` to
       // continue, `--session-id <id>` to create.
       const argv = buildProgrammaticClaudeArgs({
-        message,
+        message: turnMessage,
         mcpConfigPath,
         sessionId: turnSession.id,
         resumeSession: turnSession.resume,
@@ -690,6 +752,112 @@ export class ProgrammaticBackend implements AgentBackend {
       result = await attemptTurn({ id: fresh, resume: false });
     }
     return result;
+  }
+
+  /**
+   * Stage inbound file attachments into the agent's PRIVATE session workspace so the turn
+   * can `Read` them (Phase 1). For each attachment: FETCH the blob from the vault storage
+   * REST endpoint (`GET <vaultUrl>/vault/<name>/api/storage/<path>`, Bearer the per-turn
+   * minted vault token), then WRITE it to `<workspace>/attachments/<safeBasename>`. Returns
+   * the staged files' ABSOLUTE paths + mime types (for the prompt pointer line).
+   *
+   * SECURITY:
+   *  - The staged filename is a SAFE BASENAME ({@link safeAttachmentBasename}) — the vault
+   *    `path`/`filename` are UNTRUSTED data, so a malicious `../../etc/passwd` collapses to a
+   *    plain basename inside the staging dir. As defense in depth we ALSO verify the resolved
+   *    write target stays UNDER the staging dir and skip it otherwise.
+   *  - Staged ONLY into the PRIVATE session dir (`workspace`), NEVER a shared `spec.workspace`
+   *    — mirroring `.mcp.json`/`system-prompt.txt`.
+   *  - Per-attachment size cap ({@link ATTACHMENT_MAX_BYTES}, = the vault's 100MB upload
+   *    ceiling) + a total count cap ({@link ATTACHMENT_MAX_COUNT}).
+   *
+   * Best-effort + ISOLATED: a single attachment's fetch/write failure logs + is SKIPPED (the
+   * turn still runs with the rest + the text). When the spec binds NO vault, there is no
+   * per-turn vault token to authenticate the storage fetch → ALL are skipped with one log.
+   */
+  private async stageAttachments(
+    workspace: string,
+    attachments: InboundAttachment[],
+    vaultArg: { url: string; entry: { name: string; token: string } } | undefined,
+  ): Promise<Array<{ absPath: string; mimeType: string }>> {
+    if (!vaultArg) {
+      console.warn(
+        `parachute-agent: ${attachments.length} inbound attachment(s) but this agent binds no ` +
+          `vault — cannot fetch the bytes; running the turn with text only.`,
+      );
+      return [];
+    }
+    const fetchFn = this.deps.fetchFn ?? fetch;
+    const stagingDir = join(workspace, ATTACHMENT_STAGING_DIR);
+    // The canonical staging-dir prefix the write target must stay under (defense in depth).
+    const stagingPrefix = stagingDir.endsWith("/") ? stagingDir : `${stagingDir}/`;
+    mkdirSync(stagingDir, { recursive: true });
+
+    const staged: Array<{ absPath: string; mimeType: string }> = [];
+    const usedNames = new Set<string>();
+    const capped = attachments.slice(0, ATTACHMENT_MAX_COUNT);
+    if (attachments.length > ATTACHMENT_MAX_COUNT) {
+      console.warn(
+        `parachute-agent: ${attachments.length} inbound attachments exceeds the cap ` +
+          `(${ATTACHMENT_MAX_COUNT}); staging the first ${ATTACHMENT_MAX_COUNT}.`,
+      );
+    }
+
+    for (const att of capped) {
+      if (typeof att.path !== "string" || att.path.length === 0) continue;
+      // SAFE basename — defeats path traversal (the vault path/filename are untrusted).
+      let base = safeAttachmentBasename(att.filename || att.path);
+      // De-dup colliding basenames so a second `report.png` doesn't clobber the first.
+      if (usedNames.has(base)) {
+        let n = 2;
+        const dot = base.lastIndexOf(".");
+        const stem = dot > 0 ? base.slice(0, dot) : base;
+        const ext = dot > 0 ? base.slice(dot) : "";
+        while (usedNames.has(`${stem}-${n}${ext}`)) n++;
+        base = `${stem}-${n}${ext}`;
+      }
+      const target = join(stagingDir, base);
+      // Defense in depth: the join MUST stay inside the staging dir.
+      if (target !== stagingDir.replace(/\/$/, "") && !target.startsWith(stagingPrefix)) {
+        console.warn(
+          `parachute-agent: refusing to stage attachment "${att.path}" — resolved path ` +
+            `"${target}" escapes the staging dir; skipping.`,
+        );
+        continue;
+      }
+
+      try {
+        const url = `${vaultArg.url}/vault/${vaultArg.entry.name}/api/storage/${encodeURIComponent(att.path)}`;
+        const res = await fetchFn(url, {
+          headers: { authorization: `Bearer ${vaultArg.entry.token}` },
+        });
+        if (!res.ok) {
+          const detail = await res.text().catch(() => "");
+          console.warn(
+            `parachute-agent: fetch attachment blob "${att.path}" failed (${res.status}) ` +
+              `${detail} — skipping this file`.trim(),
+          );
+          continue;
+        }
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (buf.byteLength > ATTACHMENT_MAX_BYTES) {
+          console.warn(
+            `parachute-agent: attachment "${att.path}" is ${buf.byteLength} bytes, over the ` +
+              `${ATTACHMENT_MAX_BYTES}-byte cap — skipping this file.`,
+          );
+          continue;
+        }
+        writeFileSync(target, buf, { mode: 0o600 });
+        usedNames.add(base);
+        staged.push({ absPath: target, mimeType: att.mimeType || "application/octet-stream" });
+      } catch (err) {
+        console.warn(
+          `parachute-agent: staging attachment "${att.path}" errored (skipping this file): ` +
+            `${(err as Error).message}`,
+        );
+      }
+    }
+    return staged;
   }
 
   /**

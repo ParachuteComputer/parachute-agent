@@ -64,7 +64,18 @@ import type {
   ReplyArgs,
   ThreadRecord,
   CallbackMetadata,
+  InboundAttachment,
 } from "../transport.ts";
+
+/** The safe basename of a (possibly path-ful, possibly untrusted) string — the LAST
+ *  path segment, with traversal markers stripped. Used to derive a display `filename`
+ *  from an attachment `path`. The backend re-sanitizes before staging; this is just a
+ *  reasonable default for the surfaced hint. */
+function basenameOf(p: string): string {
+  // Split on both slash flavors, take the last non-empty segment, drop `..`.
+  const parts = p.split(/[/\\]+/).filter((s) => s.length > 0 && s !== "..");
+  return parts.length > 0 ? parts[parts.length - 1]! : "";
+}
 
 /** Config for a vault transport instance (from the channel registry entry). */
 export interface VaultTransportConfig {
@@ -94,6 +105,14 @@ export interface InboundNote {
   /** The note's tags — carries `#agent/message/{inbound,outbound}` for loop avoidance. */
   tags?: string[];
   metadata?: Record<string, unknown>;
+  /**
+   * The note's attachments, if the trigger payload carried them inline (vault's
+   * `send: "json"` webhook includes `note.attachments` — each `{ id, path, mimeType, ... }`).
+   * A FAST-PATH: when present + non-empty, `ingestInbound` uses these directly and skips
+   * the REST attachment-list fetch. When absent, `ingestInbound` does NOT fetch (the
+   * daemon always forwards the inline list when the note has one — Phase 1).
+   */
+  attachments?: Array<{ id?: string; path?: string; mimeType?: string }>;
 }
 
 /**
@@ -1645,6 +1664,67 @@ export class VaultTransport implements Transport {
   // -------------------------------------------------------------------------
 
   /**
+   * Fetch the attachment list for an inbound note from the vault REST API
+   * (`GET <vaultUrl>/vault/<vault>/api/notes/<id>/attachments`, Bearer the channel's
+   * existing vault token). Returns the surfaced {@link InboundAttachment} refs (one per
+   * vault attachment that carries a usable `path`), or `[]` on ANY failure (best-effort —
+   * a missing/unreachable attachment list must NEVER drop the inbound message; the turn
+   * still runs with the text). The note id is percent-encoded as one path segment.
+   *
+   * Phase 1: the bytes are NOT fetched here — the programmatic backend stages them from
+   * `<vaultUrl>/.../api/storage/<path>` into the agent's private workspace. This method
+   * only surfaces the refs (path/mimeType/filename).
+   */
+  async fetchInboundAttachments(noteId: string): Promise<InboundAttachment[]> {
+    const url = `${this.vaultUrl}/vault/${this.vault}/api/notes/${encodeURIComponent(noteId)}/attachments`;
+    let res: Response;
+    try {
+      res = await fetch(url, { headers: { authorization: `Bearer ${this.token}` } });
+    } catch (err) {
+      console.warn(
+        `parachute-agent: fetch attachments for inbound note ${noteId} errored (proceeding ` +
+          `with text only): ${(err as Error).message}`,
+      );
+      return [];
+    }
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      console.warn(
+        `parachute-agent: fetch attachments for inbound note ${noteId} failed (${res.status}) ` +
+          `${detail} — proceeding with text only`.trim(),
+      );
+      return [];
+    }
+    let raw: unknown;
+    try {
+      raw = await res.json();
+    } catch (err) {
+      console.warn(
+        `parachute-agent: fetch attachments for inbound note ${noteId} — bad JSON (proceeding ` +
+          `with text only): ${(err as Error).message}`,
+      );
+      return [];
+    }
+    // Tolerate a bare array OR an `{ attachments: [...] }` envelope.
+    const list: Array<{ path?: unknown; mimeType?: unknown; mime_type?: unknown }> = Array.isArray(raw)
+      ? (raw as typeof list)
+      : (((raw as { attachments?: unknown }).attachments as typeof list | undefined) ?? []);
+    const out: InboundAttachment[] = [];
+    for (const a of list) {
+      const path = typeof a.path === "string" ? a.path : "";
+      if (!path) continue; // no storage path → nothing to fetch later; skip.
+      const mimeType =
+        typeof a.mimeType === "string"
+          ? a.mimeType
+          : typeof a.mime_type === "string"
+            ? a.mime_type
+            : "application/octet-stream";
+      out.push({ path, mimeType, filename: basenameOf(path) });
+    }
+    return out;
+  }
+
+  /**
    * Deliver an inbound `#agent/message/inbound` note onto this channel: emit it
    * so the subscribed bridge / MCP session wakes. Called by the daemon's
    * `/api/vault/inbound` webhook after it has resolved the channel.
@@ -1652,8 +1732,17 @@ export class VaultTransport implements Transport {
    * Belt-and-suspenders over the trigger predicate: a note tagged outbound
    * (`#agent/message/outbound`) OR explicitly `direction: "outbound"` is IGNORED —
    * we never wake on our own reply, even if a mis-wired trigger delivers one.
+   *
+   * ATTACHMENTS (Phase 1). When the note carries attachments inline (the vault
+   * `send: "json"` trigger payload includes `note.attachments`), we fetch the
+   * authoritative attachment list (REST) and surface the refs on the emitted
+   * {@link InboundMessage.attachments} so the programmatic backend can stage the
+   * bytes for the turn. The fetch is best-effort: a failure logs + the message is
+   * still emitted with the text (never dropped). When the note has NO attachments
+   * inline, NO fetch happens and emit is SYNCHRONOUS (today's behavior unchanged) —
+   * the only async path is the attachments-present case.
    */
-  ingestInbound(note: InboundNote): void {
+  async ingestInbound(note: InboundNote): Promise<void> {
     if (!this.ctx) throw new Error("vault transport: not started");
     const meta = note.metadata ?? {};
     const tags = note.tags ?? [];
@@ -1667,6 +1756,18 @@ export class VaultTransport implements Transport {
     for (const [k, v] of Object.entries(meta)) {
       flatMeta[k] = typeof v === "string" ? v : String(v);
     }
+
+    // Only reach for the attachment list when the inline payload signals there ARE
+    // attachments — so the no-attachment path emits WITHOUT a network round-trip (and
+    // stays synchronous-before-await, preserving the existing fire-and-forget callers).
+    const hasInline =
+      Array.isArray(note.attachments) &&
+      note.attachments.some((a) => typeof a?.path === "string" && a.path.length > 0);
+    let attachments: InboundAttachment[] = [];
+    if (hasInline) {
+      attachments = await this.fetchInboundAttachments(note.id);
+    }
+
     this.ctx.emit({
       // `channel` here is the in-memory InboundMessage.channel TS field (NOT serialized
       // note metadata) — left as the channel name. The routing key rides in `meta.agent`.
@@ -1683,6 +1784,7 @@ export class VaultTransport implements Transport {
         direction: "inbound",
       },
       source: "vault",
+      ...(attachments.length > 0 ? { attachments } : {}),
     });
   }
 }

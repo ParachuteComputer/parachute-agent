@@ -12,6 +12,27 @@
 
 import type { AgentMode } from "./sandbox/types.ts";
 
+/**
+ * A reference to a file attached to an inbound message (Phase 1: inbound file
+ * attachments → the programmatic turn). The vault transport surfaces these from
+ * an `#agent/message/inbound` note's attachments; the programmatic backend stages
+ * the bytes into the agent's private session workspace so a `claude -p` turn can
+ * `Read` them. Structured (not flattened into `meta`, which is string-only) so the
+ * list rides cleanly transport → daemon → backend.
+ */
+export interface InboundAttachment {
+  /**
+   * The vault-internal storage path (e.g. `2026-06-24/<uuid>.png`), relative to the
+   * vault's assets dir. The bytes are fetched via `GET <vaultUrl>/vault/<name>/api/storage/<path>`.
+   * UNTRUSTED (vault data) — the backend sanitizes the staged filename, never the path.
+   */
+  path: string;
+  /** The MIME type (e.g. `image/png`) — surfaced to the turn so it knows the file kind. */
+  mimeType: string;
+  /** The basename of `path` (a display/staging hint). UNTRUSTED — the backend re-sanitizes. */
+  filename: string;
+}
+
 /** An inbound message, routed by the daemon to the bridges subscribed to `channel`. */
 export interface InboundMessage {
   /** The named channel this message arrived on. */
@@ -22,6 +43,12 @@ export interface InboundMessage {
   meta: Record<string, string>;
   /** The transport kind that produced this message (e.g. "telegram"). */
   source: string;
+  /**
+   * Files attached to this inbound message, if any (Phase 1). The programmatic
+   * backend stages each into the agent's private session workspace so the turn can
+   * read it. Absent/empty → no attachments (today's behavior unchanged).
+   */
+  attachments?: InboundAttachment[];
 }
 
 export interface ReplyArgs {

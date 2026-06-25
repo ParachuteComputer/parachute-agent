@@ -61,6 +61,7 @@ import {
 } from "./backends/registry.ts";
 import type { AgentBackend, AgentHandle, AgentStatus, DeliverResult } from "./backends/types.ts";
 import type { AgentSpec } from "./sandbox/types.ts";
+import type { InboundAttachment } from "./transport.ts";
 import { VaultTransport } from "./transports/vault.ts";
 import { persistSpec, sessionWorkspace } from "./spawn-agent.ts";
 import type { Channel } from "./registry.ts";
@@ -144,13 +145,19 @@ async function withTempStateDir<T>(fn: (dir: string) => Promise<T> | T): Promise
 /** A controllable fake backend (no `claude -p`). */
 class FakeBackend implements AgentBackend {
   readonly kind = "programmatic";
-  readonly calls: { channel: string; message: string }[] = [];
+  readonly calls: { channel: string; message: string; attachments?: InboundAttachment[] }[] = [];
   resultFor: (message: string) => DeliverResult = (m) => ({ ok: true, reply: "reply:" + m });
   async start(spec: AgentSpec): Promise<AgentHandle> {
     return { backend: this.kind, channel: spec.channels[0] as string, name: spec.name, spec };
   }
-  async deliver(handle: AgentHandle, message: string): Promise<DeliverResult> {
-    this.calls.push({ channel: handle.channel, message });
+  async deliver(
+    handle: AgentHandle,
+    message: string,
+    _session?: unknown,
+    _onInterim?: unknown,
+    attachments?: InboundAttachment[],
+  ): Promise<DeliverResult> {
+    this.calls.push({ channel: handle.channel, message, ...(attachments ? { attachments } : {}) });
     return this.resultFor(message);
   }
   async stop(): Promise<void> {}
@@ -749,6 +756,29 @@ describe("contextFor.emit threads reply_to → a callback end-to-end through the
     expect(cb.calls[0]!.meta.source_channel).toBe("worker");
     expect(cb.calls[0]!.meta.correlation_id).toBe("corr-xyz");
     expect(cb.calls[0]!.meta.delegation_depth).toBe("2"); // incoming "1" → 1, +1 hop.
+  });
+
+  test("an inbound emit carrying attachments → they thread through the QueuedMessage to deliver() (no longer dropped)", async () => {
+    const backend = new FakeBackend();
+    const out = recorder();
+    const programmatic = new ProgrammaticAgentRegistry({ backend, writeOutbound: out.fn });
+    await programmatic.register({ name: "worker", channels: ["worker"], backend: "programmatic" });
+    const ctx = contextFor(new ClientRegistry(), "worker", new DeliveryState(), programmatic);
+
+    const attachments: InboundAttachment[] = [
+      { path: "2026-06-24/pic.png", mimeType: "image/png", filename: "pic.png" },
+    ];
+    ctx.emit({
+      channel: "worker",
+      content: "with a file",
+      meta: { note_id: "inbound-att", source: "vault" },
+      source: "vault",
+      attachments,
+    });
+
+    await until(() => backend.calls.length === 1);
+    // The attachments were carried onto the QueuedMessage and handed to deliver().
+    expect(backend.calls[0]!.attachments).toEqual(attachments);
   });
 
   test("an inbound emit WITHOUT reply_to → no callback (the common path)", async () => {
