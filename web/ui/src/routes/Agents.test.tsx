@@ -673,18 +673,38 @@ describe("Claude auth — the operator-level setup-token (the gap operators hit)
     expect(screen.queryByDisplayValue(/sk-|oauth|token-value/i)).not.toBeInTheDocument();
   });
 
-  it("saves the DEFAULT token (no channel) via setClaudeCredential", async () => {
+  it("saves the DEFAULT token (no channel) via setClaudeCredential and CLEARS the input after", async () => {
     getClaudeCredentialStatus.mockResolvedValue({ defaultSet: false, channels: [] });
     setClaudeCredential.mockResolvedValue({ ok: true, scope: "default" });
     renderRoute();
 
     fireEvent.click(await screen.findByTestId("set-claude-token-toggle"));
     const form = await screen.findByTestId("set-claude-token-form");
-    fireEvent.change(within(form).getByLabelText(/^token$/i), { target: { value: "setup-token-abc" } });
+    const tokenInput = within(form).getByLabelText(/^token$/i);
+    fireEvent.change(tokenInput, { target: { value: "setup-token-abc" } });
+    // The typed token IS in the (password) input before save…
+    expect(tokenInput).toHaveValue("setup-token-abc");
     fireEvent.click(within(form).getByRole("button", { name: /save token/i }));
 
     await waitFor(() => expect(setClaudeCredential).toHaveBeenCalledWith({ token: "setup-token-abc" }));
     expect(await screen.findByTestId("claude-saved-notice")).toBeInTheDocument();
+    // …and the write-only field is cleared after a successful save (the form closes).
+    await waitFor(() => expect(screen.queryByTestId("set-claude-token-form")).not.toBeInTheDocument());
+  });
+
+  it("Cancel discards a half-typed token (it doesn't re-surface on reopen)", async () => {
+    getClaudeCredentialStatus.mockResolvedValue({ defaultSet: false, channels: [] });
+    renderRoute();
+
+    fireEvent.click(await screen.findByTestId("set-claude-token-toggle"));
+    const form = await screen.findByTestId("set-claude-token-form");
+    fireEvent.change(within(form).getByLabelText(/^token$/i), { target: { value: "half-typed-secret" } });
+    // Cancel (the toggle button now reads "Cancel").
+    fireEvent.click(screen.getByTestId("set-claude-token-toggle"));
+    // Reopen — the token field is empty again.
+    fireEvent.click(await screen.findByTestId("set-claude-token-toggle"));
+    const reopened = await screen.findByTestId("set-claude-token-form");
+    expect(within(reopened).getByLabelText(/^token$/i)).toHaveValue("");
   });
 
   it("saves a per-CHANNEL override when a channel is given", async () => {

@@ -2087,7 +2087,15 @@ export function ClaudeAuthSection() {
             className="secondary"
             data-testid="set-claude-token-toggle"
             onClick={() => {
-              setSetOpen((o) => !o);
+              setSetOpen((o) => {
+                // Closing the form (Cancel) discards the typed token — a write-only
+                // field shouldn't re-surface a half-entered secret on reopen.
+                if (o) {
+                  setToken("");
+                  setChannel("");
+                }
+                return !o;
+              });
               setSetError(null);
               setSavedNotice(null);
             }}
