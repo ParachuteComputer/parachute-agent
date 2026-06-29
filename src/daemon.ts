@@ -347,7 +347,7 @@ export function contextFor(
           // `fired-by` (a scheduled `runner:<jobId>` fire vs an interactive/delegated message).
           ...(msg.meta?.sender ? { sender: msg.meta.sender } : {}),
           // roles×threads NOW slice: carry the thread subject through to the drain so the
-          // composed prompt can fold in a subject dossier (and the NEXT slice can route by
+          // composed prompt's loadout can use it (and the NEXT slice can route by
           // it). No routing meaning yet. Absent → unchanged (the weave path is untouched).
           ...(msg.meta?.subject ? { subject: msg.meta.subject } : {}),
         });
@@ -378,7 +378,7 @@ export function contextFor(
           // register() still derives the right run-context `fired-by`.
           ...(msg.meta?.sender ? { sender: msg.meta.sender } : {}),
           // roles×threads NOW slice: carry the thread subject through the pending buffer too,
-          // so a turn that runs on register() still folds in its subject dossier. No routing
+          // so a turn that runs on register() still composes its loadout. No routing
           // meaning yet. Absent → unchanged.
           ...(msg.meta?.subject ? { subject: msg.meta.subject } : {}),
         });
@@ -3433,7 +3433,7 @@ function main(): void {
         throw new Error(`channel "${job.channel}" is not a live vault channel`);
       }
       // roles×threads NOW slice: thread the job's subject onto the inbound note so the
-      // turn's composed prompt can fold in its dossier. Absent → no subject (the weave
+      // turn's composed prompt/loadout can use it. Absent → no subject (the weave
       // job carries none → byte-identical to HEAD).
       await transport.injectInbound({
         content: job.message,

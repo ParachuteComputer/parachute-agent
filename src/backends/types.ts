@@ -200,18 +200,16 @@ export function composeSystemPrompt(
   let composed = render(kept);
   if (byteLen(composed) <= budget) return composed;
 
-  // OVER BUDGET — truncate LOADOUT entries (index ≥ 1) from the TAIL inward; never the self
-  // entry. Keep entry 0 always; add later entries only while they still fit.
-  const dropped: string[] = [];
+  // OVER BUDGET — keep the self entry (index 0) ALWAYS, then keep loadout entries from the
+  // front while they fit and STOP at the first that doesn't (tail-drop: the loadout's order
+  // IS its priority — earlier notes win, the tail is shed first). The self entry survives even
+  // if it alone exceeds the budget.
   const fit: LoadoutEntry[] = kept.length > 0 ? [kept[0]!] : [];
   for (let i = 1; i < kept.length; i++) {
-    const candidate = render([...fit, kept[i]!]);
-    if (byteLen(candidate) <= budget) {
-      fit.push(kept[i]!);
-    } else {
-      dropped.push(kept[i]!.path);
-    }
+    if (byteLen(render([...fit, kept[i]!])) <= budget) fit.push(kept[i]!);
+    else break;
   }
+  const dropped = kept.slice(fit.length).map((e) => e.path);
   composed = render(fit);
   warn(
     `parachute-agent: LOADOUT over budget (${byteLen(render(kept))} > ${budget} bytes) — ` +
