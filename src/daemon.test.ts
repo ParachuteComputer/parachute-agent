@@ -14,6 +14,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { createFetchHandler, resolveStartCmd, buildTurnEventSink } from "./daemon.ts";
+import { checkProgrammaticDeps } from "./preflight.ts";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -162,6 +163,12 @@ describe("UI-facing + discovery endpoints stay open (no token, 200)", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { status: string };
     expect(body.status).toBe("ok");
+  });
+
+  test("GET /health omits `dependencies` when no preflight result was wired (back-compat)", async () => {
+    const res = await fetch(`${base}/health`);
+    const body = (await res.json()) as { dependencies?: unknown };
+    expect(body.dependencies).toBeUndefined();
   });
 
   test("GET /.parachute/config → 200", async () => {
@@ -743,5 +750,59 @@ describe("buildTurnEventSink (streaming-view fan-out)", () => {
     expect(() => sink("eng", { kind: "tool", tool: "Read" })).not.toThrow();
     // routeToChannel drops the dead client; a follow-up emit finds no subscribers.
     expect(turnEvents.countForChannel("eng")).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /health surfaces the boot dependency-preflight (agent#156) when wired. `main`
+// passes the boot `runBootPreflight()` result; a plain handler omits it (asserted
+// above). Here we wire a result built from a fake `which` to assert the shape.
+// ---------------------------------------------------------------------------
+describe("agent#156 — /health surfaces the dependency preflight when wired", () => {
+  test("missing deps appear under `dependencies` (ok:false + the missing bin names)", async () => {
+    const channels = new Map<string, Channel>();
+    const registry = new ClientRegistry();
+    // bwrap + claude missing, rg + socat present (a representative partial-fresh box).
+    const preflight = checkProgrammaticDeps((bin) =>
+      bin === "rg" || bin === "socat" ? `/usr/bin/${bin}` : null,
+    );
+    const srv = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      idleTimeout: 0,
+      fetch: createFetchHandler(channels, registry, { preflight }),
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${srv.port}/health`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        dependencies?: { ok: boolean; missing: string[] };
+      };
+      expect(body.dependencies).toBeDefined();
+      expect(body.dependencies!.ok).toBe(false);
+      expect(body.dependencies!.missing).toEqual(["bwrap", "claude"]);
+    } finally {
+      srv.stop(true);
+    }
+  });
+
+  test("all deps present → dependencies.ok true, missing empty", async () => {
+    const channels = new Map<string, Channel>();
+    const registry = new ClientRegistry();
+    const preflight = checkProgrammaticDeps(() => "/usr/bin/x"); // everything resolves
+    const srv = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      idleTimeout: 0,
+      fetch: createFetchHandler(channels, registry, { preflight }),
+    });
+    try {
+      const res = await fetch(`http://127.0.0.1:${srv.port}/health`);
+      const body = (await res.json()) as { dependencies?: { ok: boolean; missing: string[] } };
+      expect(body.dependencies!.ok).toBe(true);
+      expect(body.dependencies!.missing).toEqual([]);
+    } finally {
+      srv.stop(true);
+    }
   });
 });

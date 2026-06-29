@@ -114,6 +114,7 @@ import {
 import { TERMINAL_UI_HTML } from "./terminal-ui.ts";
 import { serveTerminalAsset } from "./terminal-assets.ts";
 import { isSpaPath, serveSpa, spaDistDir } from "./spa-serve.ts";
+import { runBootPreflight, type PreflightResult } from "./preflight.ts";
 import {
   buildSpecFromBody,
   setupProgrammaticSpawn,
@@ -1311,6 +1312,13 @@ export function createFetchHandler(
       url: string;
       tokenPresent: boolean;
     }>;
+    /**
+     * The boot dependency-PREFLIGHT result (agent#156) — surfaced on `/health` so the
+     * admin UI can show that programmatic turns will fail until the missing deps
+     * (`bwrap`/`rg`/`socat`/`claude`) are installed. `main` passes the boot check;
+     * absent (a plain createFetchHandler / tests) → omitted from `/health`.
+     */
+    preflight?: PreflightResult;
   },
 ): (req: Request, server?: { upgrade: (req: Request, opts: { data: TerminalWsData }) => boolean }) => Promise<Response> {
   // The per-channel turn-event SSE registry — subscribers of the live "watch it
@@ -1503,6 +1511,10 @@ export function createFetchHandler(
     // (`programmatic · idle|working|queued:N`) instead of `mcp_sessions` — a
     // programmatic agent has no live subscriber, so SSE/MCP counts don't describe it.
     if (url.pathname === "/health") {
+      // Surface the boot dependency-preflight (agent#156) so the admin UI can show
+      // that programmatic turns will fail until the missing deps are installed. Only
+      // present when `main` passed the boot check (absent in a plain handler/tests).
+      const preflight = opts?.preflight;
       return json({
         status: "ok",
         channels: [...channels.values()].map((c) => ({
@@ -1521,6 +1533,15 @@ export function createFetchHandler(
             status: s.state === "queued" ? `queued:${s.queued}` : s.state,
           };
         }),
+        ...(preflight
+          ? {
+              dependencies: {
+                ok: preflight.ok,
+                // The binary names missing on PATH — what programmatic turns need installed.
+                missing: preflight.missing.map((d) => d.bin),
+              },
+            }
+          : {}),
       });
     }
 
@@ -3233,6 +3254,14 @@ function main(): void {
   mkdirSync(STATE_DIR, { recursive: true });
   mkdirSync(INBOX_DIR, { recursive: true });
 
+  // BOOT DEPENDENCY PREFLIGHT (agent#156). A fresh box can't run a programmatic
+  // `claude -p` turn until bwrap/rg/socat + the claude CLI are on PATH — pre-#156
+  // each surfaced only as a failed *turn*, one at a time. Check them ONCE at boot and
+  // log a single clear warning (with the install one-liners) when any is missing. It's
+  // advisory, never fatal: the daemon may run only attached-backend agents that need
+  // none of these, so we warn + keep serving. The result is also surfaced on /health.
+  const preflight = runBootPreflight();
+
   // Verify the one MCP SDK internal our HTTP-MCP delivery accounting reads
   // (`_streamMapping['_GET_stream']`, see assertMcpSdkStreamContract). A screaming
   // boot error on SDK drift beats discovering it as silent message loss later.
@@ -3349,7 +3378,7 @@ function main(): void {
     buildInstantiateDeps(channels, registry, deliveryState, programmatic, attachedQueue),
   );
 
-  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, attachedQueue, turnEvents, jobStore, runner, agentDefs });
+  const fetchHandler = createFetchHandler(channels, registry, { deliveryState, programmatic, attachedQueue, turnEvents, jobStore, runner, agentDefs, preflight });
   const server = Bun.serve<TerminalWsData, never>({
     port: PORT,
     hostname: "127.0.0.1",
