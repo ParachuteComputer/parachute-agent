@@ -131,6 +131,11 @@ function recorder(): { calls: { channel: string; reply: string; inReplyTo?: stri
  * holds ALL writes in order; `ends()` / `starts()` filter by phase so a test can assert
  * the FINAL records (the pre-thread-as-container assertions) without counting the
  * working-ensure, or assert the working-ensure specifically.
+ *
+ * This recorder returns VOID (no id) — so any callback test using it exercises the
+ * per-turn-id FALLBACK for `source_thread`. The id-pinning tests (agent#124) use
+ * {@link threadRecorderWithIds} instead. (Pre-existing callback tests don't assert on
+ * `source_thread`, so the void return doesn't affect them.)
  */
 function threadRecorder(): {
   threads: ThreadNote[];
@@ -1594,6 +1599,9 @@ describe("ProgrammaticAgentRegistry — agent-to-agent callbacks (reply_to)", ()
     const { meta } = cb.calls[0]!;
     expect(meta.source_thread).toBe(expectedId); // RESOLVABLE — the per-fire note id.
     expect(meta.source_thread).toMatch(/^Threads\/worker\/[0-9a-f-]{36}$/);
+    // Concrete cross-check (not just the regex): the per-fire leaf IS the recorded threadId,
+    // so a formula bug in idFor's multi-threaded branch can't be masked.
+    expect(meta.source_thread).toBe(`Threads/worker/${endRecord.threadId}`);
     expect(meta.source_message).toBe("reply-note-2");
   });
 
@@ -1654,6 +1662,42 @@ describe("ProgrammaticAgentRegistry — agent-to-agent callbacks (reply_to)", ()
     expect(meta.status).toBe("ok");
     expect(meta.source_message).toBeUndefined(); // no reply note to point at,
     expect(meta.source_thread).toBe(threads.idFor(endRecord)); // but the thread is resolvable.
+    expect(meta.source_thread).toBe("Threads/worker/worker");
+  });
+
+  test("single-threaded OUTBOUND-FAILURE re-record: source_thread is the re-recorded (sameTurn) thread-note id", async () => {
+    // The reply was produced but the outbound write failed after retries → the drain
+    // re-records the SAME turn as status:error (sameTurn upsert) and calls back error. The
+    // callback's source_thread must be the (resolvable) re-recorded thread-note id — pinning
+    // the `?? threadNoteId` precedence leg on the outbound-failure terminal path.
+    const backend = new FakeBackend();
+    backend.resultFor = (m) => ({ ok: true, reply: "done:" + m });
+    const threads = threadRecorderWithIds();
+    // Always-fail outbound (a permanent 4xx → no retry); the reply was produced but lost.
+    const alwaysFail: WriteOutbound = async () => {
+      throw new Error("vault transport: write reply failed (400) bad request");
+    };
+    const cb = callbackRecorder();
+    const reg = new ProgrammaticAgentRegistry({
+      backend,
+      writeOutbound: alwaysFail,
+      writeThread: threads.fn,
+      writeCallback: cb.fn,
+      outboundRetryBaseMs: 1,
+    });
+    await reg.register(specSingleThreaded("worker"));
+
+    reg.enqueue("worker", { content: "x", replyTo: "orchestrator" });
+    await until(() => cb.calls.length === 1);
+
+    const endRecord = threads.ends().at(-1)!; // the sameTurn error re-record.
+    expect(endRecord.status).toBe("error");
+    expect(endRecord.sameTurn).toBe(true);
+    const { meta } = cb.calls[0]!;
+    expect(meta.status).toBe("error");
+    expect(meta.source_message).toBeUndefined(); // the outbound note never landed,
+    // …but source_thread is the resolvable re-recorded thread-note id (agent#124).
+    expect(meta.source_thread).toBe(threads.idFor(endRecord));
     expect(meta.source_thread).toBe("Threads/worker/worker");
   });
 
