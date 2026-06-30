@@ -1,6 +1,6 @@
 {
   "name": "@openparachute/agent",
-  "version": "0.2.3-rc.23",
+  "version": "0.2.3-rc.24",
   "description": "Vault-native agents for Claude Code — a #agent/definition note + an inbound message becomes a sandboxed claude turn; the reply is written back as a note. Messaging gateway on :1941.",
   "license": "AGPL-3.0",
   "type": "module",
@@ -33,7 +33,7 @@
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.54",
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "@openparachute/scope-guard": "^0.4.0",
+    "@openparachute/scope-guard": "^0.5.0",
     "@xterm/addon-fit": "0.10.0",
     "@xterm/xterm": "5.5.0"
   },
