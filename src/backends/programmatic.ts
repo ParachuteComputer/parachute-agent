@@ -611,18 +611,23 @@ export class ProgrammaticBackend implements AgentBackend {
       }
     }
 
-    // System prompt (design 2026-06-16-channel-system-prompt.md). When the spec
-    // carries one, write it to a per-session file (0600) and pass the `-file` flag.
-    // The flag is PER-INVOCATION (not persistent), so we (re)write the file + pass
-    // it EVERY turn — including a `--resume` turn — so the role is always applied.
-    // Unset → no flag, no file (today's behavior unchanged). The `-file` form is
-    // robust to long/multiline prompts and keeps the prompt visible-on-disk. Its
-    // lifecycle is tied to the workspace (like .mcp.json) — it disappears with it.
+    // System prompt (design 2026-06-16-channel-system-prompt.md). The composed prompt is
+    // written to a per-session file (0600) and passed via the `-file` flag. The flag is
+    // PER-INVOCATION (not persistent), so we (re)write the file + pass it EVERY turn —
+    // including a `--resume` turn — so the prompt is always applied. The `-file` form is
+    // robust to long/multiline prompts and keeps the prompt visible-on-disk; its lifecycle
+    // is tied to the workspace (like .mcp.json) — it disappears with it.
     //
-    // COMPOSED PROMPT — three layers, in order (DESIGN-2026-06-29-threads-roles-context.md):
+    // COMPOSED PROMPT — three layers, in order (DESIGN-2026-06-29-threads-roles-context.md).
+    // The compose is DECOUPLED from the def body (Phase 2 of the flatten): the def body is
+    // ONE OPTIONAL layer, no longer the anchor that gates the whole composition. We compose +
+    // write the file whenever ANY layer has content; the file is skipped (CC's default prompt)
+    // ONLY when EVERY layer is empty.
     //   ① ROLES         — `roles` entries, composed FIRST: the reusable "hat(s)" the thread wears.
-    //   ② SELF + THREAD — the SELF entry (the spec's `systemPrompt`, the def body) then THIS
-    //                     thread's authored CONTENT (`threadContent`, when non-blank).
+    //   ② SELF + THREAD — the SELF entry (the spec's `systemPrompt`, the def body) WHEN non-empty,
+    //                     then THIS thread's authored CONTENT (`threadContent`, when non-blank).
+    //                     An empty/retired def body simply OMITS the self entry — a thread's
+    //                     identity can live entirely in its roles + thread content (the flatten).
     //   ③ EXTRA CONTEXT — the `loadout` notes (skills, references), read CONTENT-only.
     // composeSystemPrompt dedupes by path, skips blank entries, renders each as
     // `# <path>\n\n<content>`, joins with `\n\n---\n\n`, and enforces the byte budget — truncating
@@ -636,47 +641,69 @@ export class ProgrammaticBackend implements AgentBackend {
     // absent (a spec not sourced from a def note) the header falls back to `spec.name`.
     //
     // NO-ROLES / NO-LOADOUT / NO-THREAD-CONTENT INVARIANT (the live 4am steward weave path): a
-    // thread with NO roles, NO loadout AND no authored thread content composes to EXACTLY
-    // `# <path>\n\n<def body>` — `<def body>` byte-identical to `spec.systemPrompt`. The single
-    // `# <path>` header is the ONLY change to such a prompt. The run-context preamble stays on
-    // the MESSAGE.
+    // thread with a non-empty def body but NO roles, NO loadout AND no authored thread content
+    // composes to EXACTLY `# <path>\n\n<def body>` — `<def body>` byte-identical to
+    // `spec.systemPrompt`. The single `# <path>` header is the ONLY change to such a prompt. The
+    // run-context preamble stays on the MESSAGE.
+    //
+    // ALL-LAYERS-EMPTY → NO FILE: with no roles, no def body, no thread content AND no loadout
+    // (the genuinely-blank thread), composeSystemPrompt returns "" → we leave `systemPromptFile`
+    // undefined and pass no `-file` flag (CC's default prompt — the one remaining no-file case).
+    //
+    // Self entry: the def body, labeled by the def note's PATH (`spec.definitionPath`);
+    // fallback the spec name. The note ID (`spec.definition`) is deliberately NOT used —
+    // it's a timestamp-slug, not the legible path the header should read (#169).
+    const selfPath =
+      typeof spec.definitionPath === "string" && spec.definitionPath.length > 0
+        ? spec.definitionPath
+        : spec.name;
+    // Layer ① ROLES — filter to NON-BLANK content + dedupe by path so the protected-prefix
+    // COUNT below stays exactly aligned with the entries composeSystemPrompt keeps (a blank or
+    // duplicate role would be dropped, shifting the prefix into the layer-③ tail). They lead,
+    // so a later loadout note with a colliding path dedupes against the role (the role wins).
+    const roleEntries: LoadoutEntry[] = [];
+    const seenRolePaths = new Set<string>();
+    for (const r of roles ?? []) {
+      if (typeof r.content !== "string" || r.content.trim().length === 0) continue;
+      if (seenRolePaths.has(r.path)) continue;
+      seenRolePaths.add(r.path);
+      roleEntries.push(r);
+    }
+    // Layer ② — the SELF entry (the def body) is now OPTIONAL: included ONLY when `spec.systemPrompt`
+    // is a non-empty string. An empty/retired def body omits it entirely — don't push a blank entry
+    // (composeSystemPrompt would skip it and the protected-prefix count would drift). The ternary
+    // narrows `spec.systemPrompt`, so the entry is well-typed without a non-null assertion; and
+    // `selfEntries.length` (0 or 1) IS the def-present count fed into `protectedCount` below.
+    const selfEntries: LoadoutEntry[] =
+      // `.trim()` to match composeSystemPrompt's blank-skip — a whitespace-only def body is
+      // omitted (and not counted), keeping protectedCount aligned (reviewer nit, #176).
+      typeof spec.systemPrompt === "string" && spec.systemPrompt.trim().length > 0
+        ? [{ path: selfPath, content: spec.systemPrompt }]
+        : [];
+    // Thread content sits AFTER the self entry. Include it only when it carries real (non-blank)
+    // content — a blank thread note is the no-thread-content case. Gate the inclusion AND the
+    // protected-prefix count on the SAME non-blank check.
+    const hasThreadContent =
+      !!threadContent && typeof threadContent.content === "string" && threadContent.content.trim().length > 0;
+    // Order: ① roles → ② [self if present] + thread-content → ③ extra-context loadout.
+    const entries: LoadoutEntry[] = [
+      ...roleEntries,
+      ...selfEntries,
+      ...(hasThreadContent ? [threadContent!] : []),
+      ...(loadout ?? []),
+    ];
+    // Protect the WHOLE leading prefix — roles (①) + the def (WHEN present) + the thread content
+    // (②) — from budget truncation; only the layer-③ extra-context tail (entries beyond the
+    // prefix) sheds. Count the def entry only when it's actually present (`selfEntries.length` is
+    // 0 or 1), so the prefix stays aligned with the entries above (the off-by-one when the def
+    // body is empty).
+    const protectedCount = roleEntries.length + selfEntries.length + (hasThreadContent ? 1 : 0);
+    const composed = composeSystemPrompt(entries, { protectedCount });
+    // DECOUPLED from the def body: write the file whenever the composition is non-empty (ANY layer
+    // had content); leave `systemPromptFile` undefined only when EVERY layer was empty (the
+    // genuinely-blank thread → CC's default prompt, the one remaining no-file case).
     let systemPromptFile: string | undefined;
-    if (typeof spec.systemPrompt === "string" && spec.systemPrompt.length > 0) {
-      // Self entry: the def body, labeled by the def note's PATH (`spec.definitionPath`);
-      // fallback the spec name. The note ID (`spec.definition`) is deliberately NOT used —
-      // it's a timestamp-slug, not the legible path the header should read (#169).
-      const selfPath =
-        typeof spec.definitionPath === "string" && spec.definitionPath.length > 0
-          ? spec.definitionPath
-          : spec.name;
-      // Layer ① ROLES — filter to NON-BLANK content + dedupe by path so the protected-prefix
-      // COUNT below stays exactly aligned with the entries composeSystemPrompt keeps (a blank or
-      // duplicate role would be dropped, shifting the prefix into the layer-③ tail). They lead,
-      // so a later loadout note with a colliding path dedupes against the role (the role wins).
-      const roleEntries: LoadoutEntry[] = [];
-      const seenRolePaths = new Set<string>();
-      for (const r of roles ?? []) {
-        if (typeof r.content !== "string" || r.content.trim().length === 0) continue;
-        if (seenRolePaths.has(r.path)) continue;
-        seenRolePaths.add(r.path);
-        roleEntries.push(r);
-      }
-      // Layer ② thread content sits BETWEEN the self entry and the loadout. Include it only when
-      // it carries real (non-blank) content — a blank thread note is the no-thread-content case.
-      // Gate the inclusion AND the protected-prefix count on the SAME non-blank check.
-      const hasThreadContent =
-        !!threadContent && typeof threadContent.content === "string" && threadContent.content.trim().length > 0;
-      // Order: ① roles → ② self + thread-content → ③ extra-context loadout.
-      const entries: LoadoutEntry[] = [
-        ...roleEntries,
-        { path: selfPath, content: spec.systemPrompt },
-        ...(hasThreadContent ? [threadContent!] : []),
-        ...(loadout ?? []),
-      ];
-      // Protect the WHOLE leading prefix — roles (①) + the def + the thread content (②) — from
-      // budget truncation; only the layer-③ extra-context tail (entries beyond the prefix) sheds.
-      const protectedCount = roleEntries.length + 1 + (hasThreadContent ? 1 : 0);
-      const composed = composeSystemPrompt(entries, { protectedCount });
+    if (composed.trim().length > 0) {
       systemPromptFile = join(workspace, "system-prompt.txt");
       writeFileSync(systemPromptFile, composed, { mode: 0o600 });
     }
