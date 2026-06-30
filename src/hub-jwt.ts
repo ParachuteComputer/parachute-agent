@@ -28,6 +28,19 @@
  * `hubOrigin` so a manually-relaunched daemon on an exposed box doesn't 401
  * every token — the loopback fallback is for a co-located, never-exposed dev
  * daemon only.
+ *
+ * Multi-origin iss-set (hub#692; parity with vault's `parseHubOrigins`). One box
+ * reachable on several URLs at once (loopback + `<ip>.sslip.io` + a custom
+ * domain) mints tokens whose `iss` is whichever origin the request arrived on,
+ * and `parachute hub set-origin` switches which origin is canonical without
+ * rotating the (origin-independent) signing key. So a token minted under URL-A
+ * must still validate when this resource is reached via URL-B on the SAME box.
+ * The hub publishes its full legitimate-origin SET out-of-band via
+ * `PARACHUTE_HUB_ORIGINS`; we layer it onto scope-guard's `allowedIssuers`,
+ * which the library applies ONLY after the JWKS signature verify (belt-and-
+ * suspenders membership check, never a substitute for the signature gate). When
+ * the env var is unset → empty set → scope-guard collapses to the single
+ * canonical `getHubOrigin()`, byte-identical to today.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -129,11 +142,54 @@ export function getHubOrigin(): string {
   return DEFAULT_HUB_LOOPBACK;
 }
 
+/**
+ * Parse the hub's comma-separated legitimate-origin SET from
+ * `PARACHUTE_HUB_ORIGINS` into a clean string array. Mirrors the hub's own
+ * `parseHubOrigins` semantics (and vault's local copy): split on `,`, trim each,
+ * strip a trailing slash, drop empties, dedupe. We write the ~6-line helper
+ * locally rather than import from a private hub path.
+ *
+ * The multi-origin iss-set (hub#692): one box reachable on several URLs at once
+ * (loopback + `<ip>.sslip.io` + a custom domain) mints tokens whose `iss` is
+ * whichever origin the request arrived on. The signing KEY is stable and
+ * origin-independent, so a token minted under URL-A must validate when this
+ * resource is reached via URL-B on the SAME box. The hub publishes its
+ * legitimate-origin set here (out-of-band, never from an unvalidated request
+ * Host); scope-guard layers it on top of the signature verify, never as a
+ * substitute for it.
+ *
+ * BACK-COMPAT INVARIANT: when `PARACHUTE_HUB_ORIGINS` is UNSET this returns
+ * `[]`. scope-guard's `resolveAcceptedIssuers` sees an empty set and collapses
+ * to the single canonical `getHubOrigin()` — byte-identical to today. An agent
+ * daemon that never receives the new env var behaves exactly as before.
+ */
+export function parseHubOrigins(raw: string | undefined): string[] {
+  if (!raw) return [];
+  const seen = new Set<string>();
+  for (const part of raw.split(",")) {
+    const origin = part.trim().replace(/\/$/, "");
+    if (origin.length > 0) seen.add(origin);
+  }
+  return Array.from(seen);
+}
+
 // Process-wide guard. The resolver form lets tests flip `PARACHUTE_HUB_ORIGIN`
-// between cases — the lib re-resolves on every `validateHubJwt` and
-// `resetJwksCache` call so the env-var change picks up without a restart. The
-// JWKS cache (5min/30s defaults) lives inside the guard, shared across requests.
-const guard = createScopeGuard({ hubOrigin: () => getHubOrigin() });
+// and `PARACHUTE_HUB_ORIGINS` between cases — the lib re-resolves on every
+// `validateHubJwt` and `resetJwksCache` call so the env-var change picks up
+// without a restart. The JWKS cache (5min/30s defaults) lives inside the guard,
+// shared across requests.
+//
+// Multi-origin iss-set (hub#692): accept the hub's full legitimate-origin set
+// (published via PARACHUTE_HUB_ORIGINS), not just the single PARACHUTE_HUB_ORIGIN.
+// Re-evaluated per call so an operator widening the box's origins is picked up
+// without an agent restart. When the env var is unset → `[]` → scope-guard
+// collapses to the single canonical hubOrigin (byte-identical to before). The
+// signature (JWKS) verify runs FIRST regardless; the issuer set is only an
+// additive membership check on top, never a substitute for the signature gate.
+const guard = createScopeGuard({
+  hubOrigin: () => getHubOrigin(),
+  allowedIssuers: () => parseHubOrigins(process.env.PARACHUTE_HUB_ORIGINS),
+});
 
 /**
  * Verify a presented JWT against the hub's JWKS, accepting `aud: "agent"` OR the
