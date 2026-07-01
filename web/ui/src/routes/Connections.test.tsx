@@ -1,20 +1,29 @@
 /**
  * Connections / MCP-servers panel tests (this PR). Exercises the exported
- * `ConnectionsSection` + `AddMcpForm` + `mcpConnectionRows` directly (no full-page
- * wiring), mocking `../lib/api.ts` (the def PATCH) and `../lib/hub.ts` (the cookie→hub
- * approve + the daemon-direct detector). Asserts:
- *   - the row list + status pills (Connected / Pending / Needs reconnect);
+ * `ConnectionsSection` + `AddMcpForm` + `mcpConnectionRows` + `GrantsSection` +
+ * `simpleApprovalRows` directly (no full-page wiring), mocking `../lib/api.ts` (the def
+ * PATCH) and `../lib/hub.ts` (the cookie→hub approve + the daemon-direct detector). Asserts:
+ *   - the mcp row list + status pills (Connected / Pending / Needs reconnect);
  *   - Add MCP → PATCH wants APPENDS `mcp:<url>` (preserving existing wants);
  *   - Connect → `approveAgentGrant(grantId)` → full-page redirect to authorizeUrl;
  *   - Paste-token → `approveAgentGrant(grantId, token)` (no redirect);
- *   - daemon-direct degradation hides Connect + shows the inline hint.
+ *   - daemon-direct degradation hides Connect + shows the inline hint;
+ *   - GrantsSection: a pending SURFACE (/vault/service) grant renders an Approve button
+ *     that simple-approves via `approveAgentGrant(grantId)` (no token), skips mcp, and
+ *     degrades daemon-direct.
  */
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../lib/api.ts";
 import * as hub from "../lib/hub.ts";
-import { AddMcpForm, ConnectionsSection, mcpConnectionRows } from "./Agents.tsx";
+import {
+  AddMcpForm,
+  ConnectionsSection,
+  GrantsSection,
+  mcpConnectionRows,
+  simpleApprovalRows,
+} from "./Agents.tsx";
 
 vi.mock("../lib/api.ts", async (orig) => {
   const actual = (await orig()) as typeof api;
@@ -217,5 +226,83 @@ describe("AddMcpForm", () => {
     fireEvent.change(input, { target: { value: "https://dup/mcp" } });
     expect(screen.getByTestId("mcp-url-duplicate")).toBeInTheDocument();
     expect(screen.getByTestId("add-mcp-submit")).toBeDisabled();
+  });
+});
+
+describe("simpleApprovalRows", () => {
+  it("returns the non-mcp connections (surface / vault / service), excluding mcp", () => {
+    const def = defRow({
+      connections: [
+        { key: "mcp:https://a/mcp", kind: "mcp", target: "https://a/mcp", status: "pending", grantId: "g1" },
+        { key: "surface:proj:write", kind: "surface", target: "proj:write", status: "pending", grantId: "g2" },
+        { key: "vault:research:read", kind: "vault", target: "research", status: "approved", grantId: "g3" },
+      ],
+    });
+    expect(simpleApprovalRows(def).map((r) => r.key)).toEqual(["surface:proj:write", "vault:research:read"]);
+  });
+
+  it("is empty when the daemon omits the connections field (older daemon)", () => {
+    expect(simpleApprovalRows(defRow({ wants: ["surface:proj:write"], pending: ["surface:proj:write"] }))).toEqual([]);
+  });
+});
+
+describe("GrantsSection — surface / vault / service simple approve", () => {
+  it("renders an Approve button for a pending surface grant and approves with the server grantId (no token)", async () => {
+    approveAgentGrant.mockResolvedValue({
+      id: "g2",
+      agent: "alpha",
+      connection: { kind: "surface", target: "proj:write" },
+      status: "approved",
+    });
+    const onChanged = vi.fn();
+    const def = defRow({
+      connections: [
+        { key: "surface:proj:write", kind: "surface", target: "proj:write", status: "pending", grantId: "g2" },
+      ],
+    });
+    render(<GrantsSection def={def} onChanged={onChanged} />);
+    const btn = screen.getByTestId("approve-surface:proj:write");
+    expect(btn).toHaveTextContent("Approve");
+    fireEvent.click(btn);
+    // Surface approves like a vault grant: the server-supplied grant id, NO token (no OAuth).
+    await waitFor(() => expect(approveAgentGrant).toHaveBeenCalledWith("g2"));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+  });
+
+  it("shows a Connected pill and no Approve button for an already-approved grant", () => {
+    const def = defRow({
+      connections: [
+        { key: "vault:research:read", kind: "vault", target: "research", status: "approved", grantId: "g3" },
+      ],
+    });
+    render(<GrantsSection def={def} onChanged={() => {}} />);
+    expect(screen.getByTestId("conn-status-approved")).toBeInTheDocument();
+    expect(screen.queryByTestId("approve-vault:research:read")).toBeNull();
+  });
+
+  it("disables Approve + shows the hub-origin hint when served daemon-direct", () => {
+    isDaemonDirectOrigin.mockReturnValue(true);
+    const def = defRow({
+      connections: [
+        { key: "surface:proj:write", kind: "surface", target: "proj:write", status: "pending", grantId: "g2" },
+      ],
+    });
+    render(<GrantsSection def={def} onChanged={() => {}} />);
+    expect(screen.getByTestId("grants-daemon-direct")).toBeInTheDocument();
+    expect(screen.getByTestId("approve-surface:proj:write")).toBeDisabled();
+  });
+
+  it("renders nothing when there are only mcp connections (no simple-approve grants)", () => {
+    render(
+      <GrantsSection
+        def={defRow({
+          connections: [
+            { key: "mcp:https://a/mcp", kind: "mcp", target: "https://a/mcp", status: "pending", grantId: "g1" },
+          ],
+        })}
+        onChanged={() => {}}
+      />,
+    );
+    expect(screen.queryByTestId("grants-section")).toBeNull();
   });
 });
