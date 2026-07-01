@@ -344,6 +344,14 @@ export function AgentDetail({
   const def = agent.def;
   // Edit/delete are only meaningful for a vault-native def (it has a note to mutate).
   const noteId = def?.noteId;
+  // "Pending approval" shows ONLY the legacy `uses:` names (raw strings with no grant to
+  // approve). Structured `wants:` connections are rendered as actionable rows below —
+  // mcp via ConnectionsSection (OAuth / paste-token), vault / service / surface via
+  // GrantsSection (simple approve) — so we drop them from the tag list to avoid showing a
+  // grant twice (once inert, once approvable). `connection.key` == the pending string for a
+  // structured want, so a set-difference isolates the legacy names.
+  const connectionKeys = new Set((def?.connections ?? []).map((c) => c.key));
+  const legacyPending = (def?.pending ?? []).filter((p) => !connectionKeys.has(p));
   const [mode, setMode] = useState<"view" | "edit" | "delete">("view");
 
   // Drop back to the read view whenever the selected agent changes.
@@ -423,11 +431,11 @@ export function AgentDetail({
             <p className="dim">Own-vault only — no extra connections requested.</p>
           )}
 
-          {def.pending.length > 0 ? (
+          {legacyPending.length > 0 ? (
             <>
               <h3>Pending approval</h3>
               <div className="tag-list">
-                {def.pending.map((p) => (
+                {legacyPending.map((p) => (
                   <span key={p} className="tag">
                     {p}
                   </span>
@@ -439,6 +447,12 @@ export function AgentDetail({
           {noteId ? (
             <ConnectionsSection noteId={noteId} def={def} onChanged={onChanged} />
           ) : null}
+
+          {/* Vault / service / surface grants — the SIMPLE-approve kinds (no OAuth). This is
+              what makes a thread-carried `surface:` grant approvable; it renders nothing when
+              there are no non-mcp connections. NOT noteId-gated: approve needs only the hub
+              grant id (which a thread-sourced agent carries), not a note to mutate. */}
+          <GrantsSection def={def} onChanged={onChanged} />
         </>
       ) : (
         <p className="dim" data-testid="detail-no-def">
@@ -1081,6 +1095,154 @@ export function ConnectionsSection({
 function connectErrMessage(err: unknown): string {
   if (err instanceof HubError) return err.message;
   return (err as Error).message;
+}
+
+// ---------------------------------------------------------------------------
+// GRANTS — the SIMPLE-approve connection kinds (vault / service / surface). Unlike an
+// mcp server (OAuth dance / static bearer, handled by ConnectionsSection above), these
+// approve with a bare cookie'd POST to the hub: `approveAgentGrant(grantId)` (empty body)
+// → the hub mints + flips the grant `approved`, no token, no redirect. This is the path
+// a thread-carried `surface:<name>:<access>` want takes (registered as a PENDING grant
+// keyed by the agent name); before this it rendered as an inert "Pending approval" tag
+// with no Approve button, so an operator couldn't approve it. The grant id comes FROM the
+// daemon (`connection.grantId`), never derived here; same-origin credentials are the hub's
+// CSRF belt (approveAgentGrant sets `credentials: "include"`) — no auth is weakened.
+// ---------------------------------------------------------------------------
+
+/**
+ * The connections to render in the simple-approve GRANTS section: every non-mcp
+ * connection (vault / service / surface). mcp is EXCLUDED — it has its own section
+ * (its OAuth / paste-token flow). Approved rows are kept so the operator sees the full
+ * picture (a "Connected" pill, no button). Empty for an older daemon that omits
+ * `def.connections` (nothing carries a grant id to approve).
+ */
+export function simpleApprovalRows(def: AgentDefRow): ConnectionInfoRow[] {
+  return (def.connections ?? []).filter((c) => c.kind !== "mcp");
+}
+
+/**
+ * The per-agent GRANTS section — vault / service / surface connections approved with a
+ * simple mint (no OAuth). Each pending row gets an Approve button that calls
+ * `approveAgentGrant(connection.grantId)` (no token) on the operator's OWN cookie'd,
+ * same-origin hub session; the hub mints + flips it approved, and `onChanged` refreshes so
+ * the pill goes Pending → Connected. Renders NOTHING when there are no non-mcp connections,
+ * so it's safe to always mount inside the def panel. Degrades daemon-direct exactly like
+ * ConnectionsSection (the approve needs the hub origin's cookie + CSRF belt).
+ */
+export function GrantsSection({
+  def,
+  onChanged,
+}: {
+  def: AgentDefRow;
+  onChanged: () => void;
+}) {
+  // The grant id mid-approve (so its button shows a spinner).
+  const [approving, setApproving] = useState<string | null>(null);
+  const [rowError, setRowError] = useState<string | null>(null);
+
+  const rows = simpleApprovalRows(def);
+  // The cookie→hub approve only works at the hub origin (the cookie + CSRF belt).
+  const daemonDirect = isDaemonDirectOrigin();
+
+  /** Approve the grant (no token → the hub mints, no redirect), then refresh in place. */
+  async function onApprove(grantId: string) {
+    setApproving(grantId);
+    setRowError(null);
+    try {
+      const listing = await approveAgentGrant(grantId);
+      // Simple-approve grants mint without a redirect. Defensive: if the hub ever hands
+      // back an authorizeUrl (an OAuth-shaped grant slipping through), honor it rather
+      // than silently no-op — mirrors ConnectionsSection's onConnect.
+      if (listing.authorizeUrl) {
+        window.location.assign(listing.authorizeUrl);
+        return;
+      }
+      onChanged();
+    } catch (err) {
+      setRowError(connectErrMessage(err));
+    } finally {
+      setApproving(null);
+    }
+  }
+
+  // Nothing to show — no non-mcp connections (or an older daemon without the field).
+  if (rows.length === 0) return null;
+
+  return (
+    <section className="detail-section" aria-label="Grants" data-testid="grants-section">
+      <div className="section-head">
+        <h3>Grants</h3>
+      </div>
+      <p className="muted">
+        Vault, service, and surface connections this agent requested. Approve one to grant it —
+        the hub mints on your approval (no sign-in step, unlike the MCP servers above).
+      </p>
+
+      {daemonDirect ? (
+        <div className="info-banner" role="status" data-testid="grants-daemon-direct">
+          Open this surface via your hub to approve grants — the approve step needs the hub
+          origin (you're on the loopback daemon).
+        </div>
+      ) : null}
+
+      {rowError ? (
+        <div className="error-banner" role="alert" data-testid="grants-row-error">
+          {rowError}
+        </div>
+      ) : null}
+
+      <table>
+        <thead>
+          <tr>
+            <th>Connection</th>
+            <th>Kind</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((c) => {
+            const actionable = c.status !== "approved";
+            const canApprove = actionable && !!c.grantId && !daemonDirect;
+            return (
+              <tr key={c.key} data-testid={`grant-row-${c.key}`}>
+                <td className="cell-name">
+                  <code>{c.target}</code>
+                </td>
+                <td>
+                  <span className="pill">{c.kind}</span>
+                </td>
+                <td>
+                  <GrantStatusPill status={c.status} />
+                </td>
+                <td>
+                  {!actionable ? (
+                    <span className="cell-dim">—</span>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={!canApprove || approving === c.grantId}
+                      data-testid={`approve-${c.key}`}
+                      title={
+                        daemonDirect
+                          ? "Open the agent app via your hub origin to approve."
+                          : !c.grantId
+                            ? "No grant registered yet — reload after the daemon registers it."
+                            : undefined
+                      }
+                      onClick={() => void onApprove(c.grantId!)}
+                    >
+                      {approving === c.grantId ? "Approving…" : "Approve"}
+                    </button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </section>
+  );
 }
 
 /**
