@@ -528,12 +528,29 @@ export interface ParsedThreadSpec {
    *  SKIPS a `disabled` thread. */
   agentStatus: AgentEnableStatus;
   /**
-   * Structured `wants:` declared on the thread (PARSED + surfaced for parity), if any.
-   * NOT registered as grants in Phase 4a — only a `#agent/role` carries capability (the
-   * security layer, DESIGN §"Roles carry capability"); a thread's `wants:` is
-   * informational. Empty for the live agents.
+   * Structured `wants:` declared on the thread, if any. REGISTERED as pending grants
+   * keyed by the agent NAME on instantiate (a thread carries capability DIRECTLY —
+   * restoring the parity the retired `#agent/definition` had), exactly like a def and
+   * SYMMETRIC with the injection union's `spec.name` source. Roles (`#agent/role`,
+   * PATH-keyed) remain the separate composable/curated capability layer. Empty for the
+   * live agents.
    */
   wants: ConnectionSpec[];
+}
+
+/**
+ * The minimal grant-bearing shape the registry's grant registration + reconcile-GC
+ * ({@link AgentDefRegistry.resolveStatusWithGrants} + `reconcileLiveKeys`) operate on:
+ * an agent NAME plus its declared connections. BOTH a `#agent/definition`
+ * ({@link ParsedAgentDef}) and a `#agent/thread` ({@link ParsedThreadSpec}, passing
+ * `declaredConnections: []`) satisfy it — a thread's grants key by its agent name,
+ * exactly like a def's. (Roles are the separate PATH-keyed layer — {@link
+ * AgentDefRegistry.reconcileRole} — never routed through here.)
+ */
+interface GrantBearingSpec {
+  name: string;
+  wants: ConnectionSpec[];
+  declaredConnections: string[];
 }
 
 /**
@@ -614,8 +631,10 @@ export function parseThreadSpec(
   const rawEnable = metaStr(meta.agent_status);
   const agentStatus: AgentEnableStatus = rawEnable === "disabled" ? "disabled" : "enabled";
 
-  // `wants:` — PARSED for parity/surfacing, NOT registered as grants in 4a (only a role
-  // grants capability). A malformed value is an ERROR (mirrors the def discipline).
+  // `wants:` — PARSED here, REGISTERED as pending grants keyed by the agent name on
+  // instantiate (a thread carries capability directly, like a def). A malformed value is
+  // an ERROR (mirrors the def discipline) — so the instantiate path skips register+reconcile
+  // and never presents a stale/empty live set that would nuke approved grants.
   let wants: ConnectionSpec[];
   try {
     wants = parseWants(meta.wants);
@@ -641,7 +660,10 @@ export function parseThreadSpec(
  * (`resolveConnectionStatus` in grants.ts) — `enabled` only once every connection is
  * approved. This pure function is the no-hub fallback + the legacy-`uses:` path.
  */
-export function resolveDefStatus(def: ParsedAgentDef): {
+export function resolveDefStatus(def: {
+  declaredConnections: string[];
+  wants: ConnectionSpec[];
+}): {
   status: AgentDefStatus;
   pending?: string[];
 } {
@@ -1616,9 +1638,17 @@ export class AgentDefRegistry {
   /**
    * Reload ONE `#agent/thread` note by id (the reactive THREAD-discovery path — a thread-
    * watch trigger says this note changed; Phase 4a). The thread analogue of {@link reload},
-   * but ADDITIVE: present + enabled + not-deduped → (re)instantiate; deleted/404 → deregister
-   * ONLY the thread-sourced agent at this note's key (a def-sourced same-name agent keyed by a
-   * DIFFERENT note is left intact). NO grant-GC (threads register no grants — only roles do).
+   * but ADDITIVE: present + enabled + not-deduped → (re)instantiate ({@link instantiateThread}
+   * registers the thread's `wants:` + reconcile-GCs to the declared set, so removing a want on
+   * a later turn prunes it); deleted/404 → deregister ONLY the thread-sourced agent at this
+   * note's key (a def-sourced same-name agent keyed by a DIFFERENT note is left intact).
+   *
+   * The DELETE/404 branch does NOT prune the thread's name-keyed grants: a proper removed-thread
+   * GC needs a thread SEEN-SET + a confident removed-thread diff (mirroring {@link pruneRemovedDefs}
+   * — the poll, not the reactive path, is the real deletion-convergence path since the vault has no
+   * `deleted` trigger). That is a separate, larger change; the instantiate-path register + GC here
+   * is the parity restoration. A deleted thread's approved grants persist until then (a cleanliness
+   * gap, never an escalation — grants are always operator-approved).
    *
    * DISCOVERY-MODE GATE: a no-op in `def` mode (threads aren't a source then). DEDUP: in
    * `both` mode a thread whose name a def already registered is skipped (def wins). DISABLE:
@@ -2068,13 +2098,20 @@ export class AgentDefRegistry {
    *   2. agent_status: skip a thread whose `metadata.agent_status` is `disabled` (and tear
    *      down a previously thread-sourced-live agent that flips to disabled). DISTINCT from
    *      `metadata.status` (the turn outcome) — never read here.
-   *   3. NO status stamp + NO grant registration: we never write the thread note's metadata
-   *      (`status` is the turn outcome, owned by the worker) and threads carry no capability
-   *      (only `#agent/role` grants — the security layer). So this is read-only on the vault.
+   *   3. NO status stamp: we never write the thread note's metadata (`status` is the turn
+   *      outcome, owned by the worker) — read-only on the vault. But we DO register the
+   *      thread's `wants:` as PENDING grants keyed by the agent name (a thread carries
+   *      capability directly — the parity the retired `#agent/definition` had), mirroring
+   *      the def path's {@link resolveStatusWithGrants} + reconcile-GC. Registration is
+   *      hub-side (`PUT /admin/grants`), not a vault write; the operator still APPROVES each
+   *      grant (approval is the security boundary — this is not self-escalation). Roles
+   *      (`#agent/role`, PATH-keyed) stay the separate composable/curated layer.
    *
    * Returns true on a successful (re)registration. A parse failure / dedup-skip / disabled
-   * thread returns false (logged, no vault write). An instantiate failure leaves any prior
-   * registration intact (we don't tear down a working agent on a transient failure).
+   * thread returns false (logged, no vault write, NO grant register/reconcile — so a
+   * transient error never presents a stale/empty live set that nukes approved grants). An
+   * instantiate failure leaves any prior registration intact (we don't tear down a working
+   * agent on a transient failure).
    */
   private async instantiateThread(
     vault: string,
@@ -2125,23 +2162,44 @@ export class AgentDefRegistry {
       return false;
     }
 
-    // A thread-sourced agent has no def status flow → status `enabled` (it's live), no
-    // pending/connections (threads register no grants — roles are the capability layer).
+    // A thread carries capability DIRECTLY (the parity the retired `#agent/definition`
+    // had): register its `wants:` as PENDING grants keyed by the AGENT NAME + derive
+    // status from the hub's grant statuses, mirroring the def path's {@link
+    // resolveStatusWithGrants}. `declaredConnections: []` — a thread has no legacy `uses:`.
+    // Keyed by the name (`parsed.name` = `metadata.agent`), SYMMETRIC with the injection
+    // union's `spec.name` source (resolveInjectedGrantsUnion), so an approved thread grant
+    // injects at spawn. No `wants:` / no grants client → status `enabled` (byte-identical
+    // to before for the wants-free live agents). ONLY reached AFTER a confident parse +
+    // setup (a dedup/disabled/parse/setup failure returned above WITHOUT registering).
+    const threadAgent: GrantBearingSpec = {
+      name: parsed.name,
+      wants: parsed.wants,
+      declaredConnections: [],
+    };
+    const { status, pending, connections } = await this.resolveStatusWithGrants(threadAgent);
     this.live.set(key, {
       vault,
       noteId: note.id,
       name: parsed.name,
-      status: "enabled",
+      status,
       backend: parsed.spec.backend ?? "programmatic",
       mode: parsed.spec.mode ?? "single-threaded",
       systemPromptPreview: "", // identity composes at turn time — no prompt body here.
-      pending: [],
+      pending: pending ?? [],
       wants: parsed.wants.map((c) => connectionKey(c)),
-      connections: [],
+      connections,
       ...(parsed.spec.model ? { model: parsed.spec.model } : {}),
       source: "thread",
     });
-    console.log(`agent-defs: instantiated "${parsed.name}" from thread ${note.id} in "${vault}" (source=thread).`);
+    // Grant-GC (#96): a CLEAN successful thread load is a CONFIDENT live set, so prune any
+    // grant the thread no longer declares (e.g. a `wants:` entry removed on a later turn).
+    // SAFETY: only reached AFTER a successful parse + setup AND only when this thread
+    // EXCLUSIVELY owns the name (the dedup gate above returned false otherwise) — so this
+    // reconcile can never nuke a def's or another source's grants for the same name, and a
+    // transient parse/setup failure returns above without reconciling. Keyed by the name,
+    // its OWN partition — a role's PATH-keyed grants are untouched.
+    await this.reconcileLiveKeys(threadAgent);
+    console.log(`agent-defs: instantiated "${parsed.name}" from thread ${note.id} in "${vault}" (status=${status}, source=thread).`);
     return true;
   }
 
@@ -2157,54 +2215,61 @@ export class AgentDefRegistry {
 
   /**
    * Prune the agent's grants down to its CURRENTLY-declared connections (#96 grant-GC,
-   * the clean-load case). POSTs reconcile with the live connection SPECS (`def.wants`);
+   * the clean-load case). POSTs reconcile with the live connection SPECS (`agent.wants`);
    * the hub re-derives each key with its own connectionKey and tears down + removes every
-   * grant NOT in that set (e.g. a removed want). A def with no `wants:` sends an empty
+   * grant NOT in that set (e.g. a removed want). An agent with no `wants:` sends an empty
    * set, which prunes any leftover grant from a prior `wants:` it no longer declares.
    * Best-effort: no grants client → no-op; a reconcile failure logs a warning and never
-   * throws out of the load path.
+   * throws out of the load path. Shared by the def load path AND the thread instantiate
+   * path — both key by the agent NAME (`agent.name`); a thread's grants are ITS OWN
+   * name-keyed partition, never a role's (roles are PATH-keyed — {@link reconcileRole}).
    */
-  private async reconcileLiveKeys(def: ParsedAgentDef): Promise<void> {
+  private async reconcileLiveKeys(agent: GrantBearingSpec): Promise<void> {
     if (!this.grants) return;
-    // Pass the live connection SPECS (def.wants) — the hub derives the keys with
+    // Pass the live connection SPECS (agent.wants) — the hub derives the keys with
     // its own connectionKey. (Sending keys we computed via grants.ts connectionKey
     // would diverge from the hub's for service/tagged/mcp grants → wrong prunes.)
     try {
-      const { pruned } = await this.grants.reconcileGrants(def.name, def.wants);
+      const { pruned } = await this.grants.reconcileGrants(agent.name, agent.wants);
       if (pruned > 0) {
-        console.log(`agent-defs: pruned ${pruned} stale grant(s) for "${def.name}".`);
+        console.log(`agent-defs: pruned ${pruned} stale grant(s) for "${agent.name}".`);
       }
     } catch (err) {
       console.warn(
-        `agent-defs: reconciling grants for "${def.name}" failed (continuing): ${(err as Error).message}`,
+        `agent-defs: reconciling grants for "${agent.name}" failed (continuing): ${(err as Error).message}`,
       );
     }
   }
 
   /**
-   * Resolve a def's status, registering its `wants:` connections as PENDING grants
+   * Resolve an agent's status, registering its `wants:` connections as PENDING grants
    * when a grants client is wired (4b). For each declared connection: `PUT
    * /admin/grants {agent, connection}` (idempotent upsert), collect the returned
    * status, then derive `enabled` (every connection approved) vs `pending` (listing
    * the unapproved connection keys). Legacy `uses:` names are appended to `pending`
    * (they have no grants flow — informational only).
    *
+   * Keys every grant by `agent.name`. Shared by a `#agent/definition` (name = its
+   * `metadata.name`) AND a `#agent/thread` (name = its `metadata.agent`, `declaredConnections`
+   * empty) — both carry capability keyed by their agent name (the injection union reads the
+   * same `spec.name` source). Roles are the separate PATH-keyed layer ({@link reconcileRole}).
+   *
    * Best-effort + non-fatal: NO grants client, NO `wants:`, or a registration failure
    * all fall back to {@link resolveDefStatus} (a connection that couldn't register
-   * counts as unapproved → the def is `pending`, not `error` — the agent still runs
+   * counts as unapproved → the agent is `pending`, not `error` — it still runs
    * own-vault, the operator can retry the hub). A single connection's PUT failing is
    * logged + that connection counts as unapproved; the others still register.
    */
   private async resolveStatusWithGrants(
-    def: ParsedAgentDef,
+    agent: GrantBearingSpec,
   ): Promise<{ status: AgentDefStatus; pending?: string[]; connections: ConnectionInfo[] }> {
-    if (!this.grants || def.wants.length === 0) {
+    if (!this.grants || agent.wants.length === 0) {
       // No hub wiring / no structured connections → the pure fallback. The connections
       // list is still surfaced (status `pending`, NO grant id) so the ops panel can
       // list the agent's declared `mcp:` connections + show the degraded hint when
       // there's nothing to Connect against (no grant could be resolved here).
-      const fallback = resolveDefStatus(def);
-      const connections: ConnectionInfo[] = def.wants.map((c) => ({
+      const fallback = resolveDefStatus(agent);
+      const connections: ConnectionInfo[] = agent.wants.map((c) => ({
         key: connectionKey(c),
         kind: c.kind,
         target: c.target,
@@ -2215,14 +2280,14 @@ export class AgentDefRegistry {
     const grants = this.grants;
     const statusByKey = new Map<string, string>();
     // Per-connection grant info (id + status) for the ops panel — keyed by connectionKey
-    // so it lines up with the def's wants. The grant id comes FROM the hub (registerGrant
+    // so it lines up with the agent's wants. The grant id comes FROM the hub (registerGrant
     // is an idempotent upsert that echoes the existing grant's id + current status); we
     // never derive it client-side (the hub's id-slug impl must not be duplicated).
     const infoByKey = new Map<string, ConnectionInfo>();
-    for (const conn of def.wants) {
+    for (const conn of agent.wants) {
       const key = connectionKey(conn);
       try {
-        const rec = await grants.registerGrant(def.name, conn);
+        const rec = await grants.registerGrant(agent.name, conn);
         statusByKey.set(key, rec.status);
         infoByKey.set(key, {
           key,
@@ -2237,12 +2302,12 @@ export class AgentDefRegistry {
         // Surface it with status `pending` + no grant id (the panel shows it un-Connectable).
         infoByKey.set(key, { key, kind: conn.kind, target: conn.target, status: "pending" });
         console.warn(
-          `agent-defs: registering grant for "${def.name}" (${key}) failed ` +
+          `agent-defs: registering grant for "${agent.name}" (${key}) failed ` +
             `(treating as pending): ${(err as Error).message}`,
         );
       }
     }
-    const connections = def.wants.map(
+    const connections = agent.wants.map(
       (c) =>
         infoByKey.get(connectionKey(c)) ?? {
           key: connectionKey(c),
@@ -2251,9 +2316,9 @@ export class AgentDefRegistry {
           status: "pending",
         },
     );
-    const resolved = resolveConnectionStatus(def.wants, statusByKey);
+    const resolved = resolveConnectionStatus(agent.wants, statusByKey);
     // Surface legacy `uses:` names alongside the structured pending keys (no grant flow).
-    const pending = [...(resolved.pending ?? []), ...def.declaredConnections];
+    const pending = [...(resolved.pending ?? []), ...agent.declaredConnections];
     if (resolved.status === "enabled" && pending.length === 0) {
       return { status: "enabled", connections };
     }

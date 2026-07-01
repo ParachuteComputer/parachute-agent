@@ -2007,3 +2007,157 @@ describe("AgentDefRegistry — dual-discovery (Phase 4a)", () => {
     expect(detailed[0]!.source).toBe("def");
   });
 });
+
+// ---------------------------------------------------------------------------
+// AgentDefRegistry — thread grant registration (a thread carries capability
+// DIRECTLY — the parity the retired `#agent/definition` had). Registers the
+// thread's `wants:` as PENDING grants keyed by the AGENT NAME on instantiate,
+// mirroring the def path's resolveStatusWithGrants + reconcile-GC discipline.
+// ---------------------------------------------------------------------------
+
+describe("AgentDefRegistry — thread grant registration + reconcile-GC", () => {
+  const SURFACE: ConnectionSpec = { kind: "surface", target: "foo", access: "write" };
+
+  test("a thread's `wants:` register as PENDING grants keyed by the AGENT NAME (status pending)", async () => {
+    const { deps } = recorderDeps();
+    const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
+    const grants = fakeGrantsClient({ registered, reconciled }); // all default "pending"
+    const fetchFn = dualFetch({
+      threads: [{ id: "Threads/eco/eco", path: "Threads/eco/eco", metadata: { agent: "eco", wants: "surface:foo:write" } }],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants, discovery: "thread" });
+    await reg.loadAll();
+    // Registered under the AGENT NAME (`eco` = metadata.agent), NOT the note path — symmetric
+    // with the injection union's `spec.name` source, so an approved grant injects at spawn.
+    expect(registered).toEqual([{ agent: "eco", connection: SURFACE }]);
+    // Nothing approved yet → status pending, listing the want key; still source=thread + live.
+    const detail = reg.listDetailed().find((d) => d.name === "eco")!;
+    expect(detail.source).toBe("thread");
+    expect(detail.status).toBe("pending");
+    expect(detail.pending).toEqual(["surface:foo:write"]);
+    expect(detail.connections).toEqual([
+      { key: "surface:foo:write", kind: "surface", target: "foo", status: "pending", grantId: "g-surface:foo:write" },
+    ]);
+    // Reconcile-GC ran from the confident live set, keyed by the NAME (its own partition).
+    expect(reconciled).toEqual([{ agent: "eco", liveConnections: [SURFACE] }]);
+  });
+
+  test("status flips to `enabled` once every thread want is approved", async () => {
+    const { deps } = recorderDeps();
+    const grants = fakeGrantsClient({ statusByKey: { [connectionKey(SURFACE)]: "approved" } });
+    const fetchFn = dualFetch({
+      threads: [{ id: "Threads/eco/eco", path: "Threads/eco/eco", metadata: { agent: "eco", wants: "surface:foo:write" } }],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants, discovery: "thread" });
+    await reg.loadAll();
+    expect(reg.listDetailed().find((d) => d.name === "eco")!.status).toBe("enabled");
+  });
+
+  test("a wants-free thread stays `enabled` with no grant traffic (byte-identical to before)", async () => {
+    const { deps } = recorderDeps();
+    const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
+    const grants = fakeGrantsClient({ registered, reconciled });
+    const fetchFn = dualFetch({ threads: [{ id: "Threads/eco/eco", metadata: { agent: "eco" } }] });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants, discovery: "thread" });
+    await reg.loadAll();
+    const detail = reg.listDetailed().find((d) => d.name === "eco")!;
+    expect(detail.status).toBe("enabled");
+    expect(detail.connections).toEqual([]);
+    // No wants → resolveStatusWithGrants short-circuits: NO register PUT, but the clean-load
+    // reconcile still runs (prunes any leftover grant from a want it no longer declares).
+    expect(registered).toEqual([]);
+    expect(reconciled).toEqual([{ agent: "eco", liveConnections: [] }]);
+  });
+
+  test("removing a thread want → reconcile-GC prunes to the reduced set (keyed by name)", async () => {
+    const { deps } = recorderDeps();
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
+    const grants = fakeGrantsClient({ reconciled });
+    // A single note object we MUTATE between reloads (dualFetch serves it by id).
+    const note = {
+      id: "Threads/eco/eco",
+      path: "Threads/eco/eco",
+      metadata: { agent: "eco", wants: "surface:foo:write, env:github" },
+    };
+    const reg = new AgentDefRegistry(deps, {
+      bindings: [binding],
+      fetchFn: dualFetch({ byId: { "Threads/eco/eco": note } }),
+      grants,
+      discovery: "thread",
+    });
+    await reg.reloadThread("default", "Threads/eco/eco", "created");
+    // First load reconciled to BOTH wants (its confident live set).
+    expect(reconciled.at(-1)!.liveConnections.map((c) => c.target).sort()).toEqual(["foo", "github"]);
+    // Drop the env want, reload → reconcile to just the surface (the hub prunes env:github).
+    note.metadata.wants = "surface:foo:write";
+    reconciled.length = 0;
+    await reg.reloadThread("default", "Threads/eco/eco", "updated");
+    expect(reconciled).toEqual([{ agent: "eco", liveConnections: [SURFACE] }]);
+  });
+
+  test("SAFETY: a malformed thread `wants:` → SKIPPED, NEVER registers or reconciles (approved grants NOT nuked)", async () => {
+    const { deps } = recorderDeps();
+    const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
+    const grants = fakeGrantsClient({ registered, reconciled });
+    const fetchFn = dualFetch({
+      // `vault:research` is malformed (a vault want needs a verb) → parseThreadSpec throws.
+      threads: [{ id: "Threads/bad/bad", metadata: { agent: "bad", wants: "vault:research" } }],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants, discovery: "thread" });
+    const n = await reg.loadAll();
+    expect(n).toBe(0); // not instantiated
+    expect(reg.listDetailed()).toHaveLength(0);
+    // THE SAFETY CASE: a parse failure presents NO confident live set → we never register and
+    // never reconcile, so a transient/malformed edit can't nuke this agent's approved grants.
+    expect(registered).toEqual([]);
+    expect(reconciled).toEqual([]);
+  });
+
+  test("a thread deduped by a same-name DEF registers NOTHING (def owns the name partition)", async () => {
+    const { deps } = recorderDeps();
+    const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
+    const grants = fakeGrantsClient({ registered, reconciled });
+    const fetchFn = dualFetch({
+      defs: [{ id: "Agents/eco", content: "", metadata: { name: "eco" } }], // no wants
+      // The thread declares a want — but it dedups against the def (def wins in `both`).
+      threads: [{ id: "Threads/eco/eco", path: "Threads/eco/eco", metadata: { agent: "eco", wants: "surface:foo:write" } }],
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants }); // both
+    await reg.loadAll();
+    expect(reg.listDetailed().map((d) => `${d.name}:${d.source}`)).toEqual(["eco:def"]);
+    // The DEDUPED thread never reaches registration — so it can't register or reconcile the
+    // `eco` name partition (which the def owns). Only the def's clean-load reconcile ([] here) ran.
+    expect(registered).toEqual([]);
+    expect(reconciled).toEqual([{ agent: "eco", liveConnections: [] }]);
+  });
+
+  test("thread wants (keyed by NAME) + a role's wants (keyed by PATH) are SEPARATE partitions", async () => {
+    const { deps } = recorderDeps();
+    const registered: Array<{ agent: string; connection: ConnectionSpec }> = [];
+    const reconciled: Array<{ agent: string; liveConnections: ConnectionSpec[] }> = [];
+    const grants = fakeGrantsClient({ registered, reconciled });
+    const thread = { id: "Threads/eco/eco", path: "Threads/eco/eco", metadata: { agent: "eco", wants: "surface:foo:write" } };
+    const fetchFn = dualFetch({
+      threads: [thread],
+      byId: {
+        // A role note the operator loads into the thread — its own PATH-keyed capability layer.
+        "Roles/gh": { id: "Roles/gh", content: "role", metadata: { wants: "env:github" }, ...( { tags: ["agent/role"] } as Record<string, unknown> ) } as never,
+      },
+    });
+    const reg = new AgentDefRegistry(deps, { bindings: [binding], fetchFn, grants, discovery: "thread" });
+    await reg.loadAll(); // thread → registers surface:foo:write keyed by "eco"
+    expect(await reg.reconcileRole("default", "Roles/gh", "created")).toBe("reconciled"); // role → keyed by its path
+    const roleKey = rolePathKey("Roles/gh");
+    const GH: ConnectionSpec = { kind: "service", target: "github", inject: ["env"] };
+    // The thread's want landed under the NAME; the role's under its PATH — distinct partitions,
+    // neither clobbers the other (the injection union at spawn re-unions both, spec.name first).
+    expect(registered).toContainEqual({ agent: "eco", connection: SURFACE });
+    expect(registered).toContainEqual({ agent: roleKey, connection: GH });
+    expect(reconciled).toContainEqual({ agent: "eco", liveConnections: [SURFACE] });
+    expect(reconciled).toContainEqual({ agent: roleKey, liveConnections: [GH] });
+  });
+});
