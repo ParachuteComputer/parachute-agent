@@ -835,6 +835,20 @@ describe("resolveInjectedGrantsUnion — union of def key + role keys", () => {
     expect(fromUnion.env).toEqual({ GITHUB_TOKEN: "GHTOK" });
   });
 
+  test("a thread's OWN approved want (keyed by its agent name) injects — no roles needed", async () => {
+    // The spawn-time call for a thread that carries capability directly + loads no role:
+    // resolveInjectedGrantsUnion(grants, [spec.name]). The want was registered keyed by the
+    // agent NAME (see agent-defs instantiateThread), so it injects here keyed by the SAME name.
+    const client = multiAgentClient({
+      byAgent: {
+        eco: [{ id: "s1", connection: { kind: "surface", target: "brain", access: "write" }, status: "approved" }],
+      },
+      material: { s1: { kind: "surface", token: "SURFTOK", remoteUrl: "https://hub/git/brain" } },
+    });
+    const out = await resolveInjectedGrantsUnion(client, ["eco"]);
+    expect(out.gitCredentials).toEqual([{ remoteUrl: "https://hub/git/brain", token: "SURFTOK" }]);
+  });
+
   test("a thread loading ONE role → def grants UNIONED with the role's path-keyed grants", async () => {
     const roleKey = rolePathKey("Roles/github");
     const client = multiAgentClient({
