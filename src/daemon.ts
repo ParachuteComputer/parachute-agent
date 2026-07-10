@@ -71,7 +71,8 @@ import { registerAllDefVaultTriggers } from "./def-vault-triggers.ts";
 import { GrantsClient } from "./grants.ts";
 import { resolveEffectiveEnv } from "./effective-env.ts";
 import { VaultJobStore, validateJob, vaultTransportFor, type Job } from "./jobs.ts";
-import { Runner, realTickDriver } from "./runner.ts";
+import { Runner, realTickDriver, type NotifyFn } from "./runner.ts";
+import { TelegramTransport } from "./transports/telegram.ts";
 import { Backoff, backoffConfigFromEnv } from "./backoff.ts";
 import { nextRunAfter } from "./cron.ts";
 import {
@@ -839,6 +840,67 @@ export function buildWriteCallback(channels: Map<string, Channel>): WriteCallbac
     // structurally-identical local mirror (the transport layer doesn't import the backend
     // layer), so it passes without a cast.
     await vt.writeCallback(content, meta);
+  };
+}
+
+/**
+ * Build the runner's job-alert {@link NotifyFn} — the operator-facing half of R1
+ * (the risk register's silent-failure gap: a scheduled job's fire failing wrote
+ * `lastStatus: "error: ..."` on its `#agent/job` note and NOTHING ELSE happened;
+ * every outage to date was found by hand). Reuses the EXISTING Telegram transport's
+ * `reply()` send path — no new transport, no new external API surface.
+ *
+ * Configured via two env vars (the `PARACHUTE_AGENT_*` convention every other
+ * daemon knob follows):
+ *   - `PARACHUTE_AGENT_ALERT_CHANNEL`  — the name of an ALREADY-configured telegram
+ *     channel (channels.json) whose bot sends the alert.
+ *   - `PARACHUTE_AGENT_ALERT_CHAT_ID`  — the chat id (DM or group) to send it to.
+ *
+ * Both unset → returns `undefined` (the runner is built with no `notify` at all —
+ * a clean, silent no-op; this is the out-of-the-box state, not a misconfiguration).
+ * Exactly one set → logs a loud warning ONCE at boot and returns `undefined` — the
+ * operator sees the gap in the daemon log instead of alerts silently going nowhere
+ * forever. Both set but naming a channel that isn't (yet, or anymore) a live
+ * `TelegramTransport` is checked PER-ALERT (not at boot), so a channel added or
+ * replaced later is picked up without a restart; a miss there logs + drops (never
+ * throws — an unreachable alert channel must not break the runner's tick).
+ */
+export function buildJobAlertNotify(
+  channels: Map<string, Channel>,
+  env: NodeJS.ProcessEnv = process.env,
+): NotifyFn | undefined {
+  const channelName = env.PARACHUTE_AGENT_ALERT_CHANNEL;
+  const chatId = env.PARACHUTE_AGENT_ALERT_CHAT_ID;
+  if (!channelName && !chatId) return undefined; // not configured — silent skip, by design.
+  if (!channelName || !chatId) {
+    console.warn(
+      `parachute-agent: job-failure alerts are PARTIALLY configured — both ` +
+        `PARACHUTE_AGENT_ALERT_CHANNEL and PARACHUTE_AGENT_ALERT_CHAT_ID must be set. ` +
+        `Alerts are DISABLED until both are present.`,
+    );
+    return undefined;
+  }
+  return async (event) => {
+    const ch = channels.get(channelName);
+    if (!(ch?.transport instanceof TelegramTransport)) {
+      console.error(
+        `parachute-agent: job alert DROPPED for "${event.job.id}" — channel "${channelName}" ` +
+          `(PARACHUTE_AGENT_ALERT_CHANNEL) is not a live telegram transport.`,
+      );
+      return;
+    }
+    const label = event.kind === "recovery" ? "✅ Recovered" : "🔴 Job failed";
+    const lines = [
+      `${label}: ${event.job.id}`,
+      `agent: ${event.job.channel}`,
+      `cron: ${event.job.schedule.cron}${event.job.schedule.tz ? ` (${event.job.schedule.tz})` : ""}`,
+    ];
+    if (event.kind === "error") lines.push(`error: ${event.newStatus}`);
+    if (event.job.noteId) lines.push(`note: ${event.job.noteId}`);
+    // Reuse the transport's own outbound path — the exact `reply()` a programmatic
+    // agent's turn reply goes through, so an alert-delivery failure surfaces exactly
+    // like any other Telegram send failure (thrown, caught by the runner's notify guard).
+    await ch.transport.reply({ channel: channelName, text: lines.join("\n"), meta: { chat_id: chatId } });
   };
 }
 
@@ -3850,6 +3912,9 @@ function main(): void {
         lastStatus: job.lastStatus,
       });
     },
+    // Operator alerts on job failure/recovery (R1) — resolved from env each boot;
+    // undefined (unconfigured) is a clean no-op, exactly like today's silent behavior.
+    notify: buildJobAlertNotify(channels),
     driver: realTickDriver(),
   });
 
