@@ -18,7 +18,12 @@
  * Storage-agnostic: the runner never touches the vault directly. It calls:
  *   - `loadJobs()`        → the current jobs (the store queries the vault),
  *   - `fire(job)`         → inject the inbound note (the transport writes it),
- *   - `persistFire(job)`  → write back lastRunAt/lastStatus (the store PATCHes).
+ *   - `persistFire(job)`  → write back lastRunAt/lastStatus (the store PATCHes),
+ *   - `notify(event)`     → OPTIONAL, tell a human on an ok↔error TRANSITION (the
+ *     daemon wires this to a Telegram send — agent's risk register R1: a fire
+ *     failing used to be silent, `lastStatus: "error: ..."` on the note and nothing
+ *     else, so the operator discovered every outage by hand). Same "inject the side
+ *     effect, keep the core pure" shape as the three calls above.
  *
  * `nextRunAt` is COMPUTED IN MEMORY and NEVER persisted. The runner keeps a small
  * per-job horizon map (keyed by id) across ticks so a job fires once per slot; a
@@ -47,6 +52,29 @@ export type FireFn = (job: Job) => Promise<void>;
 /** Persist a job's bookkeeping (lastRunAt/lastStatus) after a fire. Async. */
 export type PersistFireFn = (job: Job) => Promise<void>;
 
+/**
+ * A job status transition worth telling a human about (agent's risk register R1 —
+ * a fire failing used to write `lastStatus: "error: ..."` on the note and NOTHING
+ * else happened; the operator discovered every outage by hand).
+ */
+export interface JobAlertEvent {
+  /** The job as it stands AFTER this fire (lastStatus already reflects `newStatus`). */
+  job: Job;
+  /** The job's status before this fire — undefined on a job's very first fire. */
+  previousStatus: string | undefined;
+  /** The job's status after this fire (mirrors `job.lastStatus`). */
+  newStatus: string;
+  /** `"error"` — a fresh or still-ongoing failure. `"recovery"` — error → ok. */
+  kind: "error" | "recovery";
+}
+
+/**
+ * Notify a human about a job status transition (e.g. send a Telegram message).
+ * Delivery failures here are caught by the runner and never propagate — an alert
+ * that can't be sent must not break the tick that's trying to report a problem.
+ */
+export type NotifyFn = (event: JobAlertEvent) => Promise<void>;
+
 /** A scheduler driver: schedule `fn` to run every `ms`, return a cancel handle. */
 export interface TickDriver {
   schedule(fn: () => void, ms: number): { cancel: () => void };
@@ -59,6 +87,21 @@ export interface RunnerOptions {
   fire: FireFn;
   /** Persist a job's bookkeeping after a fire. */
   persistFire: PersistFireFn;
+  /**
+   * Notify a human on a job status TRANSITION (agent#R1). Called after a fire with
+   * `job.lastStatus` already updated: on ok/undefined → error (first failure, or a
+   * repeat past the {@link alertThrottleMs} window) and on error → ok (recovery, one
+   * line). Omitted → no alerting (today's silent behavior, unchanged). A thrown/
+   * rejected notify is caught and logged — it never fails the tick.
+   */
+  notify?: NotifyFn;
+  /**
+   * Throttle window (ms) for a REPEATED alert on a job stuck in error — the first
+   * transition into error always alerts; a still-failing job re-alerts at most once
+   * per window rather than every tick. Recovery always alerts once, unthrottled.
+   * Default 24h.
+   */
+  alertThrottleMs?: number;
   /** Clock — injected for determinism. Default `() => new Date()`. */
   now?: () => Date;
   /** Tick driver — injected for determinism. Default a real-setInterval driver. */
@@ -96,6 +139,8 @@ export class Runner {
   private readonly loadJobs: LoadJobsFn;
   private readonly fire: FireFn;
   private readonly persistFire: PersistFireFn;
+  private readonly notify: NotifyFn | undefined;
+  private readonly alertThrottleMs: number;
   private readonly now: () => Date;
   private readonly driver: TickDriver;
   private readonly intervalMs: number;
@@ -109,6 +154,13 @@ export class Runner {
   private readonly horizons = new Map<string, string>();
   /** Job ids currently mid-fire — skipped by an interleaving tick (overlap guard). */
   private readonly inFlight = new Set<string>();
+  /**
+   * Per-job epoch-ms of the last alert SENT (agent#R1), keyed like {@link horizons}.
+   * In-memory only, like the horizon map — a restart loses the throttle window (one
+   * possible extra alert after a restart is an acceptable cost for zero new persisted
+   * state; the bookkeeping this guards is best-effort notification, not correctness).
+   */
+  private readonly lastAlertAt = new Map<string, number>();
   private handle: { cancel: () => void } | undefined;
   /** Circuit breaker for the `loadJobs` failure loop (agent#187). */
   private readonly loadBackoff: Backoff;
@@ -117,6 +169,8 @@ export class Runner {
     this.loadJobs = opts.loadJobs;
     this.fire = opts.fire;
     this.persistFire = opts.persistFire;
+    this.notify = opts.notify;
+    this.alertThrottleMs = opts.alertThrottleMs ?? 24 * 60 * 60 * 1000;
     this.now = opts.now ?? (() => new Date());
     this.driver = opts.driver ?? realTickDriver();
     this.intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
@@ -197,10 +251,14 @@ export class Runner {
       this.log.warn(`runner: loadJobs recovered — resuming normal ${Math.round(this.intervalMs / 1000)}s cadence.`);
     }
 
-    // Prune horizons for jobs that no longer exist (deleted), so the map can't grow.
+    // Prune horizons + alert bookkeeping for jobs that no longer exist (deleted), so
+    // neither map can grow unbounded.
     const liveKeys = new Set(jobs.map((j) => this.keyOf(j)));
     for (const key of [...this.horizons.keys()]) {
       if (!liveKeys.has(key)) this.horizons.delete(key);
+    }
+    for (const key of [...this.lastAlertAt.keys()]) {
+      if (!liveKeys.has(key)) this.lastAlertAt.delete(key);
     }
 
     const fires: Array<Promise<void>> = [];
@@ -239,6 +297,10 @@ export class Runner {
   private async fireOne(job: Job, at: Date): Promise<void> {
     const key = this.keyOf(job);
     this.inFlight.add(key);
+    // Captured BEFORE the fire mutates `job.lastStatus` below — the only place the
+    // prior status is still available (the store's copy is loaded fresh each tick;
+    // by the time persistFire runs, `job.lastStatus` already holds the NEW value).
+    const previousStatus = job.lastStatus;
     try {
       await this.fire(job);
       job.lastStatus = "ok";
@@ -263,6 +325,51 @@ export class Runner {
       } catch (err) {
         this.log.warn(`runner: persist bookkeeping for "${job.id}" failed (continuing): ${(err as Error).message}`);
       }
+      // Tell a human about a status TRANSITION (agent#R1) — best-effort, after the
+      // durable bookkeeping so a slow/failing notify never delays the persisted record.
+      await this.maybeNotify(job, key, previousStatus, at);
+    }
+  }
+
+  /**
+   * Decide whether this fire's status transition is alert-worthy and, if so, invoke
+   * the injected {@link notify}. Never throws — an alert-delivery failure must not
+   * break the tick that's trying to report a DIFFERENT problem.
+   *
+   *   - ok/undefined → error   — ALWAYS alerts (first failure, `kind: "error"`).
+   *   - error → error          — still failing; alerts again only if the last alert
+   *                              for this job is older than {@link alertThrottleMs}
+   *                              (a stuck job doesn't spam every tick).
+   *   - error → ok             — ALWAYS alerts once, unthrottled (`kind: "recovery"`)
+   *                              so trust is restored without a manual check.
+   *   - ok → ok                — nothing worth telling a human.
+   */
+  private async maybeNotify(
+    job: Job,
+    key: string,
+    previousStatus: string | undefined,
+    at: Date,
+  ): Promise<void> {
+    if (!this.notify) return;
+    const wasError = previousStatus !== undefined && previousStatus !== "ok";
+    const isError = job.lastStatus !== undefined && job.lastStatus !== "ok";
+    let kind: "error" | "recovery";
+    if (isError && !wasError) {
+      kind = "error"; // fresh transition into error (including a job's very first fire)
+    } else if (isError && wasError) {
+      const last = this.lastAlertAt.get(key);
+      if (last !== undefined && at.getTime() - last < this.alertThrottleMs) return; // throttled
+      kind = "error"; // still failing, throttle window elapsed — re-alert
+    } else if (!isError && wasError) {
+      kind = "recovery";
+    } else {
+      return; // ok → ok
+    }
+    this.lastAlertAt.set(key, at.getTime());
+    try {
+      await this.notify({ job, previousStatus, newStatus: job.lastStatus ?? "ok", kind });
+    } catch (err) {
+      this.log.warn(`runner: alert notify for "${job.id}" failed (continuing): ${(err as Error).message}`);
     }
   }
 

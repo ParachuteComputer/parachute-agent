@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { Runner, type TickDriver } from "./runner.ts";
+import { Runner, type TickDriver, type JobAlertEvent } from "./runner.ts";
 import type { Job } from "./jobs.ts";
 import {
   ProgrammaticAgentRegistry,
@@ -70,6 +70,29 @@ function store(jobs: Job[]) {
     loadJobs: async () => jobs.map((j) => ({ ...j })), // fresh copies each tick (vault-like)
     persistFire: async (j: Job) => {
       persisted.push({ id: j.id, lastStatus: j.lastStatus, lastRunAt: j.lastRunAt });
+    },
+  };
+}
+
+/**
+ * Like {@link store}, but ROUND-TRIPS a job's persisted `lastStatus`/`lastRunAt` back
+ * onto the NEXT `loadJobs()` call — mirroring the real vault store, where
+ * `persistFire` PATCHes the `#agent/job` note and the next tick's `listAll()` reads
+ * that patch back. The plain `store()` above never needed this (horizon/nextRunAt
+ * lives in the runner's own in-memory map, not on the job); the alert-transition
+ * tests below DO need it — `previousStatus` is read off whatever `loadJobs()` hands
+ * the runner at the START of each fire, so without the round-trip every tick would
+ * see a fresh `lastStatus: undefined` and no transition could ever be observed.
+ */
+function roundTripStore(jobs: Job[]) {
+  const persisted: Array<{ id: string; lastStatus?: string; lastRunAt?: string }> = [];
+  const persistedById = new Map<string, { lastStatus?: string; lastRunAt?: string }>();
+  return {
+    persisted,
+    loadJobs: async () => jobs.map((j) => ({ ...j, ...persistedById.get(j.id) })),
+    persistFire: async (j: Job) => {
+      persisted.push({ id: j.id, lastStatus: j.lastStatus, lastRunAt: j.lastRunAt });
+      persistedById.set(j.id, { lastStatus: j.lastStatus, lastRunAt: j.lastRunAt });
     },
   };
 }
@@ -230,6 +253,162 @@ describe("Runner.tick — fire failure recorded, never thrown", () => {
     const byId = Object.fromEntries(s.persisted.map((p) => [p.id, p.lastStatus]));
     expect(byId.bad).toMatch(/error/);
     expect(byId.good).toBe("ok");
+  });
+});
+
+describe("Runner — operator alerts on job failure/recovery (R1)", () => {
+  test("ok → error is a fresh transition and alerts once (kind: \"error\")", async () => {
+    const clock = fakeClock("2026-06-17T10:30:00Z");
+    const alerts: JobAlertEvent[] = [];
+    let shouldFail = false;
+    const s = roundTripStore([job()]);
+    const r = new Runner({
+      loadJobs: s.loadJobs,
+      fire: async () => {
+        if (shouldFail) throw new Error("boom");
+      },
+      persistFire: s.persistFire,
+      notify: async (e) => void alerts.push(e),
+      now: clock.now,
+      log: silent,
+    });
+    await r.tick(); // seeds horizon 11:00
+    clock.set("2026-06-17T11:00:00Z");
+    await r.tick(); // fires ok — first-ever success is NOT alert-worthy
+    expect(alerts).toEqual([]);
+
+    shouldFail = true;
+    clock.set("2026-06-17T12:00:00Z");
+    await r.tick(); // fires, fails → ok → error
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({ previousStatus: "ok", kind: "error" });
+    expect(alerts[0]!.newStatus).toMatch(/error: boom/);
+  });
+
+  test("a job's very FIRST fire failing also alerts (undefined → error)", async () => {
+    const clock = fakeClock("2026-06-17T11:00:00Z");
+    const alerts: JobAlertEvent[] = [];
+    const s = roundTripStore([job()]);
+    const r = new Runner({
+      loadJobs: s.loadJobs,
+      fire: async () => {
+        throw new Error("nope");
+      },
+      persistFire: s.persistFire,
+      notify: async (e) => void alerts.push(e),
+      now: clock.now,
+      log: silent,
+    });
+    await r.tick(); // seed
+    clock.set("2026-06-17T12:00:00Z");
+    await r.tick(); // due → fails on its first-ever fire
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toMatchObject({ previousStatus: undefined, kind: "error" });
+  });
+
+  test("ok → ok never alerts", async () => {
+    const clock = fakeClock("2026-06-17T10:30:00Z");
+    const alerts: JobAlertEvent[] = [];
+    const s = roundTripStore([job()]);
+    const r = new Runner({
+      loadJobs: s.loadJobs,
+      fire: async () => {},
+      persistFire: s.persistFire,
+      notify: async (e) => void alerts.push(e),
+      now: clock.now,
+      log: silent,
+    });
+    await r.tick(); // seed
+    clock.set("2026-06-17T11:00:00Z");
+    await r.tick(); // ok
+    clock.set("2026-06-17T12:00:00Z");
+    await r.tick(); // ok again
+    expect(alerts).toEqual([]);
+  });
+
+  test("error → ok fires a single recovery alert", async () => {
+    const clock = fakeClock("2026-06-17T11:00:00Z");
+    const alerts: JobAlertEvent[] = [];
+    let shouldFail = true;
+    const s = roundTripStore([job()]);
+    const r = new Runner({
+      loadJobs: s.loadJobs,
+      fire: async () => {
+        if (shouldFail) throw new Error("down");
+      },
+      persistFire: s.persistFire,
+      notify: async (e) => void alerts.push(e),
+      now: clock.now,
+      log: silent,
+    });
+    await r.tick(); // seed
+    clock.set("2026-06-17T12:00:00Z");
+    await r.tick(); // fails → error alert
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]!.kind).toBe("error");
+
+    shouldFail = false;
+    clock.set("2026-06-17T13:00:00Z");
+    await r.tick(); // recovers → recovery alert
+    expect(alerts).toHaveLength(2);
+    expect(alerts[1]!.newStatus).toBe("ok");
+    expect(alerts[1]!.previousStatus).toMatch(/error: down/);
+    expect(alerts[1]!.kind).toBe("recovery");
+
+    // The episode is closed — a THIRD tick that stays ok must not alert again.
+    clock.set("2026-06-17T14:00:00Z");
+    await r.tick();
+    expect(alerts).toHaveLength(2);
+  });
+
+  test("a notify failure is swallowed — the tick still resolves and bookkeeping still persists", async () => {
+    const clock = fakeClock("2026-06-17T11:00:00Z");
+    const s = roundTripStore([job()]);
+    const r = new Runner({
+      loadJobs: s.loadJobs,
+      fire: async () => {
+        throw new Error("down");
+      },
+      persistFire: s.persistFire,
+      notify: async () => {
+        throw new Error("telegram unreachable");
+      },
+      now: clock.now,
+      log: silent,
+    });
+    await r.tick(); // seed
+    clock.set("2026-06-17T12:00:00Z");
+    await expect(r.tick()).resolves.toBeUndefined(); // must not throw out of tick()
+    expect(s.persisted.at(-1)).toMatchObject({ id: "j", lastStatus: "error: down" });
+  });
+
+  test("a still-failing job is throttled to at most one alert per window", async () => {
+    const clock = fakeClock("2026-06-17T11:00:00Z");
+    const alerts: JobAlertEvent[] = [];
+    const s = roundTripStore([job()]);
+    const r = new Runner({
+      loadJobs: s.loadJobs,
+      fire: async () => {
+        throw new Error("down");
+      },
+      persistFire: s.persistFire,
+      notify: async (e) => void alerts.push(e),
+      now: clock.now,
+      alertThrottleMs: 2 * 60 * 60 * 1000, // 2h window (test-scale stand-in for the 24h default)
+      log: silent,
+    });
+    await r.tick(); // seed
+    clock.set("2026-06-17T12:00:00Z");
+    await r.tick(); // 1st failure → alert #1
+    expect(alerts).toHaveLength(1);
+
+    clock.set("2026-06-17T13:00:00Z");
+    await r.tick(); // still failing, only 1h since the last alert (< 2h window) → throttled
+    expect(alerts).toHaveLength(1);
+
+    clock.set("2026-06-17T14:00:00Z");
+    await r.tick(); // still failing, 2h elapsed → re-alerts
+    expect(alerts).toHaveLength(2);
   });
 });
 
