@@ -66,8 +66,7 @@ number of sessions subscribe.
   oldest inbound, returns the agent's system prompt) → work → `reply { inReplyTo, text }`.
   Claims auto-release after a TTL, so a crashed session never strands the queue.
 - Env vars are documented by the code that reads them (grep `process.env` in
-  `src/daemon.ts` and friends). One trap: job-failure alerting needs
-  either alone is a partial config (logged, alerts disabled).
+  `src/daemon.ts` and friends).
 
 ### The `=`-binding flag trap (bridge launch)
 
