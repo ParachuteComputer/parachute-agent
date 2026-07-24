@@ -67,7 +67,6 @@ number of sessions subscribe.
   Claims auto-release after a TTL, so a crashed session never strands the queue.
 - Env vars are documented by the code that reads them (grep `process.env` in
   `src/daemon.ts` and friends). One trap: job-failure alerting needs
-  `PARACHUTE_AGENT_ALERT_CHANNEL` **and** `PARACHUTE_AGENT_ALERT_CHAT_ID` set together —
   either alone is a partial config (logged, alerts disabled).
 
 ### The `=`-binding flag trap (bridge launch)
